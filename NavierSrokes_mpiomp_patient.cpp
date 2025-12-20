@@ -807,7 +807,7 @@ int main(int argc, char **argv) {
 
     int max_threads = omp_get_max_threads();
 
-    ptrdiff_t nt = 1;
+    ptrdiff_t nt = 100;
     double T = 1;
     double tau = T / 20000; 
     int i, j, k, index;

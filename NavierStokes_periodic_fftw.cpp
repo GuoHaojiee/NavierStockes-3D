@@ -26,125 +26,103 @@ fftw_plan plan_bwd_v1, plan_bwd_v2, plan_bwd_v3;  // 3D C2R反向变换
 // 这是全周期性边界条件下Navier-Stokes方程的精确解
 // ==============================================================================
 
-const double nu = 0.001;  // 运动粘度
-const double V0 = 1.0;    // 初始速度幅值
 
-// 速度分量的解析解
 double func_V1(double x, double y, double z, double t) {
-    return V0 * sin(x) * cos(y) * cos(z) * exp(-3.0*nu*t);
+    return (t*t+1)*exp(sin(3*x+3*y))*cos(6*z);
 }
-
 double func_V2(double x, double y, double z, double t) {
-    return -V0 * cos(x) * sin(y) * cos(z) * exp(-3.0*nu*t);
+    return (t*t+1)*exp(sin(3*x+3*y))*cos(6*z);
 }
-
 double func_V3(double x, double y, double z, double t) {
-    return 0.0;  // Taylor-Green涡在z方向无速度
+    return -(t*t+1)*exp(sin(3*x+3*y))*cos(3*x+3*y)*sin(6*z);
 }
 
-// 压力的解析解
-double func_p(double x, double y, double z, double t) {
-    double rho = 1.0;
-    return (rho * V0 * V0 / 16.0) *
-           (cos(2.0*x) + cos(2.0*y)) *
-           (cos(2.0*z) + 2.0) *
-           exp(-6.0*nu*t);
-}
-
-// 时间导数
 double func_dV1_dt(double x, double y, double z, double t) {
-    return -3.0*nu * V0 * sin(x) * cos(y) * cos(z) * exp(-3.0*nu*t);
+    return 2*t*exp(sin(3*x+3*y))*cos(6*z);
 }
 
 double func_dV2_dt(double x, double y, double z, double t) {
-    return 3.0*nu * V0 * cos(x) * sin(y) * cos(z) * exp(-3.0*nu*t);
+    return 2*t*exp(sin(3*x+3*y))*cos(6*z);
 }
 
 double func_dV3_dt(double x, double y, double z, double t) {
-    return 0.0;
+    return -2*t*exp(sin(3*x+3*y))*cos(3*x+3*y)*sin(6*z);
 }
 
-// Laplacian（拉普拉斯算子）
 double func_laplace_V1(double x, double y, double z, double t) {
-    // ∇²v1 = -3*v1 (因为sin(x)的二阶导是-sin(x)，每个方向贡献-1)
-    return -3.0 * func_V1(x, y, z, t);
+    double d2v1_dx2 = (t*t+1)*9*exp(sin(3*x+3*y))*((cos(3*x+3*y)*cos(3*x+3*y))-sin(3*x+3*y))*cos(6*z);
+    double d2v1_dy2 = (t*t+1)*9*exp(sin(3*x+3*y))*((cos(3*x+3*y)*cos(3*x+3*y))-sin(3*x+3*y))*cos(6*z);
+    double d2v1_dz2 = -(t*t+1)*36*exp(sin(3*x+3*y))*cos(6*z);
+    return d2v1_dx2 + d2v1_dy2 + d2v1_dz2;
 }
 
 double func_laplace_V2(double x, double y, double z, double t) {
-    return -3.0 * func_V2(x, y, z, t);
+    return func_laplace_V1(x,y,z,t);
 }
 
 double func_laplace_V3(double x, double y, double z, double t) {
-    return 0.0;
+    double d2v3_dx2 = -(t*t+1)*9*exp(sin(3*x+3*y))*cos(3*x+3*y)*((cos(3*x+3*y)*cos(3*x+3*y)-sin(3*x+3*y))-(2*sin(3*x+3*y)+1))*sin(6*z);
+    double d2v3_dy2 = -(t*t+1)*9*exp(sin(3*x+3*y))*cos(3*x+3*y)*((cos(3*x+3*y)*cos(3*x+3*y)-sin(3*x+3*y))-(2*sin(3*x+3*y)+1))*sin(6*z);
+    double d2v3_dz2 = (t*t+1)*36*exp(sin(3*x+3*y))*cos(3*x+3*y)*sin(6*z);
+    return d2v3_dx2 + d2v3_dy2 + d2v3_dz2;
 }
 
-// 旋度（vorticity）
-double func_rot1(double x, double y, double z, double t) {
-    // rot1 = ∂v3/∂y - ∂v2/∂z
-    double dv3_dy = 0.0;
-    double dv2_dz = V0 * cos(x) * sin(y) * sin(z) * exp(-3.0*nu*t);
+double func_rot1(double x, double y, double z, double t){
+    double dv3_dy = -(t*t+1)*3*exp(sin(3*x+3*y))*(cos(3*x+3*y)*cos(3*x+3*y)-sin(3*x+3*y))*sin(6*z);
+    double dv2_dz = -(t*t+1)*6*exp(sin(3*x+3*y))*sin(6*z);
     return dv3_dy - dv2_dz;
 }
 
-double func_rot2(double x, double y, double z, double t) {
-    // rot2 = ∂v1/∂z - ∂v3/∂x
-    double dv1_dz = -V0 * sin(x) * cos(y) * sin(z) * exp(-3.0*nu*t);
-    double dv3_dx = 0.0;
+double func_rot2(double x, double y, double z, double t){
+    double dv1_dz = -(t*t+1)*6*exp(sin(3*x+3*y))*sin(6*z);
+    double dv3_dx = -(t*t+1)*3*exp(sin(3*x+3*y))*(cos(3*x+3*y)*cos(3*x+3*y)-sin(3*x+3*y))*sin(6*z);
     return dv1_dz - dv3_dx;
 }
 
-double func_rot3(double x, double y, double z, double t) {
-    // rot3 = ∂v2/∂x - ∂v1/∂y
-    double dv2_dx = V0 * sin(x) * sin(y) * cos(z) * exp(-3.0*nu*t);
-    double dv1_dy = -V0 * sin(x) * sin(y) * cos(z) * exp(-3.0*nu*t);
-    return dv2_dx - dv1_dy;
+double func_rot3(double x, double y, double z, double t){
+    return 0;
 }
 
-// v × rot(v) (对流项)
 double func_v_cross_rot1(double x, double y, double z, double t) {
-    return func_V2(x,y,z,t)*func_rot3(x,y,z,t) - func_V3(x,y,z,t)*func_rot2(x,y,z,t);
+    return func_V2(x,y,z,t)*func_rot3(x,y,z,t)-func_V3(x,y,z,t)*func_rot2(x,y,z,t);
 }
 
 double func_v_cross_rot2(double x, double y, double z, double t) {
-    return func_V3(x,y,z,t)*func_rot1(x,y,z,t) - func_V1(x,y,z,t)*func_rot3(x,y,z,t);
+    return func_V3(x,y,z,t)*func_rot1(x,y,z,t)-func_V1(x,y,z,t)*func_rot3(x,y,z,t);
 }
 
 double func_v_cross_rot3(double x, double y, double z, double t) {
-    return func_V1(x,y,z,t)*func_rot2(x,y,z,t) - func_V2(x,y,z,t)*func_rot1(x,y,z,t);
+    return func_V1(x,y,z,t)*func_rot2(x,y,z,t)-func_V2(x,y,z,t)*func_rot1(x,y,z,t);
 }
 
-// 压力梯度
+double func_p(double x, double y, double z, double t) {
+    return (t*t+1)*cos(x)*cos(y)*cos(z);
+}
+
 double func_grad_p1(double x, double y, double z, double t) {
-    double rho = 1.0;
-    return -(rho * V0 * V0 / 8.0) * sin(2.0*x) *
-           (cos(2.0*z) + 2.0) * exp(-6.0*nu*t);
+    return -(t*t+1)*sin(x)*cos(y)*cos(z);
 }
-
 double func_grad_p2(double x, double y, double z, double t) {
-    double rho = 1.0;
-    return -(rho * V0 * V0 / 8.0) * sin(2.0*y) *
-           (cos(2.0*z) + 2.0) * exp(-6.0*nu*t);
+    return -(t*t+1)*cos(x)*sin(y)*cos(z);
 }
-
 double func_grad_p3(double x, double y, double z, double t) {
-    double rho = 1.0;
-    return (rho * V0 * V0 / 8.0) * (cos(2.0*x) + cos(2.0*y)) *
-           sin(2.0*z) * exp(-6.0*nu*t);
+    return -(t*t+1)*cos(x)*cos(y)*sin(z);
 }
 
-// 外力项：使3D Taylor-Green涡成为精确解
-// f = dv/dt - (-v×rot(v) + ν∇²v) = -3νv - (-v×rot(v) - 3νv) = v×rot(v)
-// 这样NS方程变为：dv/dt = -v×rot(v) + ν∇²v + v×rot(v) = ν∇²v = -3νv ✓
+// 投影方法：求解器求解 ∂v/∂t = P∆v + v×rot(v) + f_code（无-∇p项）
+// 完整方程：∂v/∂t = P∆v + v×rot(v) - ∇p + f_image
+// 压力项通过make_div_free()投影隐式处理
+// 所以：f_code = f_image = ∂v/∂t - P∆v - v×rot(v) + ∇p（P=1）
 double func_f1(double x, double y, double z, double t) {
-    return func_v_cross_rot1(x, y, z, t);  // f = v×rot(v)
+    return func_dV1_dt(x,y,z,t) - func_laplace_V1(x,y,z,t) - func_v_cross_rot1(x,y,z,t) + func_grad_p1(x,y,z,t);
 }
 
 double func_f2(double x, double y, double z, double t) {
-    return func_v_cross_rot2(x, y, z, t);
+    return func_dV2_dt(x,y,z,t) - func_laplace_V2(x,y,z,t) - func_v_cross_rot2(x,y,z,t) + func_grad_p2(x,y,z,t);
 }
 
 double func_f3(double x, double y, double z, double t) {
-    return func_v_cross_rot3(x, y, z, t);
+    return func_dV3_dt(x,y,z,t) - func_laplace_V3(x,y,z,t) - func_v_cross_rot3(x,y,z,t) + func_grad_p3(x,y,z,t);
 }
 
 // ==============================================================================
@@ -433,8 +411,7 @@ void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
  */
 void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
                           ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                          ptrdiff_t local_n0, ptrdiff_t local_0_start,
-                          double nu) {
+                          ptrdiff_t local_n0, ptrdiff_t local_0_start) {
 
     ptrdiff_t nz_complex = nz/2 + 1;
 
@@ -450,9 +427,9 @@ void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
                 double kz = k;
                 double k2 = kx*kx + ky*ky + kz*kz;
 
-                // ν∇²V = -νk²V (频谱空间)
-                viscous_c[index][0] = -nu * k2 * V_c[index][0];
-                viscous_c[index][1] = -nu * k2 * V_c[index][1];
+                // P∆V = -k²V (频谱空间，P=1)
+                viscous_c[index][0] = -k2 * V_c[index][0];
+                viscous_c[index][1] = -k2 * V_c[index][1];
             }
         }
     }
@@ -580,22 +557,22 @@ void compute_nonlinear_term(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex
     fftw_free(cross_r2);
     fftw_free(cross_r3);
 
-    // 归一化并取负号得到 -v×rot(v)
+    // 归一化得到 v×rot(v)（图片方程中是正号）
     double norm = nx * ny * nz;
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_size; ++i) {
-        nl1_c[i][0] = -nl1_c[i][0] / norm;
-        nl1_c[i][1] = -nl1_c[i][1] / norm;
-        nl2_c[i][0] = -nl2_c[i][0] / norm;
-        nl2_c[i][1] = -nl2_c[i][1] / norm;
-        nl3_c[i][0] = -nl3_c[i][0] / norm;
-        nl3_c[i][1] = -nl3_c[i][1] / norm;
+        nl1_c[i][0] = nl1_c[i][0] / norm;
+        nl1_c[i][1] = nl1_c[i][1] / norm;
+        nl2_c[i][0] = nl2_c[i][0] / norm;
+        nl2_c[i][1] = nl2_c[i][1] / norm;
+        nl3_c[i][0] = nl3_c[i][0] / norm;
+        nl3_c[i][1] = nl3_c[i][1] / norm;
     }
 }
 
 /**
- * 计算完整右端项：dV/dt = -v×rot(v) + ν∇²v + f
- * 使用伪谱方法
+ * 计算完整右端项：dV/dt = v×rot(v) + ν∇²v + f
+ * 使用伪谱方法（符合图片方程）
  */
 void compute_rhs(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                  fftw_complex* rhs1_c, fftw_complex* rhs2_c, fftw_complex* rhs3_c,
@@ -607,7 +584,7 @@ void compute_rhs(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                  fftw_complex* f1_c, fftw_complex* f2_c, fftw_complex* f3_c,
                  ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
                  ptrdiff_t local_n0, ptrdiff_t local_0_start,
-                 ptrdiff_t alloc_local, double nu, double t,
+                 ptrdiff_t alloc_local, double t,
                  double dx, double dy, double dz) {
 
     ptrdiff_t nz_complex = nz/2 + 1;
@@ -642,10 +619,10 @@ void compute_rhs(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                           rot1_c, rot2_c, rot3_c, tmp1_c, tmp2_c, tmp3_c,
                           nx, ny, nz, local_n0, local_0_start, alloc_local);
 
-    // 2. 计算粘性项 ν∇²v（使用保存的V_c）
-    compute_viscous_term(V1_c_save, visc1_c, nx, ny, nz, local_n0, local_0_start, nu);
-    compute_viscous_term(V2_c_save, visc2_c, nx, ny, nz, local_n0, local_0_start, nu);
-    compute_viscous_term(V3_c_save, visc3_c, nx, ny, nz, local_n0, local_0_start, nu);
+    // 2. 计算粘性项 P∆v（使用保存的V_c，P=1）
+    compute_viscous_term(V1_c_save, visc1_c, nx, ny, nz, local_n0, local_0_start);
+    compute_viscous_term(V2_c_save, visc2_c, nx, ny, nz, local_n0, local_0_start);
+    compute_viscous_term(V3_c_save, visc3_c, nx, ny, nz, local_n0, local_0_start);
 
     // 3. 计算外力项 f（实空间）
     // 使用work_r，不要破坏V_r！
@@ -690,7 +667,7 @@ void compute_rhs(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
     // 注意：我们不再恢复V_c和V_r，因为rk4_step会管理这些数组
     // V_c和V_r现在可能包含临时数据，但这是预期的
 
-    // 4. 组合所有项：rhs = -v×rot(v) + ν∇²v + f
+    // 4. 组合所有项：F = v×rot(v) + P∆v + f
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_size; ++i) {
         rhs1_c[i][0] = nl1_c[i][0] + visc1_c[i][0] + f1_c[i][0];
@@ -701,7 +678,85 @@ void compute_rhs(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
         rhs3_c[i][1] = nl3_c[i][1] + visc3_c[i][1] + f3_c[i][1];
     }
 
-    // V_c和V_r已经在上面恢复了，释放临时数组
+    // 5. 投影到无散空间（图片中的方法）
+    // 计算 div(F) = ik·F
+    fftw_complex *div_F = fftw_alloc_complex(alloc_local);
+    #pragma omp parallel for collapse(3)
+    for(ptrdiff_t i = 0; i < local_n0; ++i) {
+        for(ptrdiff_t j = 0; j < ny; ++j) {
+            for(ptrdiff_t k = 0; k < nz_complex; ++k) {
+                ptrdiff_t index = (i * ny + j) * nz_complex + k;
+                ptrdiff_t i_global = local_0_start + i;
+
+                double kx = (i_global <= nx/2) ? i_global : i_global - nx;
+                double ky = (j <= ny/2) ? j : j - ny;
+                double kz = k;
+
+                // div(F) = i*kx*F1 + i*ky*F2 + i*kz*F3
+                // i*kx*F = i*kx*(Fr + i*Fi) = i*kx*Fr - kx*Fi
+                double div_real = -kx*rhs1_c[index][1] - ky*rhs2_c[index][1] - kz*rhs3_c[index][1];
+                double div_imag =  kx*rhs1_c[index][0] + ky*rhs2_c[index][0] + kz*rhs3_c[index][0];
+
+                div_F[index][0] = div_real;
+                div_F[index][1] = div_imag;
+            }
+        }
+    }
+
+    // 求解泊松方程：∆p = div(F) → p = div(F) / (-k²)
+    fftw_complex *p_c = fftw_alloc_complex(alloc_local);
+    #pragma omp parallel for collapse(3)
+    for(ptrdiff_t i = 0; i < local_n0; ++i) {
+        for(ptrdiff_t j = 0; j < ny; ++j) {
+            for(ptrdiff_t k = 0; k < nz_complex; ++k) {
+                ptrdiff_t index = (i * ny + j) * nz_complex + k;
+                ptrdiff_t i_global = local_0_start + i;
+
+                double kx = (i_global <= nx/2) ? i_global : i_global - nx;
+                double ky = (j <= ny/2) ? j : j - ny;
+                double kz = k;
+                double k2 = kx*kx + ky*ky + kz*kz;
+
+                if (k2 > 1e-10) {
+                    p_c[index][0] = div_F[index][0] / (-k2);
+                    p_c[index][1] = div_F[index][1] / (-k2);
+                } else {
+                    p_c[index][0] = 0.0;
+                    p_c[index][1] = 0.0;
+                }
+            }
+        }
+    }
+
+    // 6. 从F中减去压力梯度：rhs = F - ∇p
+    #pragma omp parallel for collapse(3)
+    for(ptrdiff_t i = 0; i < local_n0; ++i) {
+        for(ptrdiff_t j = 0; j < ny; ++j) {
+            for(ptrdiff_t k = 0; k < nz_complex; ++k) {
+                ptrdiff_t index = (i * ny + j) * nz_complex + k;
+                ptrdiff_t i_global = local_0_start + i;
+
+                double kx = (i_global <= nx/2) ? i_global : i_global - nx;
+                double ky = (j <= ny/2) ? j : j - ny;
+                double kz = k;
+
+                // ∇p = ik*p，所以从F中减去
+                // ∂F/∂x = i*kx*p → F - ∂p/∂x
+                rhs1_c[index][0] -= -kx*p_c[index][1];
+                rhs1_c[index][1] -=  kx*p_c[index][0];
+
+                rhs2_c[index][0] -= -ky*p_c[index][1];
+                rhs2_c[index][1] -=  ky*p_c[index][0];
+
+                rhs3_c[index][0] -= -kz*p_c[index][1];
+                rhs3_c[index][1] -=  kz*p_c[index][0];
+            }
+        }
+    }
+
+    // 释放临时数组
+    fftw_free(div_F);
+    fftw_free(p_c);
     fftw_free(V1_c_save);
     fftw_free(V2_c_save);
     fftw_free(V3_c_save);
@@ -728,7 +783,7 @@ void rk4_step(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
               fftw_complex* f1_c, fftw_complex* f2_c, fftw_complex* f3_c,
               ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
               ptrdiff_t local_n0, ptrdiff_t local_0_start,
-              ptrdiff_t alloc_local, double tau, double nu, double t,
+              ptrdiff_t alloc_local, double tau, double t,
               double dx, double dy, double dz) {
 
     ptrdiff_t nz_complex = nz/2 + 1;
@@ -751,7 +806,7 @@ void rk4_step(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 nx, ny, nz, local_n0, local_0_start, alloc_local,
-                nu, t, dx, dy, dz);
+                t, dx, dy, dz);
 
     // tmp = V^n + τ/2 * k1（使用原始V_c）
     #pragma omp parallel for
@@ -774,7 +829,7 @@ void rk4_step(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 nx, ny, nz, local_n0, local_0_start, alloc_local,
-                nu, t+0.5*tau, dx, dy, dz);
+                t+0.5*tau, dx, dy, dz);
 
     // tmp = V^n + τ/2 * k2（使用原始V_c）
     #pragma omp parallel for
@@ -797,7 +852,7 @@ void rk4_step(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 nx, ny, nz, local_n0, local_0_start, alloc_local,
-                nu, t+0.5*tau, dx, dy, dz);
+                t+0.5*tau, dx, dy, dz);
 
     // tmp = V^n + τ * k3（使用原始V_c）
     #pragma omp parallel for
@@ -820,7 +875,7 @@ void rk4_step(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 nx, ny, nz, local_n0, local_0_start, alloc_local,
-                nu, t+tau, dx, dy, dz);
+                t+tau, dx, dy, dz);
 
     // V^{n+1} = V^n + τ/6 * (k1 + 2k2 + 2k3 + k4)（使用原始V_c）
     #pragma omp parallel for
@@ -849,10 +904,10 @@ int main(int argc, char **argv) {
     const double L_x = 2*M_PI, L_y = 2*M_PI, L_z = 2*M_PI;
 
     // 时间步进参数
-    const ptrdiff_t nt_total = 10000;  // 总时间步数
-    const ptrdiff_t nt_run = 1000;        // 实际运行步数（验证用）
+    const ptrdiff_t nt_total = 20000;  // 总时间步数
+    const ptrdiff_t nt_run = 5000;        // 实际运行步数（验证用）
     const double T = 1.0;               // 总时间
-    const double tau = T / nt_total;    // 时间步长
+    const double tau = T / nt_total;    // 时间步长 dt = 5e-5
 
     // MPI初始化
     int rank, size, provided;
@@ -878,7 +933,7 @@ int main(int argc, char **argv) {
         cout << "============================================================" << endl;
         cout << "Grid: " << nx << " x " << ny << " x " << nz << endl;
         cout << "Domain: [0, 2π]³" << endl;
-        cout << "Viscosity: " << nu << endl;
+        cout << "Diffusion coefficient P: 1" << endl;
         cout << "Total time steps: " << nt_total << endl;
         cout << "Running steps (validation): " << nt_run << endl;
         cout << "Time step size: " << tau << endl;
@@ -960,6 +1015,10 @@ int main(int argc, char **argv) {
     normalization(V2_c, alloc_local, norm_factor);
     normalization(V3_c, alloc_local, norm_factor);
 
+    // 强制初始条件无散（投影到无散空间）
+    if (rank == 0) cout << "Projecting initial condition to divergence-free space..." << endl;
+    make_div_free(V1_c, V2_c, V3_c, div_c, phi_c, nx, ny, nz, local_n0, local_0_start);
+
     // 分配RK4临时变量
     fftw_complex *k1_v1 = fftw_alloc_complex(alloc_local);
     fftw_complex *k1_v2 = fftw_alloc_complex(alloc_local);
@@ -1000,8 +1059,8 @@ int main(int argc, char **argv) {
         cout << "  Time Integration (RK4)" << endl;
         cout << "============================================================" << endl;
         cout << setw(6) << "Step" << setw(12) << "Time"
-             << setw(15) << "L2 Error" << endl;
-        cout << "------------------------------------------------------------" << endl;
+             << setw(15) << "L2 Error" << setw(15) << "Max |div V|" << endl;
+        cout << "------------------------------------------------------------------------" << endl;
     }
 
     for(ptrdiff_t it = 0; it <= nt_run; ++it) {
@@ -1040,23 +1099,51 @@ int main(int argc, char **argv) {
         double global_error;
         MPI_Reduce(&local_error, &global_error, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
+        // 计算散度（频谱空间精确计算）
+        // 先转回频谱空间
+        fftw_execute(plan_fwd_v1);
+        fftw_execute(plan_fwd_v2);
+        fftw_execute(plan_fwd_v3);
+        normalization(V1_c, alloc_local, norm_factor);
+        normalization(V2_c, alloc_local, norm_factor);
+        normalization(V3_c, alloc_local, norm_factor);
+
+        // div(V) = ik_x*V1 + ik_y*V2 + ik_z*V3
+        double local_max_div = 0.0;
+        #pragma omp parallel for collapse(3) reduction(max:local_max_div)
+        for(ptrdiff_t i = 0; i < local_n0; ++i) {
+            for(ptrdiff_t j = 0; j < ny; ++j) {
+                for(ptrdiff_t k = 0; k < nz/2+1; ++k) {
+                    ptrdiff_t i_global = local_0_start + i;
+                    ptrdiff_t index = (i * ny + j) * (nz/2+1) + k;
+
+                    // 波数
+                    double kx = (i_global <= nx/2) ? i_global : i_global - nx;
+                    double ky = (j <= ny/2) ? j : j - ny;
+                    double kz = k;
+
+                    // div = i*kx*V1 + i*ky*V2 + i*kz*V3
+                    double div_real = -kx * V1_c[index][1] - ky * V2_c[index][1] - kz * V3_c[index][1];
+                    double div_imag =  kx * V1_c[index][0] + ky * V2_c[index][0] + kz * V3_c[index][0];
+
+                    double div_mag = sqrt(div_real*div_real + div_imag*div_imag);
+                    local_max_div = max(local_max_div, div_mag);
+                }
+            }
+        }
+
+        double global_max_div;
+        MPI_Reduce(&local_max_div, &global_max_div, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
         if (rank == 0) {
             double dx = L_x/nx, dy = L_y/ny, dz = L_z/nz;
             double L2_error = sqrt(global_error * dx * dy * dz);
             cout << setw(6) << it << setw(12) << scientific << setprecision(4) << t
-                 << setw(15) << L2_error << endl;
+                 << setw(15) << L2_error << setw(15) << global_max_div << endl;
         }
 
-        // 继续时间步进
+        // 继续时间步进（V已在频谱空间）
         if (it < nt_run) {
-            fftw_execute(plan_fwd_v1);
-            fftw_execute(plan_fwd_v2);
-            fftw_execute(plan_fwd_v3);
-
-            normalization(V1_c, alloc_local, norm_factor);
-            normalization(V2_c, alloc_local, norm_factor);
-            normalization(V3_c, alloc_local, norm_factor);
-
             double dx = L_x / nx, dy = L_y / ny, dz = L_z / nz;
 
             rk4_step(V1_c, V2_c, V3_c,
@@ -1072,12 +1159,13 @@ int main(int argc, char **argv) {
                     visc1_c, visc2_c, visc3_c,
                     f1_c, f2_c, f3_c,
                     nx, ny, nz, local_n0, local_0_start,
-                    alloc_local, tau, nu, t, dx, dy, dz);
+                    alloc_local, tau, t, dx, dy, dz);
 
-            // 投影到无散空间（强制执行不可压缩性）
-            make_div_free(V1_c, V2_c, V3_c,
-                         div_c, phi_c,
-                         nx, ny, nz, local_n0, local_0_start);
+            // 投影到无散空间不再需要，因为compute_rhs中每个k1-k4都已经投影过
+            // 如果k1, k2, k3, k4都无散，则它们的线性组合也无散
+            // make_div_free(V1_c, V2_c, V3_c,
+            //              div_c, phi_c,
+            //              nx, ny, nz, local_n0, local_0_start);
         }
     }
 
