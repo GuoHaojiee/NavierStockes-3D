@@ -1,0 +1,43 @@
+# Makefile for Periodic Navier-Stokes Solver with FFTW
+
+# 编译器设置
+CC = mpicc
+CXX = mpicxx
+CXXFLAGS = -O3 -std=c++11 -Wall -fopenmp
+
+# FFTW路径（根据你的系统调整）
+FFTW_DIR = /usr/local
+FFTW_INC = -I$(FFTW_DIR)/include
+FFTW_LIB = -L$(FFTW_DIR)/lib -lfftw3_mpi -lfftw3 -lfftw3_threads -lm
+
+# 包含和链接
+INCLUDES = $(FFTW_INC)
+LDFLAGS = $(FFTW_LIB)
+
+# 目标
+TARGET = navier_stokes_periodic
+
+# 源文件
+SRC = NavierStokes_periodic_fftw.cpp
+
+# 默认目标
+all: $(TARGET)
+
+# 编译规则
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS)
+	@echo "编译成功！可执行文件: $(TARGET)"
+
+# 清理
+clean:
+	rm -f $(TARGET) *.o
+
+# 运行测试（小规模）
+test: $(TARGET)
+	mpirun -np 4 ./$(TARGET)
+
+# 运行性能测试（需要根据你的系统调整进程数）
+run: $(TARGET)
+	mpirun -np 8 ./$(TARGET)
+
+.PHONY: all clean test run
