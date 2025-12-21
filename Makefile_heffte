@@ -1,0 +1,51 @@
+# Makefile for heFFTe版本Navier-Stokes求解器
+
+CXX = mpicxx
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+
+# heFFTe路径（安装在用户目录）
+HEFFTE_DIR = /home/guohaojie/.local
+
+# FFTW路径（系统安装）
+FFTW_INCLUDE = /usr/include
+FFTW_LIB = /usr/lib/x86_64-linux-gnu
+
+# 包含路径
+INCLUDES = -I$(HEFFTE_DIR)/include -I$(FFTW_INCLUDE)
+
+# 库路径和链接
+LIBS = -L$(HEFFTE_DIR)/lib -L$(FFTW_LIB) \
+       -lheffte -lfftw3_mpi -lfftw3 -lfftw3_omp -lfftw3f -lfftw3f_omp -lm -Wl,-rpath,$(HEFFTE_DIR)/lib
+
+# 目标可执行文件
+TARGET_V1 = navier_stokes_heffte_v1
+TARGET_V2 = navier_stokes_heffte_v2
+TARGET_FULL = navier_stokes_heffte
+
+all: $(TARGET_V2)
+
+# 简化测试版本v1
+$(TARGET_V1): NavierStokes_periodic_heffte_v1.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET_V1)"
+
+# 完整Navier-Stokes求解器v2
+$(TARGET_V2): NavierStokes_periodic_heffte_v2.cpp heffte_spectral_ops.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET_V2)"
+
+# 完整版本（待完成）
+$(TARGET_FULL): NavierStokes_periodic_heffte.cpp heffte_spectral_ops.hpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) NavierStokes_periodic_heffte.cpp -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET_FULL)"
+
+clean:
+	rm -f $(TARGET_V1) $(TARGET_V2) $(TARGET_FULL) *.o
+
+test: $(TARGET_V2)
+	mpirun -np 4 ./$(TARGET_V2)
+
+test_v1: $(TARGET_V1)
+	mpirun -np 4 ./$(TARGET_V1)
+
+.PHONY: all clean test

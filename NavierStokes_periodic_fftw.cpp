@@ -905,7 +905,7 @@ int main(int argc, char **argv) {
 
     // 时间步进参数
     const ptrdiff_t nt_total = 20000;  // 总时间步数
-    const ptrdiff_t nt_run = 5000;        // 实际运行步数（验证用）
+    const ptrdiff_t nt_run = 10;        // 实际运行步数（验证用）
     const double T = 1.0;               // 总时间
     const double tau = T / nt_total;    // 时间步长 dt = 5e-5
 
