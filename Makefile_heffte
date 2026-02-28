@@ -29,13 +29,13 @@ $(TARGET_V1): NavierStokes_periodic_heffte_v1.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
 	@echo "编译成功！可执行文件: $(TARGET_V1)"
 
-# 完整Navier-Stokes求解器v2
-$(TARGET_V2): NavierStokes_periodic_heffte_v2.cpp heffte_spectral_ops.hpp
+# 完整Navier-Stokes求解器v2（所有辅助函数已内联，无需外部头文件）
+$(TARGET_V2): NavierStokes_periodic_heffte_v2.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
 	@echo "编译成功！可执行文件: $(TARGET_V2)"
 
 # 完整版本（待完成）
-$(TARGET_FULL): NavierStokes_periodic_heffte.cpp heffte_spectral_ops.hpp
+$(TARGET_FULL): NavierStokes_periodic_heffte.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) NavierStokes_periodic_heffte.cpp -o $@ $(LIBS)
 	@echo "编译成功！可执行文件: $(TARGET_FULL)"
 

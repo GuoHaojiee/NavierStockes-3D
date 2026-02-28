@@ -1,0 +1,36 @@
+# Makefile for p3dfft版本Navier-Stokes求解器
+
+CXX = mpicxx
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+
+# p3dfft路径（安装在用户目录）
+P3DFFT_DIR = /home/guohaojie/.local
+
+# FFTW路径
+FFTW_LIB = /usr/lib/x86_64-linux-gnu
+
+# 包含路径
+INCLUDES = -I$(P3DFFT_DIR)/include
+
+# 库路径和链接
+LIBS = -L$(P3DFFT_DIR)/lib -L$(FFTW_LIB) \
+       -lp3dfft -lfftw3_mpi -lfftw3_omp -lfftw3 -lgfortran -lmpi_mpifh -lm \
+       -Wl,-rpath,$(P3DFFT_DIR)/lib
+
+# 目标可执行文件
+TARGET = navier_stokes_p3dfft
+
+all: $(TARGET)
+
+# 编译p3dfft版本
+$(TARGET): NavierStokes_periodic_p3dfft.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET)"
+
+clean:
+	rm -f $(TARGET) *.o
+
+test: $(TARGET)
+	mpirun -np 4 ./$(TARGET)
+
+.PHONY: all clean test

@@ -5,10 +5,9 @@ CC = mpicc
 CXX = mpicxx
 CXXFLAGS = -O3 -std=c++11 -Wall -fopenmp
 
-# FFTW路径（根据你的系统调整）
-FFTW_DIR = /usr/local
-FFTW_INC = -I$(FFTW_DIR)/include
-FFTW_LIB = -L$(FFTW_DIR)/lib -lfftw3_mpi -lfftw3 -lfftw3_threads -lm
+# FFTW路径（系统安装）
+FFTW_INC = -I/usr/include
+FFTW_LIB = -L/usr/lib/x86_64-linux-gnu -lfftw3_mpi -lfftw3 -lfftw3_threads -lm
 
 # 包含和链接
 INCLUDES = $(FFTW_INC)

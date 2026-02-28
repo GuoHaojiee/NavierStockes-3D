@@ -1,0 +1,45 @@
+# Makefile for AccFFT版本求解器
+
+CXX = mpicxx
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+
+# AccFFT路径（安装在用户目录）
+ACCFFT_DIR = /home/guohaojie/.local
+
+# FFTW路径（AccFFT依赖，系统安装）
+FFTW_LIB = /usr/lib/x86_64-linux-gnu
+
+# 包含路径
+INCLUDES = -I$(ACCFFT_DIR)/include
+
+# 库路径和链接（AccFFT不使用fftw_mpi，自己实现MPI通信）
+LIBS = -L$(ACCFFT_DIR)/lib -L$(FFTW_LIB) \
+       -laccfft -lfftw3 -lfftw3f -lfftw3_threads -lfftw3f_threads -lm \
+       -Wl,-rpath,$(ACCFFT_DIR)/lib
+
+# 目标可执行文件
+TARGET_TEST = test_spectral_derivative_accfft
+TARGET_NS   = navier_stokes_accfft
+
+all: $(TARGET_TEST) $(TARGET_NS)
+
+# 频谱导数验证程序
+$(TARGET_TEST): test_spectral_derivative_accfft.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET_TEST)"
+
+# NavierStokes 求解器（AccFFT 版）
+$(TARGET_NS): NavierStokes_periodic_accfft.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET_NS)"
+
+clean:
+	rm -f $(TARGET_TEST) $(TARGET_NS) *.o
+
+test: $(TARGET_TEST)
+	mpirun -np 4 ./$(TARGET_TEST)
+
+run: $(TARGET_NS)
+	mpirun -np 4 ./$(TARGET_NS)
+
+.PHONY: all clean test run
