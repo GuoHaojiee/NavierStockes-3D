@@ -569,7 +569,7 @@ int main(int argc, char **argv) {
     const double dx = L_x/nx, dy = L_y/ny, dz = L_z/nz;
 
     const ptrdiff_t nt_total = 20000;
-    const ptrdiff_t nt_run   = 10;
+    const ptrdiff_t nt_run   = 2000;
     const double T   = 1.0;
     const double tau = T / nt_total;  // dt = 5e-5
 

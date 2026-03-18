@@ -538,7 +538,7 @@ int main(int argc, char** argv) {
     const double dx = Lx/nx, dy = Ly/ny, dz = Lz/nz;
 
     const ptrdiff_t nt_total = 20000;
-    const ptrdiff_t nt_run   = 10;
+    const ptrdiff_t nt_run   = 100;
     const double T  = 1.0;
     const double dt = T / nt_total;    // dt = 5e-5
 

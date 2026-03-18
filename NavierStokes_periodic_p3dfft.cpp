@@ -22,6 +22,7 @@
 #include <vector>
 #include <mpi.h>
 #include <omp.h>
+#include <fftw3.h>
 #include <p3dfft.h>
 
 using namespace std;
@@ -550,7 +551,7 @@ int main(int argc, char** argv) {
     const double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
 
     const ptrdiff_t nt_total = 20000;
-    const ptrdiff_t nt_run   = 10;
+    const ptrdiff_t nt_run   = 2000;
     const double T  = 1.0;
     const double dt = T / nt_total;    // dt = 5e-5
 
@@ -563,6 +564,14 @@ int main(int argc, char** argv) {
     int dims[2] = {0, 0};
     MPI_Dims_create(nprocs, 2, dims);
 
+    // ------------------------------------------------------------------
+    // FFTW 多线程初始化（必须在 Cp3dfft_setup 之前调用，使 p3dfft 内部的
+    // FFTW 计划创建时使用多线程，与 FFTW / AccFFT 版本保持一致）
+    // ------------------------------------------------------------------
+    int max_threads = omp_get_max_threads();
+    fftw_init_threads();
+    fftw_plan_with_nthreads(max_threads);
+
     if (rank == 0) {
         cout << "============================================================\n";
         cout << "  Navier-Stokes Solver - p3dfft Version (2D Pencil)\n";
@@ -571,6 +580,7 @@ int main(int argc, char** argv) {
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs
              << " (2D grid " << dims[0] << "x" << dims[1] << ")\n";
+        cout << "OpenMP threads/process: " << max_threads << "\n";
         cout << "Steps: " << nt_run << " / " << nt_total << ", dt = " << dt << "\n";
         cout << "============================================================\n";
     }
@@ -784,6 +794,7 @@ int main(int argc, char** argv) {
     }
 
     Cp3dfft_clean();
+    fftw_cleanup_threads();
     MPI_Finalize();
     return 0;
 }

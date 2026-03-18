@@ -1,0 +1,33 @@
+# Makefile for cuFFT 单 GPU 版本求解器
+
+NVCC      = nvcc
+# 请根据实际 GPU 架构修改 -arch：
+#   sm_60 Pascal (GTX 10xx)
+#   sm_70 Volta  (V100, Titan V)
+#   sm_80 Ampere (A100, RTX 3080)
+#   sm_86 Ampere (RTX 3090, A6000)
+#   sm_89 Ada    (RTX 4090)
+#   sm_90 Hopper (H100)
+ARCH      = sm_86
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH)
+
+# cuFFT / CUDA（系统安装路径，通常在 /usr/local/cuda）
+CUDA_DIR  = /usr/local/cuda
+INCLUDES  = -I$(CUDA_DIR)/include
+LIBS      = -L$(CUDA_DIR)/lib64 -lcufft -lcudart -lm
+
+TARGET    = navier_stokes_cufft
+
+all: $(TARGET)
+
+$(TARGET): NavierStokes_periodic_cufft.cu
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET)
+
+.PHONY: all clean run

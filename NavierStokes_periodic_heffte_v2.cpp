@@ -456,7 +456,7 @@ int main(int argc, char** argv) {
     const double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
 
     const ptrdiff_t nt_total = 20000;  // 总步数（用于计算 dt）
-    const ptrdiff_t nt_run   = 10;     // 实际运行步数（验证用）
+    const ptrdiff_t nt_run   = 2000;     // 实际运行步数（验证用）
     const double T  = 1.0;
     const double dt = T / nt_total;    // dt = 5e-5
 
