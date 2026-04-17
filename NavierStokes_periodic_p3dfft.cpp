@@ -351,10 +351,12 @@ void compute_nonlinear(const P3DCtx& ctx,
     }
 
     // 3. 实空间计算 v × rot(v)，覆盖 rot_r（复用为工作数组）
+    // 循环顺序 k(z)→j(y)→i(x)：p3dfft Fortran 列主序 x 最快（stride=1），
+    // x 放最内层可保证连续内存访问，避免大步长缓存缺失。
     #pragma omp parallel for collapse(3)
-    for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+    for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
         for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
-            for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+            for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
                 size_t idx = idx_r(ctx, i, j, k);
                 double v1 = V1_r[idx], v2 = V2_r[idx], v3 = V3_r[idx];
                 double w1 = rot1_r[idx], w2 = rot2_r[idx], w3 = rot3_r[idx];
@@ -421,10 +423,11 @@ void compute_rhs(const P3DCtx& ctx,
     compute_viscous(ctx, V3_c, visc3_c);
 
     // 3. 外力项 f（实空间 → 频谱空间，不归一化）
+    // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
     #pragma omp parallel for collapse(3)
-    for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+    for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
         for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
-            for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+            for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
                 size_t idx = idx_r(ctx, i, j, k);
                 double x = phys_x(ctx, i, dx);
                 double y = phys_y(ctx, j, dy);
@@ -648,9 +651,10 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 初始条件（t=0）
     // ------------------------------------------------------------------
-    for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+    // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
+    for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
         for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
-            for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+            for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
                 size_t ridx = idx_r(ctx, i, j, k);
                 double x = phys_x(ctx, i, dx);
                 double y = phys_y(ctx, j, dy);
@@ -693,10 +697,11 @@ int main(int argc, char** argv) {
             V3_r[idx] *= inv_n;
         }
 
+        // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
         double local_err = 0.0, local_max = 0.0;
-        for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+        for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
             for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
-                for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+                for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
                     size_t idx = idx_r(ctx, i, j, k);
                     double x = phys_x(ctx, i, dx);
                     double y = phys_y(ctx, j, dy);

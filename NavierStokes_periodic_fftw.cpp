@@ -17,19 +17,11 @@ using namespace std;
 // 使用FFTW MPI进行3D R2C/C2R变换
 // ==============================================================================
 
-// 全局FFTW计划
-// 速度场（plan 绑定到 V_r <-> V_c）
-fftw_plan plan_fwd_v1, plan_fwd_v2, plan_fwd_v3;  // V_r -> V_c
-fftw_plan plan_bwd_v1, plan_bwd_v2, plan_bwd_v3;  // V_c -> V_r
-
-// 旋度场（plan 绑定到 rot_c -> rot_r）
-fftw_plan plan_bwd_rot1, plan_bwd_rot2, plan_bwd_rot3;  // rot_c -> rot_r
-
-// 非线性项（plan 绑定到 rot_r -> nl_c，叉乘后覆盖 rot_r）
-fftw_plan plan_fwd_nl1, plan_fwd_nl2, plan_fwd_nl3;   // rot_r -> nl_c
-
-// 外力项（plan 绑定到 work_r -> f_c）
-fftw_plan plan_fwd_f1, plan_fwd_f2, plan_fwd_f3;      // work_r -> f_c
+// 全局FFTW计划（仅 2 个，通过 fftw_mpi_execute_dft_r2c/c2r 新执行 API 复用）
+// FFTW plan 描述"变换几何"（网格大小、类型、布局），与具体数组无关；
+// 只要所有数组均由 fftw_alloc_real/complex 分配（对齐保证），即可在执行时换指针。
+fftw_plan plan_r2c;  // 所有正变换（R2C）共用
+fftw_plan plan_c2r;  // 所有逆变换（C2R）共用
 
 // ==============================================================================
 // 解析解与强迫项（与 heFFTe/p3dfft 版本完全一致）
@@ -123,59 +115,28 @@ double func_f3(double x, double y, double z, double t) {
 // ==============================================================================
 
 /**
- * 初始化所有 FFTW MPI 3D 计划
+ * 初始化 FFTW MPI 3D 计划（仅创建 2 个）
  *
- * 归一化约定（与 heFFTe 版本对齐）：
- *   V_c = DFT(V_r) / N （归一化频谱系数）
- *   forward 后手动 /N；backward 后直接得到物理值（N * IDFT(V_c_norm) = V_phys）
+ * plan_r2c / plan_c2r 描述"变换几何"（nx×ny×nz，R2C/C2R，MPI 分解），
+ * 与具体数组无关。执行时通过 fftw_mpi_execute_dft_r2c / _c2r 传入实际指针，
+ * 前提：所有数组均由 fftw_alloc_real / fftw_alloc_complex 分配（对齐一致）。
  *
- * 为消除热循环中的动态内存分配，所有需要专用 plan 的 (src, dst) 对均在此创建：
- *   plan_bwd_v{1,2,3}  : V_c -> V_r    （速度逆变换，已存在）
- *   plan_fwd_v{1,2,3}  : V_r -> V_c    （速度正变换，已存在）
- *   plan_bwd_rot{1,2,3}: rot_c -> rot_r （旋度逆变换，新增）
- *   plan_fwd_nl{1,2,3} : rot_r -> nl_c  （叉乘结果正变换，新增；叉乘后 rot_r 被覆盖）
- *   plan_fwd_f{1,2,3}  : work_r -> f_c  （外力正变换，新增）
+ * 对比旧方案：15 个 plan × FFTW_MEASURE 预计算 → 2 个，初始化开销显著降低。
+ *
+ * any_r : 任意一个已分配的实数组（大小 2*alloc_local），用于 plan 创建
+ * any_c : 任意一个已分配的复数组（大小 alloc_local），用于 plan 创建
  */
 void initialize_fftw_3d(ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                        double *V1_r,    double *V2_r,    double *V3_r,
-                        fftw_complex *V1_c,   fftw_complex *V2_c,   fftw_complex *V3_c,
-                        double *rot1_r,  double *rot2_r,  double *rot3_r,
-                        fftw_complex *rot1_c, fftw_complex *rot2_c, fftw_complex *rot3_c,
-                        fftw_complex *nl1_c,  fftw_complex *nl2_c,  fftw_complex *nl3_c,
-                        double *work_r1, double *work_r2, double *work_r3,
-                        fftw_complex *f1_c,   fftw_complex *f2_c,   fftw_complex *f3_c) {
-
-    // 速度正/逆变换（已有）
-    plan_fwd_v1 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, V1_r, V1_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_v2 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, V2_r, V2_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_v3 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, V3_r, V3_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-
-    plan_bwd_v1 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, V1_c, V1_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_bwd_v2 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, V2_c, V2_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_bwd_v3 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, V3_c, V3_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-
-    // 旋度逆变换（新增）：rot_c -> rot_r
-    plan_bwd_rot1 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, rot1_c, rot1_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_bwd_rot2 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, rot2_c, rot2_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_bwd_rot3 = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, rot3_c, rot3_r, MPI_COMM_WORLD, FFTW_ESTIMATE);
-
-    // 非线性项正变换（新增）：rot_r -> nl_c（叉乘后 rot_r 保存叉乘结果）
-    plan_fwd_nl1 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, rot1_r, nl1_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_nl2 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, rot2_r, nl2_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_nl3 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, rot3_r, nl3_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-
-    // 外力正变换（新增）：work_r -> f_c
-    plan_fwd_f1 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, work_r1, f1_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_f2 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, work_r2, f2_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
-    plan_fwd_f3 = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, work_r3, f3_c, MPI_COMM_WORLD, FFTW_ESTIMATE);
+                        double *any_r, fftw_complex *any_c) {
+    plan_r2c = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, any_r, any_c,
+                                         MPI_COMM_WORLD, FFTW_MEASURE);
+    plan_c2r = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, any_c, any_r,
+                                         MPI_COMM_WORLD, FFTW_MEASURE);
 }
 
 void finalize_fft_plans() {
-    fftw_destroy_plan(plan_fwd_v1);   fftw_destroy_plan(plan_fwd_v2);   fftw_destroy_plan(plan_fwd_v3);
-    fftw_destroy_plan(plan_bwd_v1);   fftw_destroy_plan(plan_bwd_v2);   fftw_destroy_plan(plan_bwd_v3);
-    fftw_destroy_plan(plan_bwd_rot1); fftw_destroy_plan(plan_bwd_rot2); fftw_destroy_plan(plan_bwd_rot3);
-    fftw_destroy_plan(plan_fwd_nl1);  fftw_destroy_plan(plan_fwd_nl2);  fftw_destroy_plan(plan_fwd_nl3);
-    fftw_destroy_plan(plan_fwd_f1);   fftw_destroy_plan(plan_fwd_f2);   fftw_destroy_plan(plan_fwd_f3);
+    fftw_destroy_plan(plan_r2c);
+    fftw_destroy_plan(plan_c2r);
 }
 
 // ==============================================================================
@@ -307,13 +268,13 @@ void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
 //
 // 算法（与 heFFTe/p3dfft 版本完全相同）：
 //   1. 频谱空间计算旋度 rot_c = ik × V_c                 （无 FFT）
-//   2. 逆变换 V_c → V_r（plan_bwd_v）                    （3 FFTs）
-//   3. 逆变换 rot_c → rot_r（plan_bwd_rot）               （3 FFTs）
+//   2. 逆变换 V_c → V_r（plan_c2r）                      （3 FFTs）
+//   3. 逆变换 rot_c → rot_r（plan_c2r）                   （3 FFTs）
 //   4. 实空间叉乘，结果覆盖 rot_r                         （无 FFT）
-//   5. 正变换 rot_r → nl_c（plan_fwd_nl），归一化          （3 FFTs）
+//   5. 正变换 rot_r → nl_c（plan_r2c），归一化             （3 FFTs）
 // 合计：9 次 FFT，零动态内存分配
 //
-// 注意：V_c 在此函数中只读（plan_bwd_v 为 out-of-place，不破坏 V_c）
+// 注意：V_c 在此函数中只读（plan_c2r 为 out-of-place，不破坏 V_c）
 // ==============================================================================
 void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                             fftw_complex* nl1_c,  fftw_complex* nl2_c,  fftw_complex* nl3_c,
@@ -331,15 +292,15 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
     compute_rot(V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c,
                 nx, ny, nz, local_n0, local_0_start);
 
-    // 2. 速度逆变换：V_c → V_r（plan_bwd_v 为 out-of-place，V_c 不被修改）
-    fftw_execute(plan_bwd_v1);
-    fftw_execute(plan_bwd_v2);
-    fftw_execute(plan_bwd_v3);
+    // 2. 速度逆变换：V_c → V_r（plan_c2r，out-of-place，V_c 不被修改）
+    fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
+    fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
+    fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
 
     // 3. 旋度逆变换：rot_c → rot_r（专用 plan，无需借用 V_c 作中转）
-    fftw_execute(plan_bwd_rot1);
-    fftw_execute(plan_bwd_rot2);
-    fftw_execute(plan_bwd_rot3);
+    fftw_mpi_execute_dft_c2r(plan_c2r, rot1_c, rot1_r);
+    fftw_mpi_execute_dft_c2r(plan_c2r, rot2_c, rot2_r);
+    fftw_mpi_execute_dft_c2r(plan_c2r, rot3_c, rot3_r);
 
     // 4. 实空间叉乘 v × rot(v)，结果覆盖 rot_r（后续用于正变换）
     //    FFTW R2C 实空间数组 padding：行步长 = 2*(nz/2+1)
@@ -358,9 +319,9 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
     }
 
     // 5. 正变换：rot_r（叉乘结果）→ nl_c（专用 plan，不触碰 V_c）
-    fftw_execute(plan_fwd_nl1);
-    fftw_execute(plan_fwd_nl2);
-    fftw_execute(plan_fwd_nl3);
+    fftw_mpi_execute_dft_r2c(plan_r2c, rot1_r, nl1_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, rot2_r, nl2_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, rot3_r, nl3_c);
 
     // 归一化（FFTW 正变换不归一化，除以 N 得到归一化频谱系数）
     #pragma omp parallel for
@@ -395,7 +356,7 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
     ptrdiff_t total_c = local_n0 * ny * nz_c;
     double norm = (double)(nx * ny * nz);
 
-    // 1. 非线性项 v×rot(v)（伪谱，plan_bwd_v 不破坏 V_c，plan_bwd_rot 和 plan_fwd_nl 专用）
+    // 1. 非线性项 v×rot(v)（伪谱，plan_c2r out-of-place 不破坏 V_c）
     compute_nonlinear_term(V1_c, V2_c, V3_c, nl1_c, nl2_c, nl3_c,
                            V1_r, V2_r, V3_r, rot1_r, rot2_r, rot3_r,
                            rot1_c, rot2_c, rot3_c,
@@ -406,7 +367,7 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
     compute_viscous_term(V2_c, visc2_c, nx, ny, nz, local_n0, local_0_start);
     compute_viscous_term(V3_c, visc3_c, nx, ny, nz, local_n0, local_0_start);
 
-    // 3. 外力项 f（实空间填充 → 专用 plan_fwd_f 直接写到 f_c，不触碰 V_c）
+    // 3. 外力项 f（实空间填充 → plan_r2c 正变换到 f_c，不触碰 V_c）
     #pragma omp parallel for collapse(3)
     for(ptrdiff_t i = 0; i < local_n0; ++i) {
         for(ptrdiff_t j = 0; j < ny; ++j) {
@@ -420,9 +381,9 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
             }
         }
     }
-    fftw_execute(plan_fwd_f1);  // work_r1 -> f1_c
-    fftw_execute(plan_fwd_f2);
-    fftw_execute(plan_fwd_f3);
+    fftw_mpi_execute_dft_r2c(plan_r2c, work_r1, f1_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, work_r2, f2_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, work_r3, f3_c);
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_c; ++i) {
         f1_c[i][0] /= norm;  f1_c[i][1] /= norm;
@@ -637,7 +598,7 @@ int main(int argc, char **argv) {
     fftw_complex *f2_c    = fftw_alloc_complex(alloc_local);
     fftw_complex *f3_c    = fftw_alloc_complex(alloc_local);
 
-    // 外力实空间工作数组（plan_fwd_f 绑定到这里）
+    // 外力实空间工作数组
     double *work_r1 = fftw_alloc_real(2 * alloc_local);
     double *work_r2 = fftw_alloc_real(2 * alloc_local);
     double *work_r3 = fftw_alloc_real(2 * alloc_local);
@@ -671,12 +632,8 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     double t_plan_start = MPI_Wtime();
 
-    initialize_fftw_3d(nx, ny, nz,
-                       V1_r,   V2_r,   V3_r,   V1_c,   V2_c,   V3_c,
-                       rot1_r, rot2_r, rot3_r, rot1_c, rot2_c, rot3_c,
-                       nl1_c,  nl2_c,  nl3_c,
-                       work_r1, work_r2, work_r3,
-                       f1_c,   f2_c,   f3_c);
+    // 只需任意一对合法缓冲区创建 plan；执行时通过 fftw_mpi_execute_* 换指针
+    initialize_fftw_3d(nx, ny, nz, V1_r, V1_c);
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
@@ -702,9 +659,9 @@ int main(int argc, char **argv) {
     }
 
     // 正变换 → 归一化（V_c = DFT(V_r)/N）
-    fftw_execute(plan_fwd_v1);
-    fftw_execute(plan_fwd_v2);
-    fftw_execute(plan_fwd_v3);
+    fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
+    fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
 
     double norm_factor = (double)(nx * ny * nz);
     ptrdiff_t nz_c = nz/2+1;
@@ -724,9 +681,9 @@ int main(int argc, char **argv) {
     // 打印初始误差
     // ------------------------------------------------------------------
     {
-        fftw_execute(plan_bwd_v1);
-        fftw_execute(plan_bwd_v2);
-        fftw_execute(plan_bwd_v3);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
 
         double local_err = 0.0, local_max = 0.0;
         #pragma omp parallel for collapse(3) reduction(+:local_err) reduction(max:local_max)
@@ -757,9 +714,9 @@ int main(int argc, char **argv) {
 
         // 恢复 V_c（backward 为 out-of-place，V_c 本身未被修改；但后续 rk4 需要 V_c 正确）
         // 这里重新做一次正变换保证 V_c 与 V_r 一致（V_r 此时是物理值）
-        fftw_execute(plan_fwd_v1);
-        fftw_execute(plan_fwd_v2);
-        fftw_execute(plan_fwd_v3);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
         #pragma omp parallel for
         for(ptrdiff_t i = 0; i < total_c; ++i) {
             V1_c[i][0] /= norm_factor;  V1_c[i][1] /= norm_factor;
@@ -808,9 +765,9 @@ int main(int argc, char **argv) {
         double t_cur = it * tau;
 
         // --- 误差计算（不计入 wall time）---
-        fftw_execute(plan_bwd_v1);
-        fftw_execute(plan_bwd_v2);
-        fftw_execute(plan_bwd_v3);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
 
         double local_err = 0.0;
         #pragma omp parallel for collapse(3) reduction(+:local_err)
@@ -831,9 +788,9 @@ int main(int argc, char **argv) {
         MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
         // 恢复 V_c（从 V_r 重新正变换；V_r 此时包含当前步物理值）
-        fftw_execute(plan_fwd_v1);
-        fftw_execute(plan_fwd_v2);
-        fftw_execute(plan_fwd_v3);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
         #pragma omp parallel for
         for(ptrdiff_t i = 0; i < total_c; ++i) {
             V1_c[i][0] /= norm_factor;  V1_c[i][1] /= norm_factor;
