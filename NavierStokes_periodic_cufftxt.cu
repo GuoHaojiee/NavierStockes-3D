@@ -970,9 +970,13 @@ int main() {
             (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
             s.nx_local, x_offset, 0.0);
     }
+    // kernel_fill_velocity runs on stream 0; D2Z uses cuFFT internal streams — must sync first.
+    sync_all_gpus(s);
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
+    // D2Z writes on internal streams; kernel_scale_cplx reads on stream 0 — must sync first.
+    sync_all_gpus(s);
     // Normalize
     const double inv_N = 1.0 / (double)(NX * NY * NZ);
     #pragma omp parallel for num_threads(s.nGPUs)
