@@ -1,32 +1,19 @@
-# Makefile for cuFFTXt 多 GPU 版本求解器
-# 需要 CUDA Toolkit >= 11.0（cuFFTXt 多 GPU 支持）
+CUDA_DIR = /usr/local/cuda-10.2
+ARCH     = sm_60
 
-NVCC      = nvcc
-# 根据集群 GPU 架构修改 -arch：
-#   sm_70  Volta  (V100)
-#   sm_80  Ampere (A100)
-#   sm_86  Ampere (RTX 3090, A6000)
-#   sm_89  Ada    (RTX 4090, L40)
-#   sm_90  Hopper (H100)
-ARCH      = sm_80
-NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -Xcompiler -fopenmp
+NVCC     = $(CUDA_DIR)/bin/nvcc
+INCLUDE  = -I$(CUDA_DIR)/targets/ppc64le-linux/include
+LIBDIR   = -L$(CUDA_DIR)/targets/ppc64le-linux/lib
+LIBS     = $(LIBDIR) -lcufft -lcudart -Wl,-rpath,$(CUDA_DIR)/targets/ppc64le-linux/lib
+OMP_FLAG = -Xcompiler -fopenmp -lgomp
 
-CUDA_DIR  = /usr/local/cuda
-INCLUDES  = -I$(CUDA_DIR)/include
-LIBS      = -L$(CUDA_DIR)/lib64 -lcufft -lcudart -lm -lgomp
+TARGET   = navier_stokes_cufftxt
+SRC      = NavierStokes_periodic_cufftxt.cu
 
-TARGET    = navier_stokes_cufftxt
-
-all: $(TARGET)
-
-$(TARGET): NavierStokes_periodic_cufftxt.cu
-	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
-	@echo "编译成功！可执行文件: $(TARGET)"
+all:
+	$(NVCC) -arch=$(ARCH) -O3 -std=c++14 \
+	    $(INCLUDE) $(OMP_FLAG) \
+	    -o $(TARGET) $(SRC) $(LIBS)
 
 clean:
 	rm -f $(TARGET)
-
-run: $(TARGET)
-	./$(TARGET)
-
-.PHONY: all clean run
