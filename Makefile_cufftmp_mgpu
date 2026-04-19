@@ -1,0 +1,46 @@
+# Makefile for cuFFTMp single-node multi-GPU version
+# Compile: make -f Makefile_cufftmp_mgpu
+# Run:     mpirun -np 4 ./navier_stokes_cufftmp_mgpu
+#
+# Requirements:
+#   - CUDA 11.7+ with cuFFTMp support
+#   - cuFFTMp header: $CUDA_DIR/include/cufftMp.h
+#   - cuFFTMp library: libcufftMp.so (may be in $CUDA_DIR/lib64 or a separate path)
+#   - CUDA-aware MPI
+#
+# If cuFFTMp is in a separate location (e.g., NVIDIA HPC SDK):
+#   CUFFTMP_DIR = /opt/nvidia/hpc_sdk/Linux_x86_64/23.x/math_libs
+#   Add: -I$(CUFFTMP_DIR)/include  -L$(CUFFTMP_DIR)/lib64 -lcufftMp
+#
+# For NCCL-based communication (recommended):
+#   NCCL_DIR = /usr/local/nccl
+#   Add: -I$(NCCL_DIR)/include  -L$(NCCL_DIR)/lib -lnccl
+
+CUDA_DIR = /usr/local/cuda
+
+ARCH = sm_80
+
+NVCC      = nvcc
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -ccbin mpicxx
+
+INCLUDES  = -I$(CUDA_DIR)/include
+# cuFFTMp is included in CUDA 11.7+; if not, adjust path to libcufftMp
+LIBS      = -L$(CUDA_DIR)/lib64 -lcufftMp -lcufft -lcudart -lm \
+            -Wl,-rpath,$(CUDA_DIR)/lib64
+
+TARGET = navier_stokes_cufftmp_mgpu
+SRC    = NavierStokes_periodic_cufftmp_mgpu.cu
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "Done: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+run4: $(TARGET)
+	mpirun -np 4 ./$(TARGET)
+
+.PHONY: all clean run4

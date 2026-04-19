@@ -1,0 +1,42 @@
+# Makefile for heFFTe multi-node multi-GPU version
+# Compile: make -f Makefile_heffte_multigpu
+#
+# Run examples (adapt to your scheduler):
+#   Slurm:
+#     srun -N 2 --ntasks-per-node 4 --gpus-per-task 1 ./navier_stokes_heffte_multigpu
+#   OpenMPI:
+#     mpirun -np 8 --map-by ppr:4:node --bind-to none ./navier_stokes_heffte_multigpu
+#
+# Requirements:
+#   - CUDA-aware MPI (UCX with CUDA support, or OpenMPI --with-cuda)
+#   - heFFTe built with GPU backend (heffte_ENABLE_CUDA=ON)
+#   - InfiniBand (IB) for inter-node GPU communication
+#
+# Check CUDA-aware MPI: ompi_info --parseable --all | grep mpi_built_with_cuda_support
+
+HEFFTE_DIR = /home/guohaojie/.local
+CUDA_DIR   = /usr/local/cuda
+
+ARCH = sm_80
+
+NVCC      = nvcc
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -ccbin mpicxx -Xcompiler -fopenmp
+
+INCLUDES  = -I$(HEFFTE_DIR)/include -I$(CUDA_DIR)/include
+LIBS      = -L$(HEFFTE_DIR)/lib -lheffte \
+            -L$(CUDA_DIR)/lib64 -lcufft -lcudart -lm \
+            -Wl,-rpath,$(HEFFTE_DIR)/lib -Wl,-rpath,$(CUDA_DIR)/lib64
+
+TARGET = navier_stokes_heffte_multigpu
+SRC    = NavierStokes_periodic_heffte_multigpu.cu
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "Done: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all clean

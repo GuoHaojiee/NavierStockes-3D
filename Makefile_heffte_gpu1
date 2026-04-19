@@ -1,0 +1,36 @@
+# Makefile for heFFTe single GPU version
+# Compile: make -f Makefile_heffte_gpu1
+# Run:     mpirun -np 1 ./navier_stokes_heffte_gpu1
+
+HEFFTE_DIR = /home/guohaojie/.local
+CUDA_DIR   = /usr/local/cuda
+
+# Adapt GPU architecture:
+#   sm_70 Volta (V100), sm_80 Ampere (A100), sm_86 (RTX3090), sm_89 Ada (RTX4090), sm_90 Hopper (H100)
+ARCH = sm_80
+
+NVCC      = nvcc
+# Use mpicxx as host compiler so MPI headers/libs are found automatically
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -ccbin mpicxx -Xcompiler -fopenmp
+
+INCLUDES  = -I$(HEFFTE_DIR)/include -I$(CUDA_DIR)/include
+LIBS      = -L$(HEFFTE_DIR)/lib -lheffte \
+            -L$(CUDA_DIR)/lib64 -lcufft -lcudart -lm \
+            -Wl,-rpath,$(HEFFTE_DIR)/lib -Wl,-rpath,$(CUDA_DIR)/lib64
+
+TARGET = navier_stokes_heffte_gpu1
+SRC    = NavierStokes_periodic_heffte_gpu1.cu
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "Done: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+run: $(TARGET)
+	mpirun -np 1 ./$(TARGET)
+
+.PHONY: all clean run

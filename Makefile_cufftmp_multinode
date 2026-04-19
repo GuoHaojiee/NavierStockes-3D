@@ -1,0 +1,43 @@
+# Makefile for cuFFTMp multi-node multi-GPU version
+# Compile: make -f Makefile_cufftmp_multinode
+#
+# Run examples:
+#   Slurm:
+#     srun -N 2 --ntasks-per-node 4 --gpus-per-task 1 ./navier_stokes_cufftmp_multinode
+#   OpenMPI:
+#     mpirun -np 8 --map-by ppr:4:node --bind-to none ./navier_stokes_cufftmp_multinode
+#
+# Requirements:
+#   - CUDA 11.7+ with cuFFTMp
+#   - CUDA-aware MPI with InfiniBand support for cross-node GPU transfers
+#   - NCCL with IB: set NCCL_IB_DISABLE=0, NCCL_DEBUG=INFO for verification
+#
+# Inter-node performance tuning:
+#   export NCCL_IB_HCA=mlx5_0      # Specify IB device
+#   export NCCL_SOCKET_IFNAME=ib0   # Or use RoCE interface
+#   export UCX_NET_DEVICES=mlx5_0:1
+
+CUDA_DIR = /usr/local/cuda
+
+ARCH = sm_80
+
+NVCC      = nvcc
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -ccbin mpicxx
+
+INCLUDES  = -I$(CUDA_DIR)/include
+LIBS      = -L$(CUDA_DIR)/lib64 -lcufftMp -lcufft -lcudart -lm \
+            -Wl,-rpath,$(CUDA_DIR)/lib64
+
+TARGET = navier_stokes_cufftmp_multinode
+SRC    = NavierStokes_periodic_cufftmp_multinode.cu
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "Done: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all clean

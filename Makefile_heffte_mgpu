@@ -1,0 +1,41 @@
+# Makefile for heFFTe single-node multi-GPU version
+# Compile: make -f Makefile_heffte_mgpu
+# Run:     mpirun -np 4 ./navier_stokes_heffte_mgpu   (4 GPUs on one node)
+#
+# Requires CUDA-aware MPI for heFFTe GPU-to-GPU communication.
+# OpenMPI with CUDA support: mpirun --mca btl_smcuda_use_cuda_ipc 1 ...
+# Or set: export OMPI_MCA_btl=^openib; export OMPI_MCA_opal_cuda_support=true
+
+HEFFTE_DIR = /home/guohaojie/.local
+CUDA_DIR   = /usr/local/cuda
+
+ARCH = sm_80
+
+NVCC      = nvcc
+NVCCFLAGS = -O3 -std=c++17 -arch=$(ARCH) -ccbin mpicxx -Xcompiler -fopenmp
+
+INCLUDES  = -I$(HEFFTE_DIR)/include -I$(CUDA_DIR)/include
+LIBS      = -L$(HEFFTE_DIR)/lib -lheffte \
+            -L$(CUDA_DIR)/lib64 -lcufft -lcudart -lm \
+            -Wl,-rpath,$(HEFFTE_DIR)/lib -Wl,-rpath,$(CUDA_DIR)/lib64
+
+TARGET = navier_stokes_heffte_mgpu
+SRC    = NavierStokes_periodic_heffte_mgpu.cu
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "Done: $(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+# Single-node: all ranks bind to GPUs 0,1,2,...
+run4: $(TARGET)
+	mpirun -np 4 ./$(TARGET)
+
+run8: $(TARGET)
+	mpirun -np 8 ./$(TARGET)
+
+.PHONY: all clean run4 run8
