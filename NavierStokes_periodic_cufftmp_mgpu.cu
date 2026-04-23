@@ -2,47 +2,38 @@
 // Multi-GPU Navier-Stokes solver using cuFFTMp (single node, multiple GPUs via MPI)
 //
 // =============================================================================
-//  FIXES APPLIED (vs. previous version that hit CUFFT_INVALID_VALUE at line 330):
+//  架构说明 (vs 你之前报 error 4 的版本):
 // =============================================================================
-//  1. REMOVED cufftXtSetDistribution.
-//     The correct signature is
-//        cufftXtSetDistribution(plan, rank,
-//           lower_input, upper_input, lower_output, upper_output,
-//           strides_input, strides_output)
-//     i.e. strides come LAST. The old code interleaved strides between boxes,
-//     producing a NULL lower_output pointer -> CUFFT_INVALID_VALUE. Additionally,
-//     the upper bounds were inclusive, but the API requires them exclusive
-//     (lower[i] <= p[i] < upper[i]). Rather than fix both bugs, we drop the
-//     custom distribution entirely and use cuFFTMp's built-in slab decomposition.
+//  1. 不使用 cufftXtSetDistribution -- 完全依赖 cuFFTMp 内建 slab 分解。
+//     原代码对 cufftXtSetDistribution 参数顺序理解错误 (strides 应在末尾)，
+//     且 upper 边界应为开区间。这里直接用内建 slab, 无需自定义 distribution。
 //
-//  2. BUFFERS ARE NOW NVSHMEM-ALLOCATED via cufftXtMalloc (was: cudaMalloc).
-//     cuFFTMp requires buffers passed to cufftExec* / cufftXtExecDescriptor* to
-//     come from the NVSHMEM symmetric heap. Regular cudaMalloc pointers fail at
-//     runtime. cufftXtMalloc internally uses nvshmem_malloc for us.
+//  2. Buffer 通过 cufftXtMalloc 分配 (内部走 NVSHMEM symmetric heap)。
+//     传给 cufftXt* 的 buffer 必须来自 NVSHMEM, 普通 cudaMalloc 指针会崩。
 //
-//  3. TRANSFORMS ARE IN-PLACE (was: out-of-place with separate V_r / V_c).
-//     cuFFTMp only supports in-place transforms for its built-in slab format.
-//     Each buffer is a single descriptor that is reinterpreted as real (padded,
-//     X-slab) or complex (Y-slab) depending on subFormat.
+//  3. 变换是 in-place 的: V_buf 既存实数 (subFormat=2, X-slab, padded)
+//     也存频谱 (subFormat=3, Y-slab SHUFFLED)。同一块内存切换视角。
 //
-//  4. SPECTRAL KERNELS USE Y-SLAB LAYOUT (was: X-slab).
-//     After D2Z with built-in slab decomposition, cuFFTMp distributes the
-//     complex output in CUFFT_XT_FORMAT_INPLACE_SHUFFLED, which is a Y-slab:
-//       rank r owns all global x, y in [r*ny_local, (r+1)*ny_local), all kz.
-//     Local linear index i on rank r decodes as:
-//        gx      = i / (ny_local * NZC)        // full range 0..NX-1
-//        local_y = (i / NZC) % ny_local
-//        gy      = r * ny_local + local_y      // partial range
-//        kz      = i % NZC
+//  4. 频谱 kernel 使用 Y-slab 布局:
+//     D2Z 之后, rank r 拥有全部 gx in [0,NX), 局部 gy in [r*ny_local, (r+1)*ny_local),
+//     全部 kz in [0,NZC)。本地线性 idx 分解:
+//        kz      = idx % NZC
+//        local_y = (idx / NZC) % ny_local
+//        gx      = idx / (ny_local * NZC)
+//        gy      = r * ny_local + local_y
 //
-//  Run: mpirun -np <nprocs> ./navier_stokes_cufftmp_mgpu
-//   nprocs must divide both NX and NY (for equal-sized X-slab and Y-slab).
+//     实数 kernel 保持 X-slab 布局:
+//        k  = idx % NZ
+//        j  = (idx / NZ) % NY
+//        lx = idx / (NY * NZ)
+//        gi = r * nx_local + lx
+//     padded 访问: pidx = lx * NY * 2*NZC + j * 2*NZC + k
 //
-// Data layouts (per rank, single in-place descriptor reinterpreted):
-//  - Real   (subFormat=2, X-slab, padded last dim):
-//        V[lx][j][k]      at lx * NY * 2*NZC + j * 2*NZC + k
-//  - Complex(subFormat=3, Y-slab):
-//        V[gx][local_y][kz] at gx * ny_local * NZC + local_y * NZC + kz
+//  5. 每次 user kernel (stream 0) 与 cufftXt 调用之间都 cudaDeviceSynchronize()。
+//     cuFFTMp 使用内部流, 不会自动等待 stream 0。
+//
+//  要求 nprocs 同时整除 NX 和 NY (内建 slab 分解要求等分)。
+//  运行: mpirun -np <nprocs> ./navier_stokes_cufftmp_mgpu
 // =============================================================================
 
 #include <iostream>
@@ -68,7 +59,7 @@ typedef cufftDoubleComplex GCplx;
 // Grid parameters
 // ============================================================
 constexpr int    NX = 128, NY = 128, NZ = 128;
-constexpr int    NZC      = NZ/2 + 1;          // 65
+constexpr int    NZC      = NZ/2 + 1;
 constexpr double LX = 2.0*M_PI, LY = 2.0*M_PI, LZ = 2.0*M_PI;
 constexpr double DX = LX/NX, DY = LY/NY, DZ = LZ/NZ;
 constexpr int    NT_TOTAL = 20000;
@@ -76,22 +67,15 @@ constexpr int    NT_RUN   = 10;
 constexpr double TAU      = 1.0 / NT_TOTAL;
 constexpr int    BLOCK    = 256;
 
-// ============================================================
-// Error macros
-// ============================================================
 #define CUDA_CHECK(e) do { cudaError_t _e=(e); if(_e!=cudaSuccess){ \
-    fprintf(stderr,"[rank?] CUDA error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(_e)); \
+    fprintf(stderr,"CUDA error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(_e)); \
     MPI_Abort(MPI_COMM_WORLD,1);} } while(0)
 #define CUFFT_CHECK(e) do { cufftResult _e=(e); if(_e!=CUFFT_SUCCESS){ \
-    fprintf(stderr,"[rank?] cuFFT error %s:%d: code %d\n",__FILE__,__LINE__,(int)_e); \
+    fprintf(stderr,"cuFFT error %s:%d: code %d\n",__FILE__,__LINE__,(int)_e); \
     MPI_Abort(MPI_COMM_WORLD,1);} } while(0)
 
-// ============================================================
-// subFormat helpers (cuFFTMp uses same cudaLibXtDesc_t as cuFFTXt)
-// ============================================================
-static inline void force_d2z_format(cudaLibXtDesc* d) { d->subFormat = CUFFT_XT_FORMAT_INPLACE;          } // = 2
-static inline void force_z2d_format(cudaLibXtDesc* d) { d->subFormat = CUFFT_XT_FORMAT_INPLACE_SHUFFLED; } // = 3
-// 1 MPI rank owns 1 GPU in cuFFTMp → data[0] is the local pointer.
+static inline void force_d2z_format(cudaLibXtDesc* d) { d->subFormat = CUFFT_XT_FORMAT_INPLACE;          }
+static inline void force_z2d_format(cudaLibXtDesc* d) { d->subFormat = CUFFT_XT_FORMAT_INPLACE_SHUFFLED; }
 static inline void* gpu_ptr(cudaLibXtDesc* d) { return d->descriptor->data[0]; }
 
 // ============================================================
@@ -120,8 +104,7 @@ __host__ __device__ double func_f2(double x,double y,double z,double t){return f
 __host__ __device__ double func_f3(double x,double y,double z,double t){return func_dV3_dt(x,y,z,t)-func_laplace_V3(x,y,z,t)-func_vcr3(x,y,z,t)+func_grad_p3(x,y,z,t);}
 
 // ============================================================
-// REAL-SPACE KERNELS (X-slab, subFormat=2, padded stride 2*NZC in last dim)
-//   gi = x_offset + lx,  lx = 0..nx_local-1
+// 实数空间 kernel (X-slab, subFormat=2, padded stride 2*NZC)
 // ============================================================
 
 __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
@@ -191,9 +174,7 @@ __global__ void kernel_error_sq(const double* V1, const double* V2, const double
 }
 
 // ============================================================
-// SPECTRAL-SPACE KERNELS (Y-slab, subFormat=3)
-//   gy = y_offset + local_y, local_y = 0..ny_local-1
-//   gx = full range 0..NX-1 (each rank has all of X in spectral)
+// 频谱空间 kernel (Y-slab, subFormat=3)
 // ============================================================
 
 __global__ void kernel_scale_cplx(GCplx* A, long long nc_local, double scale) {
@@ -294,7 +275,7 @@ __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3
 }
 
 // ============================================================
-// Layout-agnostic element-wise kernels
+// 布局无关的元素级 kernel
 // ============================================================
 
 __global__ void kernel_add_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
@@ -345,7 +326,7 @@ __global__ void kernel_copy_cplx(const GCplx* src, GCplx* dst, long long nc_loca
 }
 
 // ============================================================
-// Per-rank state
+// 每个 rank 的状态
 // ============================================================
 struct State {
     int rank, nprocs, gpu;
@@ -353,12 +334,10 @@ struct State {
     long long nc_local, nr_local;
     int x_offset, y_offset;
 
-    // cuFFTMp in-place descriptors (allocated via cufftXtMalloc, uses NVSHMEM)
     cudaLibXtDesc *V1_buf, *V2_buf, *V3_buf;
     cudaLibXtDesc *rot1_buf, *rot2_buf, *rot3_buf;
     cudaLibXtDesc *work1_buf, *work2_buf, *work3_buf;
 
-    // Aux per-rank spectral-only arrays (regular cudaMalloc — not passed to cufft exec)
     GCplx *visc1_c, *visc2_c, *visc3_c;
     GCplx *f1_c,    *f2_c,    *f3_c;
     GCplx *rhs1_c,  *rhs2_c,  *rhs3_c;
@@ -370,7 +349,6 @@ struct State {
 };
 
 static void alloc_state(State& s, cufftHandle plan_r2c) {
-    // In-place cuFFTMp buffers (NVSHMEM-backed)
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.V1_buf,    CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.V2_buf,    CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.V3_buf,    CUFFT_XT_FORMAT_INPLACE));
@@ -381,7 +359,6 @@ static void alloc_state(State& s, cufftHandle plan_r2c) {
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE));
 
-    // Aux complex arrays (cudaMalloc is fine here — no cufft exec touches them)
     auto C = [&](GCplx** p){ CUDA_CHECK(cudaMalloc(p, s.nc_local*sizeof(GCplx))); };
     C(&s.visc1_c); C(&s.visc2_c); C(&s.visc3_c);
     C(&s.f1_c);    C(&s.f2_c);    C(&s.f3_c);
@@ -410,18 +387,15 @@ static void free_state(State& s) {
 }
 
 // ============================================================
-// Physics — same structure as the cuFFTXt version, minus the OMP loop over GPUs
-// (because in cuFFTMp, 1 rank = 1 GPU, so no inner loop needed).
+// 物理计算
 // ============================================================
 
-// Nonlinear term: V × rot(V) → rhs_c
 static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s) {
     const double inv_N = 1.0/(double)(NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
 
-    // 1. Spectral vorticity written directly into rot_buf (Y-slab complex)
     kernel_compute_rot<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         (GCplx*)gpu_ptr(s.rot1_buf), (GCplx*)gpu_ptr(s.rot2_buf), (GCplx*)gpu_ptr(s.rot3_buf),
@@ -429,30 +403,25 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     force_z2d_format(s.rot1_buf); force_z2d_format(s.rot2_buf); force_z2d_format(s.rot3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 2. IFFT velocity: Y-slab complex → X-slab real
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
-    // 3. IFFT vorticity: Y-slab complex → X-slab real
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot1_buf, s.rot1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 4. Real-space cross product V × rot → rot_buf (X-slab padded)
     kernel_cross_product<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         (double*)gpu_ptr(s.rot1_buf), (double*)gpu_ptr(s.rot2_buf), (double*)gpu_ptr(s.rot3_buf),
         s.nx_local);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 5. FFT cross product → Y-slab spectral (subFormat becomes 3)
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot1_buf, s.rot1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 6. Copy and scale → rhs_c
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot1_buf), s.rhs1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot2_buf), s.rhs2_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot3_buf), s.rhs3_c, nc);
@@ -461,23 +430,19 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs3_c, nc, inv_N);
 }
 
-// Full RHS = nl + visc + f, projected to divergence-free
 static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
     const double inv_N = 1.0/(double)(NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
 
-    // Viscous (BEFORE nonlinear which consumes V_buf via Z2D)
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.visc1_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.visc2_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.visc3_c, s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Nonlinear → rhs_c (destroys V_buf via Z2D inside)
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
-    // Forcing
     force_d2z_format(s.work1_buf); force_d2z_format(s.work2_buf); force_d2z_format(s.work3_buf);
     kernel_fill_forcing<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.work1_buf), (double*)gpu_ptr(s.work2_buf), (double*)gpu_ptr(s.work3_buf),
@@ -495,13 +460,11 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     kernel_scale_cplx<<<gc, BLOCK>>>(s.f2_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.f3_c, nc, inv_N);
 
-    // rhs += visc + f
     kernel_add_to_rhs<<<gc, BLOCK>>>(
         s.rhs1_c, s.rhs2_c, s.rhs3_c,
         s.visc1_c, s.visc2_c, s.visc3_c,
         s.f1_c, s.f2_c, s.f3_c, nc);
 
-    // Project rhs to divergence-free space
     kernel_make_div_free<<<gc, BLOCK>>>(
         s.rhs1_c, s.rhs2_c, s.rhs3_c, s.ny_local, s.y_offset);
 }
@@ -575,7 +538,6 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         TAU/6.0, nc);
 }
 
-// Diagnostics with MPI reductions
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                  State& s, double t, double& L2_err, double& max_div) {
     const double inv_N = 1.0/(double)(NX*NY*NZ);
@@ -583,7 +545,6 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
 
-    // max|div V| (spectral Y-slab, before IFFT)
     kernel_div_abs<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.scratch, s.ny_local, s.y_offset);
@@ -592,13 +553,11 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     double local_max = thrust::reduce(thrust::device, sp, sp + nc, 0.0, thrust::maximum<double>());
     MPI_Allreduce(&local_max, &max_div, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
-    // IFFT V_buf → X-slab real
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Squared error
     kernel_error_sq<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         s.scratch, s.nx_local, s.x_offset, t);
@@ -608,13 +567,11 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     MPI_Allreduce(&local_sq, &global_sq, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     L2_err = sqrt(global_sq * DX * DY * DZ);
 
-    // Re-FFT V_buf → Y-slab spectral
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Renormalize (D2Z is not normalized)
     kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), nc, inv_N);
@@ -630,7 +587,6 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &s.rank);
     MPI_Comm_size(MPI_COMM_WORLD, &s.nprocs);
 
-    // Each rank binds to one GPU (single-node assumption)
     int num_gpus = 0;
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
     s.gpu = s.rank % num_gpus;
@@ -638,7 +594,6 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, s.gpu));
 
-    // Decomposition — require clean divisibility (built-in slab assumption)
     if (NX % s.nprocs != 0 || NY % s.nprocs != 0) {
         if (s.rank == 0) {
             fprintf(stderr, "Error: nprocs=%d must divide both NX=%d and NY=%d\n",
@@ -655,7 +610,7 @@ int main(int argc, char** argv) {
 
     if (s.rank == 0) {
         cout << "============================================================\n";
-        cout << "  Navier-Stokes — cuFFTMp Built-in Slab (fixed)\n";
+        cout << "  Navier-Stokes -- cuFFTMp Built-in Slab (NEW VERSION)\n";
         cout << "============================================================\n";
         cout << "MPI ranks: " << s.nprocs << "  GPUs/node: " << num_gpus << "\n";
         cout << "Grid: " << NX << " x " << NY << " x " << NZ << "\n";
@@ -664,14 +619,13 @@ int main(int argc, char** argv) {
         cout << "Steps: " << NT_RUN << " / " << NT_TOTAL << "  dt=" << TAU << "\n";
         cout << "============================================================\n";
     }
-    printf("  Rank %d → GPU %d (%s)  X=[%d,%d)  Y=[%d,%d)\n",
+    printf("  Rank %d -> GPU %d (%s)  X=[%d,%d)  Y=[%d,%d)\n",
            s.rank, s.gpu, prop.name,
            s.x_offset, s.x_offset + s.nx_local,
            s.y_offset, s.y_offset + s.ny_local);
     MPI_Barrier(MPI_COMM_WORLD);
     if (s.rank == 0) cout << "============================================================\n";
 
-    // ---- cuFFTMp plans (built-in slab decomposition, NO cufftXtSetDistribution) ----
     cufftHandle plan_r2c, plan_c2r;
     CUFFT_CHECK(cufftCreate(&plan_r2c));
     CUFFT_CHECK(cufftCreate(&plan_c2r));
@@ -683,10 +637,8 @@ int main(int argc, char** argv) {
     CUFFT_CHECK(cufftMakePlan3d(plan_r2c, NX, NY, NZ, CUFFT_D2Z, &ws_r2c));
     CUFFT_CHECK(cufftMakePlan3d(plan_c2r, NX, NY, NZ, CUFFT_Z2D, &ws_c2r));
 
-    // ---- Allocate GPU memory ----
     alloc_state(s, plan_r2c);
 
-    // ---- Initial condition ----
     if (s.rank == 0) cout << "Setting initial conditions...\n";
     force_d2z_format(s.V1_buf); force_d2z_format(s.V2_buf); force_d2z_format(s.V3_buf);
     {
@@ -708,15 +660,12 @@ int main(int argc, char** argv) {
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.nc_local, inv_N);
-
-        // Project to divergence-free (Y-slab kernel)
         kernel_make_div_free<<<gc, BLOCK>>>(
             (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
             s.ny_local, s.y_offset);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Initial diagnostics
     {
         double L2_err, max_div;
         compute_diagnostics(plan_r2c, plan_c2r, s, 0.0, L2_err, max_div);
@@ -727,7 +676,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Time integration ----
     if (s.rank == 0) {
         cout << "============================================================\n";
         cout << "  Time Integration (RK4)\n";
@@ -769,7 +717,6 @@ int main(int argc, char** argv) {
         cout << "============================================================\n";
     }
 
-    // Cleanup
     free_state(s);
     CUFFT_CHECK(cufftDestroy(plan_r2c));
     CUFFT_CHECK(cufftDestroy(plan_c2r));
