@@ -14,22 +14,20 @@ typedef cufftDoubleReal    GReal;
 typedef cufftDoubleComplex GCplx;
 
 // ============================================================
-// Grid parameters (constexpr, accessible on host and device)
+// Grid parameters — host-side (set at runtime from argv)
 // ============================================================
-constexpr int    NX = 128, NY = 128, NZ = 128;
-constexpr int    NZC      = NZ / 2 + 1;
-constexpr long long NR    = (long long)NX * NY * NZ;
-constexpr long long NC_TOT = (long long)NX * NY * NZC;
-constexpr double LX = 2.0 * M_PI, LY = 2.0 * M_PI, LZ = 2.0 * M_PI;
-constexpr double DX = LX / NX, DY = LY / NY, DZ = LZ / NZ;
-constexpr int    NT_TOTAL = 20000;
-constexpr int    NT_RUN   = 10;
-constexpr double TAU      = 1.0 / NT_TOTAL;   // dt = 5e-5
+static int    NX, NY, NZ, NZC, NT_TOTAL, NT_RUN;
+static long long NR, NC_TOT;
+static double LX, LY, LZ, DX, DY, DZ, TAU;
 
-// CUDA launch config
+// Device constants (read-only from kernels)
+__device__ __constant__ int    d_NX, d_NY, d_NZ, d_NZC;
+__device__ __constant__ long long d_NR, d_NC_TOT;
+__device__ __constant__ double d_DX, d_DY, d_DZ;
+
+// CUDA launch config (computed at runtime)
 constexpr int BLOCK  = 256;
-constexpr int GRID_R = (int)((NR    + BLOCK - 1) / BLOCK);  // 8192
-constexpr int GRID_C = (int)((NC_TOT + BLOCK - 1) / BLOCK); // 4160
+static int GRID_R, GRID_C;
 
 // ============================================================
 // Error checking macros
@@ -174,11 +172,11 @@ __host__ __device__ double func_f3(double x, double y, double z, double t) {
 // Fill real arrays with analytical velocity at time t
 __global__ void kernel_fill_velocity(GReal* V1_r, GReal* V2_r, GReal* V3_r, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NR) return;
-    int k = (int)(idx % NZ);
-    int j = (int)((idx / NZ) % NY);
-    int i = (int)(idx / ((long long)NY * NZ));
-    double x = i * DX, y = j * DY, z = k * DZ;
+    if (idx >= d_NR) return;
+    int k = (int)(idx % d_NZ);
+    int j = (int)((idx / d_NZ) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = i * d_DX, y = j * d_DY, z = k * d_DZ;
     V1_r[idx] = func_V1(x, y, z, t);
     V2_r[idx] = func_V2(x, y, z, t);
     V3_r[idx] = func_V3(x, y, z, t);
@@ -197,12 +195,12 @@ __global__ void kernel_scale_cplx(GCplx* A, long long total, double scale) {
 __global__ void kernel_compute_rot(const GCplx* V1_c, const GCplx* V2_c, const GCplx* V3_c,
                                     GCplx* rot1_c, GCplx* rot2_c, GCplx* rot3_c) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NC_TOT) return;
-    int k = (int)(idx % NZC);
-    int j = (int)((idx / NZC) % NY);
-    int i = (int)(idx / ((long long)NY * NZC));
-    double kx = (i <= NX/2) ? (double)i : (double)(i - NX);
-    double ky = (j <= NY/2) ? (double)j : (double)(j - NY);
+    if (idx >= d_NC_TOT) return;
+    int k = (int)(idx % d_NZC);
+    int j = (int)((idx / d_NZC) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZC));
+    double kx = (i <= d_NX/2) ? (double)i : (double)(i - d_NX);
+    double ky = (j <= d_NY/2) ? (double)j : (double)(j - d_NY);
     double kz = (double)k;
 
     // i*(a+ib) = -b + ia, so real part of i*(ky*V3-kz*V2) = -(ky*V3.y - kz*V2.y)
@@ -217,12 +215,12 @@ __global__ void kernel_compute_rot(const GCplx* V1_c, const GCplx* V2_c, const G
 // Viscous term: visc_c = -k² V_c
 __global__ void kernel_compute_viscous(const GCplx* V_c, GCplx* visc_c) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NC_TOT) return;
-    int k = (int)(idx % NZC);
-    int j = (int)((idx / NZC) % NY);
-    int i = (int)(idx / ((long long)NY * NZC));
-    double kx = (i <= NX/2) ? (double)i : (double)(i - NX);
-    double ky = (j <= NY/2) ? (double)j : (double)(j - NY);
+    if (idx >= d_NC_TOT) return;
+    int k = (int)(idx % d_NZC);
+    int j = (int)((idx / d_NZC) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZC));
+    double kx = (i <= d_NX/2) ? (double)i : (double)(i - d_NX);
+    double ky = (j <= d_NY/2) ? (double)j : (double)(j - d_NY);
     double kz = (double)k;
     double k2 = kx*kx + ky*ky + kz*kz;
     visc_c[idx].x = -k2 * V_c[idx].x;
@@ -233,12 +231,12 @@ __global__ void kernel_compute_viscous(const GCplx* V_c, GCplx* visc_c) {
 //   div = ik·V,  phi = div/(-k²),  V -= ik*phi
 __global__ void kernel_make_div_free(GCplx* V1_c, GCplx* V2_c, GCplx* V3_c) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NC_TOT) return;
-    int k = (int)(idx % NZC);
-    int j = (int)((idx / NZC) % NY);
-    int i = (int)(idx / ((long long)NY * NZC));
-    double kx = (i <= NX/2) ? (double)i : (double)(i - NX);
-    double ky = (j <= NY/2) ? (double)j : (double)(j - NY);
+    if (idx >= d_NC_TOT) return;
+    int k = (int)(idx % d_NZC);
+    int j = (int)((idx / d_NZC) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZC));
+    double kx = (i <= d_NX/2) ? (double)i : (double)(i - d_NX);
+    double ky = (j <= d_NY/2) ? (double)j : (double)(j - d_NY);
     double kz = (double)k;
     double k2 = kx*kx + ky*ky + kz*kz;
     if (k2 < 1e-10) return;
@@ -262,7 +260,7 @@ __global__ void kernel_make_div_free(GCplx* V1_c, GCplx* V2_c, GCplx* V3_c) {
 __global__ void kernel_cross_product(const GReal* V1_r, const GReal* V2_r, const GReal* V3_r,
                                       GReal* rot1_r, GReal* rot2_r, GReal* rot3_r) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NR) return;
+    if (idx >= d_NR) return;
     double v1 = V1_r[idx], v2 = V2_r[idx], v3 = V3_r[idx];
     double w1 = rot1_r[idx], w2 = rot2_r[idx], w3 = rot3_r[idx];
     rot1_r[idx] = v2*w3 - v3*w2;
@@ -273,11 +271,11 @@ __global__ void kernel_cross_product(const GReal* V1_r, const GReal* V2_r, const
 // Fill forcing real arrays at time t
 __global__ void kernel_fill_forcing(GReal* w1_r, GReal* w2_r, GReal* w3_r, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NR) return;
-    int k = (int)(idx % NZ);
-    int j = (int)((idx / NZ) % NY);
-    int i = (int)(idx / ((long long)NY * NZ));
-    double x = i * DX, y = j * DY, z = k * DZ;
+    if (idx >= d_NR) return;
+    int k = (int)(idx % d_NZ);
+    int j = (int)((idx / d_NZ) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = i * d_DX, y = j * d_DY, z = k * d_DZ;
     w1_r[idx] = func_f1(x, y, z, t);
     w2_r[idx] = func_f2(x, y, z, t);
     w3_r[idx] = func_f3(x, y, z, t);
@@ -338,11 +336,11 @@ __global__ void kernel_rk4_update(GCplx* V1, GCplx* V2, GCplx* V3,
 __global__ void kernel_error_sq(const GReal* V1_r, const GReal* V2_r, const GReal* V3_r,
                                  GReal* err_r, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NR) return;
-    int k = (int)(idx % NZ);
-    int j = (int)((idx / NZ) % NY);
-    int i = (int)(idx / ((long long)NY * NZ));
-    double x = i * DX, y = j * DY, z = k * DZ;
+    if (idx >= d_NR) return;
+    int k = (int)(idx % d_NZ);
+    int j = (int)((idx / d_NZ) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = i * d_DX, y = j * d_DY, z = k * d_DZ;
     double d1 = V1_r[idx] - func_V1(x, y, z, t);
     double d2 = V2_r[idx] - func_V2(x, y, z, t);
     double d3 = V3_r[idx] - func_V3(x, y, z, t);
@@ -353,12 +351,12 @@ __global__ void kernel_error_sq(const GReal* V1_r, const GReal* V2_r, const GRea
 __global__ void kernel_div_abs(const GCplx* V1_c, const GCplx* V2_c, const GCplx* V3_c,
                                 GReal* div_r) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NC_TOT) return;
-    int k = (int)(idx % NZC);
-    int j = (int)((idx / NZC) % NY);
-    int i = (int)(idx / ((long long)NY * NZC));
-    double kx = (i <= NX/2) ? (double)i : (double)(i - NX);
-    double ky = (j <= NY/2) ? (double)j : (double)(j - NY);
+    if (idx >= d_NC_TOT) return;
+    int k = (int)(idx % d_NZC);
+    int j = (int)((idx / d_NZC) % d_NY);
+    int i = (int)(idx / ((long long)d_NY * d_NZC));
+    double kx = (i <= d_NX/2) ? (double)i : (double)(i - d_NX);
+    double ky = (j <= d_NY/2) ? (double)j : (double)(j - d_NY);
     double kz = (double)k;
     double dr = -(kx*V1_c[idx].y + ky*V2_c[idx].y + kz*V3_c[idx].y);
     double di =   kx*V1_c[idx].x + ky*V2_c[idx].x + kz*V3_c[idx].x;
@@ -526,7 +524,35 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // ============================================================
 // Main
 // ============================================================
-int main() {
+int main(int argc, char** argv) {
+    if (argc < 6) {
+        cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS" << endl;
+        cerr << "  Example: " << argv[0] << " 64 64 64 0.00001 100" << endl;
+        return 1;
+    }
+
+    // Parse command-line parameters
+    NX = atoi(argv[1]); NY = atoi(argv[2]); NZ = atoi(argv[3]);
+    TAU = atof(argv[4]); NT_RUN = atoi(argv[5]);
+    NZC = NZ / 2 + 1;
+    NR  = (long long)NX * NY * NZ;
+    NC_TOT = (long long)NX * NY * NZC;
+    LX = LY = LZ = 2.0 * M_PI;
+    DX = LX / NX; DY = LY / NY; DZ = LZ / NZ;
+    GRID_R = (int)((NR     + BLOCK - 1) / BLOCK);
+    GRID_C = (int)((NC_TOT + BLOCK - 1) / BLOCK);
+
+    // Copy grid parameters to device constant memory
+    cudaMemcpyToSymbol(d_NX, &NX, sizeof(int));
+    cudaMemcpyToSymbol(d_NY, &NY, sizeof(int));
+    cudaMemcpyToSymbol(d_NZ, &NZ, sizeof(int));
+    cudaMemcpyToSymbol(d_NZC, &NZC, sizeof(int));
+    cudaMemcpyToSymbol(d_NR, &NR, sizeof(long long));
+    cudaMemcpyToSymbol(d_NC_TOT, &NC_TOT, sizeof(long long));
+    cudaMemcpyToSymbol(d_DX, &DX, sizeof(double));
+    cudaMemcpyToSymbol(d_DY, &DY, sizeof(double));
+    cudaMemcpyToSymbol(d_DZ, &DZ, sizeof(double));
+
     // Print GPU info
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -535,9 +561,8 @@ int main() {
     cout << "  Navier-Stokes Solver - cuFFT Single GPU Version" << endl;
     cout << "============================================================" << endl;
     cout << "GPU: " << prop.name << endl;
-    cout << "Grid: " << NX << " x " << NY << " x " << NZ << endl;
+    printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
     cout << "Domain: [0, 2π]³" << endl;
-    cout << "Steps: " << NT_RUN << " / " << NT_TOTAL << ", dt = " << TAU << endl;
 
     // Memory estimate
     double mem_mb = (10.0 * NR * sizeof(GReal)
@@ -586,53 +611,32 @@ int main() {
     cout << "Projecting initial condition to divergence-free space..." << endl;
     kernel_make_div_free<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c);
 
-    // Initial diagnostics
-    {
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, g, 0.0, L2_err, max_div);
-        cout << "\nInitial condition (t=0):" << endl;
-        cout << "  L2 error:   " << scientific << L2_err << endl;
-        cout << "  max|div V|: " << max_div << "\n" << endl;
-    }
-
     // ----------------------------------------------------------------
     // Time integration (RK4)
     // ----------------------------------------------------------------
-    cout << "============================================================" << endl;
-    cout << "  Time Integration (RK4)" << endl;
-    cout << "============================================================" << endl;
-    cout << setw(6) << "Step" << setw(12) << "Wall(s)"
-         << setw(15) << "L2 Error" << setw(15) << "Max |div V|" << endl;
-    cout << "------------------------------------------------------------------------" << endl;
-
     double t_wall_total = 0.0;
 
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
-    for (int it = 0; it <= NT_RUN; ++it) {
+    for (int it = 0; it < NT_RUN; ++it) {
         double t_cur = it * TAU;
+        CUDA_CHECK(cudaEventRecord(ev_start));
+        rk4_step(plan_r2c, plan_c2r, g, t_cur);
+        CUDA_CHECK(cudaEventRecord(ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+        t_wall_total += (double)ms * 1e-3;
+    }
 
-        // Diagnostics (not counted in wall time)
+    {
+        double t_final = NT_RUN * TAU;
         double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, g, t_cur, L2_err, max_div);
-
-        cout << setw(6) << it
-             << setw(12) << fixed << setprecision(4) << t_wall_total
-             << setw(15) << scientific << setprecision(4) << L2_err
-             << setw(15) << max_div << endl;
-
-        // RK4 step (counted in wall time)
-        if (it < NT_RUN) {
-            CUDA_CHECK(cudaEventRecord(ev_start));
-            rk4_step(plan_r2c, plan_c2r, g, t_cur);
-            CUDA_CHECK(cudaEventRecord(ev_stop));
-            CUDA_CHECK(cudaEventSynchronize(ev_stop));
-            float ms = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-            t_wall_total += (double)ms * 1e-3;
-        }
+        compute_diagnostics(plan_r2c, plan_c2r, g, t_final, L2_err, max_div);
+        cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+             << scientific << setprecision(4) << L2_err << endl;
     }
 
     cout << "============================================================" << endl;

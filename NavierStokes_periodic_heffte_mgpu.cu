@@ -35,15 +35,15 @@ typedef double             GReal;
 typedef cufftDoubleComplex GCplx;
 
 // ============================================================
-// Grid parameters
+// Grid parameters — host-side (set at runtime from argv)
 // ============================================================
-constexpr int    NX = 128, NY = 128, NZ = 128;
-constexpr double LX = 2.0*M_PI, LY = 2.0*M_PI, LZ = 2.0*M_PI;
-constexpr double DX = LX/NX, DY = LY/NY, DZ = LZ/NZ;
-constexpr int    NT_TOTAL = 20000;
-constexpr int    NT_RUN   = 10;
-constexpr double TAU      = 1.0 / NT_TOTAL;
-constexpr int    BLOCK    = 256;
+static int    NX, NY, NZ, NT_TOTAL, NT_RUN;
+static double LX, LY, LZ, DX, DY, DZ, TAU;
+
+__device__ __constant__ int    d_NX, d_NY;
+__device__ __constant__ double d_DX, d_DY, d_DZ;
+
+constexpr int BLOCK = 256;
 
 // ============================================================
 // Error macros
@@ -96,7 +96,7 @@ __global__ void kernel_fill_velocity(GReal* V1, GReal* V2, GReal* V3,
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double x=(li+lo0)*DX,y=(lj+lo1)*DY,z=(lk+lo2)*DZ;
+    double x=(li+lo0)*d_DX,y=(lj+lo1)*d_DY,z=(lk+lo2)*d_DZ;
     V1[idx]=func_V1(x,y,z,0.);V2[idx]=func_V2(x,y,z,0.);V3[idx]=func_V3(x,y,z,0.);
 }
 __global__ void kernel_fill_forcing(GReal* W1, GReal* W2, GReal* W3,
@@ -105,7 +105,7 @@ __global__ void kernel_fill_forcing(GReal* W1, GReal* W2, GReal* W3,
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double x=(li+lo0)*DX,y=(lj+lo1)*DY,z=(lk+lo2)*DZ;
+    double x=(li+lo0)*d_DX,y=(lj+lo1)*d_DY,z=(lk+lo2)*d_DZ;
     W1[idx]=func_f1(x,y,z,t);W2[idx]=func_f2(x,y,z,t);W3[idx]=func_f3(x,y,z,t);
 }
 __global__ void kernel_cross_product(const GReal* V1, const GReal* V2, const GReal* V3,
@@ -122,12 +122,12 @@ __global__ void kernel_error_sq(const GReal* V1, const GReal* V2, const GReal* V
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double x=(li+lo0)*DX,y=(lj+lo1)*DY,z=(lk+lo2)*DZ;
+    double x=(li+lo0)*d_DX,y=(lj+lo1)*d_DY,z=(lk+lo2)*d_DZ;
     double d1=V1[idx]-func_V1(x,y,z,t),d2=V2[idx]-func_V2(x,y,z,t),d3=V3[idx]-func_V3(x,y,z,t);
     err[idx]=d1*d1+d2*d2+d3*d3;
 }
-static __device__ __forceinline__ double kx_fold(int gi){return gi<=NX/2?(double)gi:(double)(gi-NX);}
-static __device__ __forceinline__ double ky_fold(int gj){return gj<=NY/2?(double)gj:(double)(gj-NY);}
+static __device__ __forceinline__ double kx_fold(int gi){return gi<=d_NX/2?(double)gi:(double)(gi-d_NX);}
+static __device__ __forceinline__ double ky_fold(int gj){return gj<=d_NY/2?(double)gj:(double)(gj-d_NY);}
 __global__ void kernel_compute_rot(
     const GCplx* V1, const GCplx* V2, const GCplx* V3,
     GCplx* R1, GCplx* R2, GCplx* R3,
@@ -349,6 +349,21 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD,&rank);
     MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
 
+    if (argc < 6) {
+        if (rank == 0) fprintf(stderr, "Usage: %s NX NY NZ dt NSTEPS\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    NX=atoi(argv[1]); NY=atoi(argv[2]); NZ=atoi(argv[3]);
+    TAU=atof(argv[4]); NT_RUN=atoi(argv[5]);
+    NT_TOTAL=NT_RUN;
+    LX=LY=LZ=2.0*M_PI; DX=LX/NX; DY=LY/NY; DZ=LZ/NZ;
+    cudaMemcpyToSymbol(d_NX,&NX,sizeof(int));
+    cudaMemcpyToSymbol(d_NY,&NY,sizeof(int));
+    cudaMemcpyToSymbol(d_DX,&DX,sizeof(double));
+    cudaMemcpyToSymbol(d_DY,&DY,sizeof(double));
+    cudaMemcpyToSymbol(d_DZ,&DZ,sizeof(double));
+    if (rank==0) printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n",NX,NY,NZ,TAU,NT_RUN);
+
     // ---- GPU assignment: single node, all ranks on same node ----
     int num_gpus=0;
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
@@ -392,29 +407,22 @@ int main(int argc, char** argv) {
     kernel_make_div_free<<<bc.grid(BLOCK),BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],nc);
 
-    {auto [e,d]=compute_diagnostics(fft,g,br,bc,0.);
-     if(rank==0) cout<<"\nInitial (t=0):\n  L2 error: "<<scientific<<e<<"  max|div V|: "<<d<<"\n\n";}
-
-    if (rank==0) {
-        cout<<"============================================================\n";
-        cout<<"  Time Integration (RK4)\n------------------------------------------------------------\n";
-        cout<<setw(6)<<"Step"<<setw(12)<<"Wall(s)"<<setw(16)<<"L2 Error"<<setw(16)<<"max|div V|\n";
-        cout<<"------------------------------------------------------------\n";
-    }
     double t_wall=0.;
-    for(int it=0;it<=NT_RUN;++it){
+    for(int it=0;it<NT_RUN;++it){
         double tc=it*TAU;
-        auto [e,d]=compute_diagnostics(fft,g,br,bc,tc);
-        if(rank==0) cout<<setw(6)<<it<<setw(12)<<fixed<<setprecision(4)<<t_wall
-                        <<setw(16)<<scientific<<setprecision(4)<<e<<setw(16)<<d<<"\n";
-        if(it<NT_RUN){
-            double t0=MPI_Wtime();
-            rk4_step(fft,g,br,bc,tc);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            double dt_step=MPI_Wtime()-t0, dt_max;
-            MPI_Allreduce(&dt_step,&dt_max,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
-            t_wall+=dt_max;
-        }
+        double t0=MPI_Wtime();
+        rk4_step(fft,g,br,bc,tc);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double dt_step=MPI_Wtime()-t0, dt_max;
+        MPI_Allreduce(&dt_step,&dt_max,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+        t_wall+=dt_max;
+    }
+    {
+        double t_final=NT_RUN*TAU;
+        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final);
+        if(rank==0)
+            cout<<"  L2 error (t="<<fixed<<setprecision(6)<<t_final<<"): "
+                <<scientific<<setprecision(4)<<e<<"\n";
     }
     if(rank==0){
         cout<<"============================================================\n";

@@ -525,36 +525,43 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
 // ==============================================================================
 
 int main(int argc, char **argv) {
-    const ptrdiff_t nx = 128, ny = 128, nz = 128;
-    const double L_x = 2*M_PI, L_y = 2*M_PI, L_z = 2*M_PI;
-    const double dx = L_x/nx, dy = L_y/ny, dz = L_z/nz;
-
-    const ptrdiff_t nt_total = 20000;
-    const ptrdiff_t nt_run   = 2000;
-    const double T   = 1.0;
-    const double tau = T / nt_total;  // dt = 5e-5
-
     // MPI + OpenMP + FFTW 初始化
     int rank, size, provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int max_threads = omp_get_max_threads();
+    if (argc < 6) {
+        if (rank == 0) {
+            cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS [OMP_threads]" << endl;
+            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100" << endl;
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    ptrdiff_t nx = atoi(argv[1]), ny = atoi(argv[2]), nz = atoi(argv[3]);
+    double tau = atof(argv[4]);
+    ptrdiff_t nt_run = atoi(argv[5]);
+    int nthreads = (argc > 6) ? atoi(argv[6]) : omp_get_max_threads();
+    omp_set_num_threads(nthreads);
+    int max_threads = nthreads;
+
+    const double L_x = 2*M_PI, L_y = 2*M_PI, L_z = 2*M_PI;
+    double dx = L_x/nx, dy = L_y/ny, dz = L_z/nz;
+
     fftw_init_threads();
     fftw_plan_with_nthreads(max_threads);
     fftw_mpi_init();
-
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     if (rank == 0) {
         cout << "============================================================" << endl;
         cout << "  Navier-Stokes Solver - FFTW MPI Version (1D Slab)" << endl;
         cout << "============================================================" << endl;
-        cout << "Grid: " << nx << " x " << ny << " x " << nz << endl;
+        cout << "Grid: " << nx << " x " << ny << " x " << nz
+             << ", dt=" << scientific << tau << ", steps=" << nt_run << endl;
         cout << "Domain: [0, 2π]³" << endl;
         cout << "MPI processes: " << size << endl;
         cout << "OpenMP threads/process: " << max_threads << endl;
-        cout << "Steps: " << nt_run << " / " << nt_total << ", dt = " << tau << endl;
         cout << "============================================================" << endl;
     }
 
@@ -678,156 +685,13 @@ int main(int argc, char **argv) {
     make_div_free(V1_c, V2_c, V3_c, div_c, phi_c, nx, ny, nz, local_n0, local_0_start);
 
     // ------------------------------------------------------------------
-    // 打印初始误差
-    // ------------------------------------------------------------------
-    {
-        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
-
-        double local_err = 0.0, local_max = 0.0;
-        #pragma omp parallel for collapse(3) reduction(+:local_err) reduction(max:local_max)
-        for(ptrdiff_t i = 0; i < local_n0; ++i) {
-            for(ptrdiff_t j = 0; j < ny; ++j) {
-                for(ptrdiff_t k = 0; k < nz; ++k) {
-                    ptrdiff_t ig  = local_0_start + i;
-                    double x = ig * dx, y = j * dy, z = k * dz;
-                    ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
-                    double d1 = V1_r[idx] - func_V1(x, y, z, 0.0);
-                    double d2 = V2_r[idx] - func_V2(x, y, z, 0.0);
-                    double d3 = V3_r[idx] - func_V3(x, y, z, 0.0);
-                    double e  = d1*d1 + d2*d2 + d3*d3;
-                    local_err += e;
-                    local_max  = max(local_max, sqrt(e));
-                }
-            }
-        }
-        double global_err = 0.0, global_max = 0.0;
-        MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-        MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-        if (rank == 0) {
-            cout << "\nInitial condition (t=0):" << endl;
-            cout << "  L2 error:   " << scientific << sqrt(global_err * dx * dy * dz) << endl;
-            cout << "  L∞ error:   " << global_max << endl;
-        }
-
-        // 恢复 V_c（backward 为 out-of-place，V_c 本身未被修改；但后续 rk4 需要 V_c 正确）
-        // 这里重新做一次正变换保证 V_c 与 V_r 一致（V_r 此时是物理值）
-        fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
-        fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
-        fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
-        #pragma omp parallel for
-        for(ptrdiff_t i = 0; i < total_c; ++i) {
-            V1_c[i][0] /= norm_factor;  V1_c[i][1] /= norm_factor;
-            V2_c[i][0] /= norm_factor;  V2_c[i][1] /= norm_factor;
-            V3_c[i][0] /= norm_factor;  V3_c[i][1] /= norm_factor;
-        }
-
-        // 计算 max|div V|
-        double local_div = 0.0;
-        #pragma omp parallel for collapse(3) reduction(max:local_div)
-        for(ptrdiff_t i = 0; i < local_n0; ++i) {
-            for(ptrdiff_t j = 0; j < ny; ++j) {
-                for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                    ptrdiff_t ig  = local_0_start + i;
-                    ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                    double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                    double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
-                    double kz = (double)k;
-                    double dr = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
-                    double di =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
-                    local_div = max(local_div, sqrt(dr*dr + di*di));
-                }
-            }
-        }
-        double global_div = 0.0;
-        MPI_Reduce(&local_div, &global_div, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        if (rank == 0)
-            cout << "  max|div V|: " << global_div << "\n" << endl;
-    }
-
-    // ------------------------------------------------------------------
     // 时间推进（RK4）
     // ------------------------------------------------------------------
-    if (rank == 0) {
-        cout << "============================================================" << endl;
-        cout << "  Time Integration (RK4)" << endl;
-        cout << "============================================================" << endl;
-        cout << setw(6) << "Step" << setw(12) << "Wall(s)"
-             << setw(15) << "L2 Error" << setw(15) << "Max |div V|" << endl;
-        cout << "------------------------------------------------------------------------" << endl;
-    }
+    double t_wall_total = 0.0;
 
-    double t_wall_total = 0.0;  // 累计挂钟时间（秒）
-
-    for(ptrdiff_t it = 0; it <= nt_run; ++it) {
+    for(ptrdiff_t it = 0; it < nt_run; ++it) {
         double t_cur = it * tau;
-
-        // --- 误差计算（不计入 wall time）---
-        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
-
-        double local_err = 0.0;
-        #pragma omp parallel for collapse(3) reduction(+:local_err)
-        for(ptrdiff_t i = 0; i < local_n0; ++i) {
-            for(ptrdiff_t j = 0; j < ny; ++j) {
-                for(ptrdiff_t k = 0; k < nz; ++k) {
-                    ptrdiff_t ig  = local_0_start + i;
-                    double x = ig * dx, y = j * dy, z = k * dz;
-                    ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
-                    double d1 = V1_r[idx] - func_V1(x, y, z, t_cur);
-                    double d2 = V2_r[idx] - func_V2(x, y, z, t_cur);
-                    double d3 = V3_r[idx] - func_V3(x, y, z, t_cur);
-                    local_err += d1*d1 + d2*d2 + d3*d3;
-                }
-            }
-        }
-        double global_err = 0.0;
-        MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-        // 恢复 V_c（从 V_r 重新正变换；V_r 此时包含当前步物理值）
-        fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
-        fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
-        fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
-        #pragma omp parallel for
-        for(ptrdiff_t i = 0; i < total_c; ++i) {
-            V1_c[i][0] /= norm_factor;  V1_c[i][1] /= norm_factor;
-            V2_c[i][0] /= norm_factor;  V2_c[i][1] /= norm_factor;
-            V3_c[i][0] /= norm_factor;  V3_c[i][1] /= norm_factor;
-        }
-
-        // 计算 max|div V|
-        double local_div = 0.0;
-        #pragma omp parallel for collapse(3) reduction(max:local_div)
-        for(ptrdiff_t i = 0; i < local_n0; ++i) {
-            for(ptrdiff_t j = 0; j < ny; ++j) {
-                for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                    ptrdiff_t ig  = local_0_start + i;
-                    ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                    double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                    double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
-                    double kz = (double)k;
-                    double dr = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
-                    double di =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
-                    local_div = max(local_div, sqrt(dr*dr + di*di));
-                }
-            }
-        }
-        double global_div = 0.0;
-        MPI_Reduce(&local_div, &global_div, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-        if (rank == 0) {
-            double L2_err = sqrt(global_err * dx * dy * dz);
-            cout << setw(6) << it
-                 << setw(12) << fixed << setprecision(4) << t_wall_total
-                 << setw(15) << scientific << setprecision(4) << L2_err
-                 << setw(15) << global_div << endl;
-        }
-
-        // --- RK4 步进（计入 wall time）---
-        if (it < nt_run) {
+        {
             double t0 = MPI_Wtime();
             rk4_step(V1_c, V2_c, V3_c,
                      V1_r, V2_r, V3_r,
@@ -851,6 +715,34 @@ int main(int argc, char **argv) {
             MPI_Allreduce(&step_time, &global_step, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
             t_wall_total += global_step;
         }
+    }
+
+    // 计算最终 L2 误差
+    {
+        double t_final = nt_run * tau;
+        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
+        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
+        double local_err = 0.0;
+        #pragma omp parallel for collapse(3) reduction(+:local_err)
+        for(ptrdiff_t i = 0; i < local_n0; ++i) {
+            for(ptrdiff_t j = 0; j < ny; ++j) {
+                for(ptrdiff_t k = 0; k < nz; ++k) {
+                    ptrdiff_t ig  = local_0_start + i;
+                    double x = ig * dx, y = j * dy, z = k * dz;
+                    ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
+                    double d1 = V1_r[idx] - func_V1(x, y, z, t_final);
+                    double d2 = V2_r[idx] - func_V2(x, y, z, t_final);
+                    double d3 = V3_r[idx] - func_V3(x, y, z, t_final);
+                    local_err += d1*d1 + d2*d2 + d3*d3;
+                }
+            }
+        }
+        double global_err = 0.0;
+        MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << sqrt(global_err * dx * dy * dz) << endl;
     }
 
     if (rank == 0) {

@@ -62,16 +62,15 @@ typedef double             GReal;
 typedef cufftDoubleComplex GCplx;
 
 // ============================================================
-// Grid / simulation parameters
+// Grid / simulation parameters — host-side (set at runtime from argv)
 // ============================================================
-constexpr int    NX = 128, NY = 128, NZ = 128;
-constexpr int    NZC      = NZ / 2 + 1;
-constexpr double LX = 2.0*M_PI, LY = 2.0*M_PI, LZ = 2.0*M_PI;
-constexpr double DX = LX/NX,    DY = LY/NY,    DZ = LZ/NZ;
-constexpr int    NT_TOTAL = 20000;
-constexpr int    NT_RUN   = 10;
-constexpr double TAU      = 1.0 / NT_TOTAL;
-constexpr int    BLOCK    = 256;
+static int    NX, NY, NZ, NZC, NT_TOTAL, NT_RUN;
+static double LX, LY, LZ, DX, DY, DZ, TAU;
+
+__device__ __constant__ int    d_NX, d_NY, d_NZ, d_NZC;
+__device__ __constant__ double d_DX, d_DY, d_DZ;
+
+constexpr int BLOCK = 256;
 
 // ============================================================
 // Error macros
@@ -136,24 +135,24 @@ __host__ __device__ double func_f3(double x,double y,double z,double t){return f
 __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
                                       int nx_local, int x_offset, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (long long)nx_local * NY * NZ) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
-    double x = (x_offset + lx) * DX, y = j * DY, z = k * DZ;
-    long long p = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    if (idx >= (long long)nx_local * d_NY * d_NZ) return;
+    int k  = (int)(idx % d_NZ);
+    int j  = (int)((idx / d_NZ) % d_NY);
+    int lx = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = (x_offset + lx) * d_DX, y = j * d_DY, z = k * d_DZ;
+    long long p = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
     V1[p] = func_V1(x,y,z,t); V2[p] = func_V2(x,y,z,t); V3[p] = func_V3(x,y,z,t);
 }
 
 __global__ void kernel_fill_forcing(double* W1, double* W2, double* W3,
                                      int nx_local, int x_offset, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (long long)nx_local * NY * NZ) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
-    double x = (x_offset + lx) * DX, y = j * DY, z = k * DZ;
-    long long p = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    if (idx >= (long long)nx_local * d_NY * d_NZ) return;
+    int k  = (int)(idx % d_NZ);
+    int j  = (int)((idx / d_NZ) % d_NY);
+    int lx = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = (x_offset + lx) * d_DX, y = j * d_DY, z = k * d_DZ;
+    long long p = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
     W1[p] = func_f1(x,y,z,t); W2[p] = func_f2(x,y,z,t); W3[p] = func_f3(x,y,z,t);
 }
 
@@ -161,11 +160,11 @@ __global__ void kernel_cross_product(const double* V1, const double* V2, const d
                                       double* rot1, double* rot2, double* rot3,
                                       int nx_local) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (long long)nx_local * NY * NZ) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
-    long long p = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    if (idx >= (long long)nx_local * d_NY * d_NZ) return;
+    int k  = (int)(idx % d_NZ);
+    int j  = (int)((idx / d_NZ) % d_NY);
+    int lx = (int)(idx / ((long long)d_NY * d_NZ));
+    long long p = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
     double v1=V1[p], v2=V2[p], v3=V3[p], w1=rot1[p], w2=rot2[p], w3=rot3[p];
     rot1[p] = v2*w3 - v3*w2;
     rot2[p] = v3*w1 - v1*w3;
@@ -175,12 +174,12 @@ __global__ void kernel_cross_product(const double* V1, const double* V2, const d
 __global__ void kernel_error_sq(const double* V1, const double* V2, const double* V3,
                                   double* scratch, int nx_local, int x_offset, double t) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (long long)nx_local * NY * NZ) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
-    double x = (x_offset + lx) * DX, y = j * DY, z = k * DZ;
-    long long p = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    if (idx >= (long long)nx_local * d_NY * d_NZ) return;
+    int k  = (int)(idx % d_NZ);
+    int j  = (int)((idx / d_NZ) % d_NY);
+    int lx = (int)(idx / ((long long)d_NY * d_NZ));
+    double x = (x_offset + lx) * d_DX, y = j * d_DY, z = k * d_DZ;
+    long long p = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
     double d1=V1[p]-func_V1(x,y,z,t), d2=V2[p]-func_V2(x,y,z,t), d3=V3[p]-func_V3(x,y,z,t);
     scratch[idx] = d1*d1 + d2*d2 + d3*d3;
 }
@@ -198,14 +197,14 @@ __global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx
                                     GCplx* rot1, GCplx* rot2, GCplx* rot3,
                                     int ny_local, int y_offset) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long nc_local = (long long)NX * ny_local * NZC;
+    long long nc_local = (long long)d_NX * ny_local * d_NZC;
     if (idx >= nc_local) return;
-    int kz  = (int)(idx % NZC);
-    int ly  = (int)((idx / NZC) % ny_local);
-    int gx  = (int)(idx / ((long long)ny_local * NZC));
+    int kz  = (int)(idx % d_NZC);
+    int ly  = (int)((idx / d_NZC) % ny_local);
+    int gx  = (int)(idx / ((long long)ny_local * d_NZC));
     int gy  = y_offset + ly;
-    double kx  = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky  = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx  = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
+    double ky  = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
     double kzd = (double)kz;
     rot1[idx].x = -(ky*V3[idx].y - kzd*V2[idx].y); rot1[idx].y = ky*V3[idx].x - kzd*V2[idx].x;
     rot2[idx].x = -(kzd*V1[idx].y - kx*V3[idx].y); rot2[idx].y = kzd*V1[idx].x - kx*V3[idx].x;
@@ -215,14 +214,14 @@ __global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx
 __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
                                         int ny_local, int y_offset) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long nc_local = (long long)NX * ny_local * NZC;
+    long long nc_local = (long long)d_NX * ny_local * d_NZC;
     if (idx >= nc_local) return;
-    int kz  = (int)(idx % NZC);
-    int ly  = (int)((idx / NZC) % ny_local);
-    int gx  = (int)(idx / ((long long)ny_local * NZC));
+    int kz  = (int)(idx % d_NZC);
+    int ly  = (int)((idx / d_NZC) % ny_local);
+    int gx  = (int)(idx / ((long long)ny_local * d_NZC));
     int gy  = y_offset + ly;
-    double kx  = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky  = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx  = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
+    double ky  = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
     double kzd = (double)kz;
     double k2  = kx*kx + ky*ky + kzd*kzd;
     visc[idx].x = -k2 * V[idx].x;
@@ -232,14 +231,14 @@ __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
 __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
                                       int ny_local, int y_offset) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long nc_local = (long long)NX * ny_local * NZC;
+    long long nc_local = (long long)d_NX * ny_local * d_NZC;
     if (idx >= nc_local) return;
-    int kz  = (int)(idx % NZC);
-    int ly  = (int)((idx / NZC) % ny_local);
-    int gx  = (int)(idx / ((long long)ny_local * NZC));
+    int kz  = (int)(idx % d_NZC);
+    int ly  = (int)((idx / d_NZC) % ny_local);
+    int gx  = (int)(idx / ((long long)ny_local * d_NZC));
     int gy  = y_offset + ly;
-    double kx  = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky  = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx  = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
+    double ky  = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
     double kzd = (double)kz;
     double k2  = kx*kx + ky*ky + kzd*kzd;
     if (k2 < 1e-10) return;
@@ -254,14 +253,14 @@ __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
 __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3,
                                  double* scratch, int ny_local, int y_offset) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long nc_local = (long long)NX * ny_local * NZC;
+    long long nc_local = (long long)d_NX * ny_local * d_NZC;
     if (idx >= nc_local) return;
-    int kz  = (int)(idx % NZC);
-    int ly  = (int)((idx / NZC) % ny_local);
-    int gx  = (int)(idx / ((long long)ny_local * NZC));
+    int kz  = (int)(idx % d_NZC);
+    int ly  = (int)((idx / d_NZC) % ny_local);
+    int gx  = (int)(idx / ((long long)ny_local * d_NZC));
     int gy  = y_offset + ly;
-    double kx  = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky  = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx  = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
+    double ky  = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
     double kzd = (double)kz;
     double dr  = -(kx*V1[idx].y + ky*V2[idx].y + kzd*V3[idx].y);
     double di  =   kx*V1[idx].x + ky*V2[idx].x + kzd*V3[idx].x;
@@ -572,6 +571,23 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &s.rank);
     MPI_Comm_size(MPI_COMM_WORLD, &s.nprocs);
 
+    if (argc < 6) {
+        if (s.rank == 0) fprintf(stderr, "Usage: %s NX NY NZ dt NSTEPS\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    NX=atoi(argv[1]); NY=atoi(argv[2]); NZ=atoi(argv[3]);
+    TAU=atof(argv[4]); NT_RUN=atoi(argv[5]);
+    NT_TOTAL=NT_RUN; NZC=NZ/2+1;
+    LX=LY=LZ=2.0*M_PI; DX=LX/NX; DY=LY/NY; DZ=LZ/NZ;
+    cudaMemcpyToSymbol(d_NX, &NX, sizeof(int));
+    cudaMemcpyToSymbol(d_NY, &NY, sizeof(int));
+    cudaMemcpyToSymbol(d_NZ, &NZ, sizeof(int));
+    cudaMemcpyToSymbol(d_NZC,&NZC,sizeof(int));
+    cudaMemcpyToSymbol(d_DX, &DX, sizeof(double));
+    cudaMemcpyToSymbol(d_DY, &DY, sizeof(double));
+    cudaMemcpyToSymbol(d_DZ, &DZ, sizeof(double));
+    if (s.rank == 0) printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n",NX,NY,NZ,TAU,NT_RUN);
+
     // ── Multi-node GPU assignment via node-local communicator ──────────────
     // MPI_Comm_split_type groups ranks sharing the same memory (i.e., same node).
     // local_rank is always in [0, GPUs_on_this_node) regardless of global rank.
@@ -658,45 +674,25 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    {
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, 0.0, L2_err, max_div);
-        if (s.rank == 0)
-            cout << "\nInitial (t=0):\n"
-                 << "  L2 error:   " << scientific << L2_err << "\n"
-                 << "  max|div V|: " << max_div << "\n\n";
-    }
-
-    if (s.rank == 0) {
-        cout << "============================================================\n"
-             << "  Time Integration (RK4)\n"
-             << "------------------------------------------------------------\n"
-             << setw(6) << "Step" << setw(12) << "Wall(s)"
-             << setw(16) << "L2 Error" << setw(16) << "max|div V|\n"
-             << "------------------------------------------------------------\n";
-    }
-
     double t_wall = 0.0;
-    for (int it = 0; it <= NT_RUN; ++it) {
+    for (int it = 0; it < NT_RUN; ++it) {
         double tc = it * TAU;
+        MPI_Barrier(MPI_COMM_WORLD);
+        double t0 = MPI_Wtime();
+        rk4_step(plan_r2c, plan_c2r, s, tc);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        MPI_Barrier(MPI_COMM_WORLD);
+        double dt = MPI_Wtime() - t0, dtmax = 0.0;
+        MPI_Allreduce(&dt, &dtmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        t_wall += dtmax;
+    }
+    {
+        double t_final = NT_RUN * TAU;
         double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, tc, L2_err, max_div);
+        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, L2_err, max_div);
         if (s.rank == 0)
-            cout << setw(6) << it
-                 << setw(12) << fixed << setprecision(4) << t_wall
-                 << setw(16) << scientific << setprecision(4) << L2_err
-                 << setw(16) << max_div << "\n";
-
-        if (it < NT_RUN) {
-            MPI_Barrier(MPI_COMM_WORLD);
-            double t0 = MPI_Wtime();
-            rk4_step(plan_r2c, plan_c2r, s, tc);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            MPI_Barrier(MPI_COMM_WORLD);
-            double dt = MPI_Wtime() - t0, dtmax = 0.0;
-            MPI_Allreduce(&dt, &dtmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            t_wall += dtmax;
-        }
+            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << L2_err << "\n";
     }
 
     if (s.rank == 0)

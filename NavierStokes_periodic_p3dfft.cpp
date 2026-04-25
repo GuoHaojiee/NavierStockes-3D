@@ -549,14 +549,21 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
-    const int nx = 128, ny = 128, nz = 128;
-    const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;
-    const double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
+    if (argc < 6) {
+        if (rank == 0) {
+            cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS [OMP_threads]\n";
+            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100\n";
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
-    const ptrdiff_t nt_total = 20000;
-    const ptrdiff_t nt_run   = 2000;
-    const double T  = 1.0;
-    const double dt = T / nt_total;    // dt = 5e-5
+    int nx = atoi(argv[1]), ny = atoi(argv[2]), nz = atoi(argv[3]);
+    double dt = atof(argv[4]);
+    int nt_run = atoi(argv[5]);
+    int nthreads = (argc > 6) ? atoi(argv[6]) : omp_get_max_threads();
+
+    const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;
+    double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
 
     // ------------------------------------------------------------------
     // 初始化 p3dfft（2D pencil 分解）
@@ -571,7 +578,8 @@ int main(int argc, char** argv) {
     // FFTW 多线程初始化（必须在 Cp3dfft_setup 之前调用，使 p3dfft 内部的
     // FFTW 计划创建时使用多线程，与 FFTW / AccFFT 版本保持一致）
     // ------------------------------------------------------------------
-    int max_threads = omp_get_max_threads();
+    omp_set_num_threads(nthreads);
+    int max_threads = nthreads;
     fftw_init_threads();
     fftw_plan_with_nthreads(max_threads);
 
@@ -579,12 +587,12 @@ int main(int argc, char** argv) {
         cout << "============================================================\n";
         cout << "  Navier-Stokes Solver - p3dfft Version (2D Pencil)\n";
         cout << "============================================================\n";
-        cout << "Grid: " << nx << " x " << ny << " x " << nz << "\n";
+        cout << "Grid: " << nx << " x " << ny << " x " << nz
+             << ", dt=" << scientific << dt << ", steps=" << nt_run << "\n";
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs
              << " (2D grid " << dims[0] << "x" << dims[1] << ")\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
-        cout << "Steps: " << nt_run << " / " << nt_total << ", dt = " << dt << "\n";
         cout << "============================================================\n";
     }
 
@@ -722,70 +730,40 @@ int main(int argc, char** argv) {
     };
 
     // ------------------------------------------------------------------
-    // 打印初始误差
-    // ------------------------------------------------------------------
-    {
-        auto [err0, err0inf] = compute_error(0.0);
-        double div0 = compute_div_max(ctx, V1_c, V2_c, V3_c);
-        if (rank == 0) {
-            cout << "\nInitial condition (t=0):\n";
-            cout << "  L2 error:   " << scientific << err0    << "\n";
-            cout << "  L∞ error:   " << err0inf   << "\n";
-            cout << "  max|div V|: " << div0       << "\n\n";
-        }
-    }
-
-    // ------------------------------------------------------------------
     // 时间推进（RK4）
     // ------------------------------------------------------------------
-    if (rank == 0) {
-        cout << "============================================================\n";
-        cout << "  Time Integration (RK4)\n";
-        cout << "============================================================\n";
-        cout << setw(6)  << "Step"
-             << setw(14) << "Wall(s)"
-             << setw(16) << "L2 Error"
-             << setw(16) << "max|div V|\n";
-        cout << "------------------------------------------------------------\n";
+    double t_wall_total = 0.0;
+
+    for (ptrdiff_t it = 0; it < nt_run; ++it) {
+        double t_cur = it * dt;
+        double t0 = MPI_Wtime();
+        rk4_step(ctx, V1_c, V2_c, V3_c,
+                 V1_r, V2_r, V3_r,
+                 work_r1, work_r2, work_r3,
+                 k1_v1, k1_v2, k1_v3,
+                 k2_v1, k2_v2, k2_v3,
+                 k3_v1, k3_v2, k3_v3,
+                 k4_v1, k4_v2, k4_v3,
+                 tmp_v1, tmp_v2, tmp_v3,
+                 rot1_c, rot2_c, rot3_c,
+                 rot1_r, rot2_r, rot3_r,
+                 nl1_c, nl2_c, nl3_c,
+                 visc1_c, visc2_c, visc3_c,
+                 f1_c, f2_c, f3_c,
+                 div_c, phi_c,
+                 dt, t_cur, dx, dy, dz);
+        double step_time = MPI_Wtime() - t0;
+        double global_step;
+        MPI_Allreduce(&step_time, &global_step, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        t_wall_total += global_step;
     }
 
-    double t_wall_total = 0.0;  // 累计挂钟时间（秒）
-
-    for (ptrdiff_t it = 0; it <= nt_run; ++it) {
-        double t_cur = it * dt;
-
-        auto [errL2, errLinf] = compute_error(t_cur);
-        double div_max = compute_div_max(ctx, V1_c, V2_c, V3_c);
-
-        if (rank == 0) {
-            cout << setw(6) << it
-                 << setw(14) << fixed << setprecision(4) << t_wall_total
-                 << setw(16) << scientific << setprecision(4) << errL2
-                 << setw(16) << div_max << "\n";
-        }
-
-        if (it < nt_run) {
-            double t0 = MPI_Wtime();
-            rk4_step(ctx, V1_c, V2_c, V3_c,
-                     V1_r, V2_r, V3_r,
-                     work_r1, work_r2, work_r3,
-                     k1_v1, k1_v2, k1_v3,
-                     k2_v1, k2_v2, k2_v3,
-                     k3_v1, k3_v2, k3_v3,
-                     k4_v1, k4_v2, k4_v3,
-                     tmp_v1, tmp_v2, tmp_v3,
-                     rot1_c, rot2_c, rot3_c,
-                     rot1_r, rot2_r, rot3_r,
-                     nl1_c, nl2_c, nl3_c,
-                     visc1_c, visc2_c, visc3_c,
-                     f1_c, f2_c, f3_c,
-                     div_c, phi_c,
-                     dt, t_cur, dx, dy, dz);
-            double step_time = MPI_Wtime() - t0;
-            double global_step;
-            MPI_Allreduce(&step_time, &global_step, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-            t_wall_total += global_step;
-        }
+    {
+        double t_final = nt_run * dt;
+        auto [errL2, errLinf] = compute_error(t_final);
+        if (rank == 0)
+            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << errL2 << "\n";
     }
 
     if (rank == 0) {
