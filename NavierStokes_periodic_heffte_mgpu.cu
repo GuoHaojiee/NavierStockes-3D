@@ -489,15 +489,25 @@ int main(int argc, char** argv) {
 
     {
     heffte::box3d<> world_r = {{0,0,0},{NX-1,NY-1,NZ-1}};
-    heffte::box3d<> world_c = {{0,0,0},{NX-1,NY-1,NZ/2}};   // NZ/2 = upper index → NZ/2+1 z-modes
-    auto pg       = heffte::proc_setup_min_surface(world_r,nprocs);
-    auto inboxes  = heffte::split_world(world_r,pg);
-    auto outboxes = heffte::split_world(world_c,pg);
+    heffte::box3d<> world_c = {{0,0,0},{NX-1,NY-1,NZ/2}};
+
+    // Slab decomposition along X (8x1x1 instead of 2x2x2)
+    // → 1 transpose per FFT instead of 3
+    std::array<int,3> pg = {nprocs, 1, 1};
+    auto inboxes  = heffte::split_world(world_r, pg);
+    auto outboxes = heffte::split_world(world_c, pg);
     heffte::box3d<> inbox_r=inboxes[rank], outbox_c=outboxes[rank];
 
-    if (rank==0) cout << "heFFTe pencil grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
+    if (rank==0) cout << "heFFTe slab grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
 
-    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,2,MPI_COMM_WORLD);
+    // Force GPU-aware MPI path + lighter reshape
+    auto options = heffte::default_options<heffte::backend::cufft>();
+    options.use_gpu_aware = true;
+    options.use_reorder   = false;
+    options.algorithm     = heffte::reshape_algorithm::alltoallv;
+
+    heffte::fft3d_r2c<heffte::backend::cufft> fft(
+        inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
     BoxGPU br=make_box(inbox_r), bc=make_box(outbox_c);
     long long nr=br.n(), nc=bc.n();
 
