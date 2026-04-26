@@ -12,19 +12,7 @@
 #SBATCH --output=/scratch/s02230673/benchmark_results/slurm_pure_omp_%j.log
 #SBATCH --error=/scratch/s02230673/benchmark_results/slurm_pure_omp_err_%j.log
 
-# ── OMP 设置（与学长 OpenMP 脚本一致）──────────────────────
-export OMP_NUM_THREADS=128
-export OMP_PROC_BIND=spread
-export OMP_PLACES="{0:128}"
-export OMP_DISPLAY_ENV=verbose
-export SLURM_EXPORT_ENV=ALL
-
-# ── 路径配置 ────────────────────────────────────────────────
-CONTAINER=/scratch/s02230673/ns3d.sqsh
-MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
-NS_DIR=/home/user/guo/NavierStockes-3D
 RESULT_DIR=/scratch/s02230673/benchmark_results/job_${SLURM_JOB_ID}_pure_omp
-
 mkdir -p $RESULT_DIR/logs/{fftw,accfft,p3dfft,heffte}/{128,256,512}
 CSV=$RESULT_DIR/summary_pure_omp.csv
 echo "solver,grid,mode,np,omp_threads,avg_step_s,l2_error,status" > $CSV
@@ -34,6 +22,17 @@ echo "  NS3D Benchmark — pure_omp (NP=1, OMP=128)"
 echo "  Job: $SLURM_JOB_ID   Node: $SLURM_NODELIST"
 echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
+
+CONTAINER=/scratch/s02230673/ns3d.sqsh
+MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
+NS_DIR=/home/user/guo/NavierStockes-3D
+
+ENV_SETUP="export LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64:\$LD_LIBRARY_PATH; \
+           export OMPI_MCA_btl='^ofi,openib'; \
+           export OMPI_MCA_pml=ob1; \
+           export OMP_NUM_THREADS=128; \
+           export OMP_PROC_BIND=spread; \
+           export OMP_PLACES={0:128}"
 
 SOLVERS=("ns_fftw:fftw" "ns_accfft:accfft" "ns_p3dfft:p3dfft" "ns_heffte_v2:heffte")
 GRIDS=(128 256 512)
@@ -47,22 +46,13 @@ for solver_entry in "${SOLVERS[@]}"; do
         echo ""
         echo "── [$(date '+%H:%M:%S')] $name  ${grid}^3  pure_omp ──"
 
-        # 单进程：--mpi=pmix 可省，但加上无害
-        # env 传递 OMP 变量进容器（与学长 OpenMP 脚本一致）
+        # 1 个 srun task → 1 个容器实例 → 1 个 MPI rank
+        # OMP_NUM_THREADS=128，使用全部 128 核
         timeout $TIMEOUT \
             srun \
-              --network=host \
-              --cpu-bind=none \
-              --hint=nomultithread \
-              --mem-bind=local \
               --container-image=$CONTAINER \
               --container-mounts="$MOUNTS" \
-              --no-container-entrypoint \
-              env OMP_NUM_THREADS=128 \
-                  OMP_PROC_BIND=spread \
-                  OMP_PLACES="{0:128}" \
-                  LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64 \
-              $NS_DIR/$exe $grid $grid $grid $DT $NSTEPS 128 \
+              bash -c "$ENV_SETUP; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 128" \
             > $LOG 2>&1
 
         ec=$?

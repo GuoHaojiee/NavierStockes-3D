@@ -13,37 +13,7 @@
 #SBATCH --output=/scratch/s02230673/benchmark_results/slurm_hybrid_%j.log
 #SBATCH --error=/scratch/s02230673/benchmark_results/slurm_hybrid_err_%j.log
 
-# ── UCX 通信优化 ─────────────────────────────────────────────
-export UCX_ASYNC_MAX_EVENTS=512
-export UCX_WARN_UNUSED_ENV_VARS=n
-export UCX_IB_REG_METHODS=odp
-export UCX_RNDV_THRESH=8192
-export UCX_MAX_RNDV_RAILS=1
-export UCX_NET_DEVICES=mlx5_0:1
-export UCX_TLS=rc_x,sm,self
-export UCX_UNIFIED_MODE=y
-
-# ── MPI + OMP 优化 ──────────────────────────────────────────
-export OMPI_MCA_pml=ucx
-export OMPI_MCA_btl="^openib,tcp"
-export OMPI_MCA_btl_base_warn_component_unused=0
-export OMPI_MCA_orte_quit_timeout=10
-export OMPI_MCA_coll_tuned_use_dynamic_rules=1
-export OMPI_MCA_coll_tuned_bcast_algorithm=1
-export OMPI_MCA_coll_tuned_allreduce_algorithm=2
-export PMIX_MCA_gds=hash
-export SLURM_EXPORT_ENV=ALL
-# OMP 设置：每个 MPI 进程 2 个线程，spread 绑定
-export OMP_NUM_THREADS=2
-export OMP_PROC_BIND=spread
-export OMP_PLACES=cores
-
-# ── 路径配置 ────────────────────────────────────────────────
-CONTAINER=/scratch/s02230673/ns3d.sqsh
-MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
-NS_DIR=/home/user/guo/NavierStockes-3D
 RESULT_DIR=/scratch/s02230673/benchmark_results/job_${SLURM_JOB_ID}_hybrid
-
 mkdir -p $RESULT_DIR/logs/{fftw,accfft,p3dfft,heffte}/{128,256,512}
 CSV=$RESULT_DIR/summary_hybrid.csv
 echo "solver,grid,mode,np,omp_threads,avg_step_s,l2_error,status" > $CSV
@@ -53,6 +23,17 @@ echo "  NS3D Benchmark — hybrid (NP=64, OMP=2)"
 echo "  Job: $SLURM_JOB_ID   Node: $SLURM_NODELIST"
 echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
+
+CONTAINER=/scratch/s02230673/ns3d.sqsh
+MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
+NS_DIR=/home/user/guo/NavierStockes-3D
+
+ENV_SETUP="export LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64:\$LD_LIBRARY_PATH; \
+           export OMPI_MCA_btl='^ofi,openib'; \
+           export OMPI_MCA_pml=ob1; \
+           export OMP_NUM_THREADS=2; \
+           export OMP_PROC_BIND=spread; \
+           export OMP_PLACES=cores"
 
 SOLVERS=("ns_fftw:fftw" "ns_accfft:accfft" "ns_p3dfft:p3dfft" "ns_heffte_v2:heffte")
 GRIDS=(128 256 512)
@@ -66,17 +47,13 @@ for solver_entry in "${SOLVERS[@]}"; do
         echo ""
         echo "── [$(date '+%H:%M:%S')] $name  ${grid}^3  hybrid ──"
 
+        # 64 个 srun task → 64 个容器实例 → 64 个 MPI rank
+        # 每个 rank 内 OMP_NUM_THREADS=2，共 128 核
         timeout $TIMEOUT \
             srun \
-              --mpi=pmix \
-              --network=host \
-              --cpu-bind=cores \
-              --hint=nomultithread \
-              --mem-bind=local \
               --container-image=$CONTAINER \
               --container-mounts="$MOUNTS" \
-              --no-container-entrypoint \
-              $NS_DIR/$exe $grid $grid $grid $DT $NSTEPS 2 \
+              bash -c "$ENV_SETUP; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 2" \
             > $LOG 2>&1
 
         ec=$?

@@ -1,50 +1,30 @@
 #!/bin/bash
 #============================================================
 #  bench_pure_mpi.sbatch — Pure MPI: 128 进程 × 1 OMP线程
+#
+#  设计说明：
+#    完全照抄你已验证的 heFFTe 多节点 sbatch 的模式：
+#    srun + bash -c "export LD_LIBRARY_PATH=容器路径; exec 程序"
+#    这样程序用容器自己的 OpenMPI，不会碰宿主机 HPC-X
+#
+#    sbatch 里的循环每次调用一个 srun（一个测试）
+#    srun 启动 128 个容器实例 = 128 个 MPI rank
+#    MPI_Init() 通过 SLURM PMI 协调所有 rank
+#
 #  提交（登录节点）：sbatch bench_pure_mpi.sbatch
 #============================================================
 #SBATCH --job-name=ns3d_pure_mpi
 #SBATCH --nodes=1
 #SBATCH --ntasks=128
 #SBATCH --ntasks-per-node=128
-#SBATCH --ntasks-per-socket=64
 #SBATCH --cpus-per-task=1
 #SBATCH --partition=batch
 #SBATCH --time=03:00:00
 #SBATCH --output=/scratch/s02230673/benchmark_results/slurm_pure_mpi_%j.log
 #SBATCH --error=/scratch/s02230673/benchmark_results/slurm_pure_mpi_err_%j.log
 
-# ── UCX 通信优化（InfiniBand，与学长脚本一致）───────────────
-export UCX_ASYNC_MAX_EVENTS=512
-export UCX_WARN_UNUSED_ENV_VARS=n
-export UCX_IB_REG_METHODS=odp
-export UCX_RNDV_THRESH=8192
-export UCX_MAX_RNDV_RAILS=1
-export UCX_NET_DEVICES=mlx5_0:1
-export UCX_TLS=rc_x,sm,self
-export UCX_UNIFIED_MODE=y
-
-# ── MPI 优化 ────────────────────────────────────────────────
-export OMPI_MCA_pml=ucx
-export OMPI_MCA_btl="^openib,tcp"
-export OMPI_MCA_btl_base_warn_component_unused=0
-export OMPI_MCA_orte_quit_timeout=10
-export OMPI_MCA_coll_tuned_use_dynamic_rules=1
-export OMPI_MCA_coll_tuned_bcast_algorithm=1
-export OMPI_MCA_coll_tuned_allreduce_algorithm=2
-export PMIX_MCA_gds=hash
-export SLURM_EXPORT_ENV=ALL
-export OMP_NUM_THREADS=1
-
-# ── 路径配置 ────────────────────────────────────────────────
-CONTAINER=/scratch/s02230673/ns3d.sqsh
-MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
-NS_DIR=/home/user/guo/NavierStockes-3D
+# ── 结果目录 ────────────────────────────────────────────────
 RESULT_DIR=/scratch/s02230673/benchmark_results/job_${SLURM_JOB_ID}_pure_mpi
-
-# 显式 CPU 映射：0,1,2,...,127
-CPU_MAP=$(seq -s , 0 127)
-
 mkdir -p $RESULT_DIR/logs/{fftw,accfft,p3dfft,heffte}/{128,256,512}
 CSV=$RESULT_DIR/summary_pure_mpi.csv
 echo "solver,grid,mode,np,omp_threads,avg_step_s,l2_error,status" > $CSV
@@ -55,10 +35,22 @@ echo "  Job: $SLURM_JOB_ID   Node: $SLURM_NODELIST"
 echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
+# ── 容器配置 ────────────────────────────────────────────────
+CONTAINER=/scratch/s02230673/ns3d.sqsh
+MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
+NS_DIR=/home/user/guo/NavierStockes-3D
+
+# 容器内环境（与 heFFTe 多节点 sbatch 一致）
+ENV_SETUP="export LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64:\$LD_LIBRARY_PATH; \
+           export OMPI_MCA_btl='^ofi,openib'; \
+           export OMPI_MCA_pml=ob1; \
+           export OMP_NUM_THREADS=1"
+
 SOLVERS=("ns_fftw:fftw" "ns_accfft:accfft" "ns_p3dfft:p3dfft" "ns_heffte_v2:heffte")
 GRIDS=(128 256 512)
 NSTEPS=10; DT=1e-5; TIMEOUT=900
 
+# ── 主循环：每次 srun = 一个测试 ────────────────────────────
 for solver_entry in "${SOLVERS[@]}"; do
     exe="${solver_entry%%:*}"
     name="${solver_entry##*:}"
@@ -67,18 +59,12 @@ for solver_entry in "${SOLVERS[@]}"; do
         echo ""
         echo "── [$(date '+%H:%M:%S')] $name  ${grid}^3  pure_mpi ──"
 
+        # 128 个 srun task → 128 个容器实例 → 128 个 MPI rank
         timeout $TIMEOUT \
             srun \
-              --mpi=pmix \
-              --network=host \
-              --cpu-bind=map_cpu:${CPU_MAP} \
-              --distribution=block:block:cyclic \
-              --hint=nomultithread \
-              --mem-bind=local \
               --container-image=$CONTAINER \
               --container-mounts="$MOUNTS" \
-              --no-container-entrypoint \
-              $NS_DIR/$exe $grid $grid $grid $DT $NSTEPS 1 \
+              bash -c "$ENV_SETUP; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 1" \
             > $LOG 2>&1
 
         ec=$?
