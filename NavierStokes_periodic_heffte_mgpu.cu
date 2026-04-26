@@ -297,13 +297,17 @@ static void free_arrays(GPUArrays& g){
 }
 
 template<typename FFT>
-static void heffte_fwd(FFT& fft, GReal* r, GCplx* c){
-    fft.forward(r, reinterpret_cast<std::complex<double>*>(c), heffte::scale::none);
+static void heffte_fwd(FFT& fft, GReal* r, GCplx* c, std::complex<double>* ws){
+    fft.forward(r, reinterpret_cast<std::complex<double>*>(c), ws, heffte::scale::none);
 }
 template<typename FFT>
-static void heffte_bwd(FFT& fft, GCplx* c, GReal* r){
-    fft.backward(reinterpret_cast<std::complex<double>*>(c), r, heffte::scale::full);
+static void heffte_bwd(FFT& fft, GCplx* c, GReal* r, std::complex<double>* ws){
+    fft.backward(reinterpret_cast<std::complex<double>*>(c), r, ws, heffte::scale::full);
 }
+template<typename FFT>
+static void compute_nonlinear(FFT& fft, GPUArrays& g,
+    GCplx* nl1, GCplx* nl2, GCplx* nl3, const BoxGPU& br, const BoxGPU& bc,
+    std::complex<double>* ws)   
 
 // ============================================================
 // Physics
@@ -367,7 +371,8 @@ static void compute_rhs(FFT& fft, GPUArrays& g,
 // Complex arrays for time-stepping: 9 instead of 15.
 template<typename FFT>
 static void rk4_step(FFT& fft, GPUArrays& g,
-    const BoxGPU& br, const BoxGPU& bc, double t)
+    const BoxGPU& br, const BoxGPU& bc, double t,
+    std::complex<double>* ws)
 {
     long long nc=bc.n();
     int gc=bc.grid(BLOCK);
@@ -383,7 +388,7 @@ static void rk4_step(FFT& fft, GPUArrays& g,
     CUDA_CHECK(cudaMemset(g.ksum3_c,0,nc*sizeof(GCplx)));
 
     // ── Stage 1: k1 ────────────────────────────────────────────────────────
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t);
+    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
     // V ← V_n + 0.5*dt*k1
@@ -392,7 +397,7 @@ static void rk4_step(FFT& fft, GPUArrays& g,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
 
     // ── Stage 2: k2 ────────────────────────────────────────────────────────
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU);
+    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
     // V ← V_n + 0.5*dt*k2
@@ -401,7 +406,7 @@ static void rk4_step(FFT& fft, GPUArrays& g,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
 
     // ── Stage 3: k3 ────────────────────────────────────────────────────────
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU);
+    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
     // V ← V_n + dt*k3
@@ -410,7 +415,7 @@ static void rk4_step(FFT& fft, GPUArrays& g,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,TAU,nc);
 
     // ── Stage 4: k4 ────────────────────────────────────────────────────────
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+TAU);
+    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
 
@@ -520,6 +525,14 @@ int main(int argc, char** argv) {
     }
 
     GPUArrays g; alloc_arrays(g,nr,nc);
+    GPUArrays g; alloc_arrays(g,nr,nc);
+
+    // Persistent workspace for heFFTe — avoids malloc/free per FFT call
+    size_t ws_size = fft.size_workspace();
+    std::complex<double>* d_ws;
+    CUDA_CHECK(cudaMalloc(&d_ws, ws_size * sizeof(std::complex<double>)));
+    if (rank==0) printf("  heFFTe workspace per rank: %.0f MB\n",
+                        ws_size * sizeof(std::complex<double>) / (1024.*1024.));
 
     // ── Initial condition ──────────────────────────────────────────────────
     kernel_fill_velocity<<<br.grid(BLOCK),BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,
@@ -558,6 +571,7 @@ int main(int argc, char** argv) {
         cout << "============================================================\n";
     }
     free_arrays(g);
+    cudaFree(d_ws);
     }
     MPI_Finalize();
     return 0;
