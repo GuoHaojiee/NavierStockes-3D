@@ -776,8 +776,6 @@ int main(int argc, char** argv) {
         cout << "============================================================\n";
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    Cp3dfft_clean();
     MPI_Finalize();
     return 0;
 }
