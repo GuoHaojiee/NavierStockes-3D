@@ -71,17 +71,12 @@ typedef cufftDoubleReal    GReal;
 typedef cufftDoubleComplex GCplx;
 
 // ============================================================
-// Grid parameters
+// Grid parameters — set at runtime from argv
 // ============================================================
-constexpr int    NX = 128, NY = 128, NZ = 128;
-constexpr int    NZC      = NZ / 2 + 1;          // 65
-constexpr long long NR    = (long long)NX * NY * NZ;
-constexpr long long NC_TOT = (long long)NX * NY * NZC;
-constexpr double LX = 2.0 * M_PI, LY = 2.0 * M_PI, LZ = 2.0 * M_PI;
-constexpr double DX = LX / NX, DY = LY / NY, DZ = LZ / NZ;
-constexpr int    NT_TOTAL = 20000;
-constexpr int    NT_RUN   = 10;
-constexpr double TAU      = 1.0 / NT_TOTAL;      // dt = 5e-5
+static int    NX, NY, NZ, NZC, NT_TOTAL, NT_RUN;
+static long long NR, NC_TOT;
+static double LX, LY, LZ, DX, DY, DZ, TAU;
+
 constexpr int    MAX_GPUS = 16;
 constexpr int    BLOCK    = 256;
 
@@ -202,16 +197,17 @@ __host__ __device__ double func_f3(double x, double y, double z, double t) {
 
 // Fill in-place padded buffer with analytical velocity
 __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
-                                      int nx_local, int x_offset, double t) {
-    long long nr_local = (long long)nx_local * NY * NZ;
+                                      int nx_local, int x_offset, double t,
+                                      int NY_, int NZ_, int NZC_, double DX_, double DY_, double DZ_) {
+    long long nr_local = (long long)nx_local * NY_ * NZ_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nr_local) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
+    int k  = (int)(idx % NZ_);
+    int j  = (int)((idx / NZ_) % NY_);
+    int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
-    double x = gi * DX, y = j * DY, z = k * DZ;
-    long long pidx = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    double x = gi * DX_, y = j * DY_, z = k * DZ_;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
     V1[pidx] = func_V1(x, y, z, t);
     V2[pidx] = func_V2(x, y, z, t);
     V3[pidx] = func_V3(x, y, z, t);
@@ -219,16 +215,17 @@ __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
 
 // Fill in-place padded buffer with forcing
 __global__ void kernel_fill_forcing(double* W1, double* W2, double* W3,
-                                     int nx_local, int x_offset, double t) {
-    long long nr_local = (long long)nx_local * NY * NZ;
+                                     int nx_local, int x_offset, double t,
+                                     int NY_, int NZ_, int NZC_, double DX_, double DY_, double DZ_) {
+    long long nr_local = (long long)nx_local * NY_ * NZ_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nr_local) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
+    int k  = (int)(idx % NZ_);
+    int j  = (int)((idx / NZ_) % NY_);
+    int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
-    double x = gi * DX, y = j * DY, z = k * DZ;
-    long long pidx = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    double x = gi * DX_, y = j * DY_, z = k * DZ_;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
     W1[pidx] = func_f1(x, y, z, t);
     W2[pidx] = func_f2(x, y, z, t);
     W3[pidx] = func_f3(x, y, z, t);
@@ -237,14 +234,14 @@ __global__ void kernel_fill_forcing(double* W1, double* W2, double* W3,
 // Real-space cross product: V_r × rot_r → rot_r  (padded layout)
 __global__ void kernel_cross_product(const double* V1, const double* V2, const double* V3,
                                       double* rot1, double* rot2, double* rot3,
-                                      int nx_local) {
-    long long nr_local = (long long)nx_local * NY * NZ;
+                                      int nx_local, int NY_, int NZ_, int NZC_) {
+    long long nr_local = (long long)nx_local * NY_ * NZ_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nr_local) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
-    long long pidx = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    int k  = (int)(idx % NZ_);
+    int j  = (int)((idx / NZ_) % NY_);
+    int lx = (int)(idx / ((long long)NY_ * NZ_));
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
     double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
     double w1 = rot1[pidx], w2 = rot2[pidx], w3 = rot3[pidx];
     rot1[pidx] = v2*w3 - v3*w2;
@@ -254,16 +251,17 @@ __global__ void kernel_cross_product(const double* V1, const double* V2, const d
 
 // Squared pointwise error |V_r - V_exact|² → scratch  (padded real read, linear scratch write)
 __global__ void kernel_error_sq(const double* V1, const double* V2, const double* V3,
-                                  double* scratch, int nx_local, int x_offset, double t) {
-    long long nr_local = (long long)nx_local * NY * NZ;
+                                  double* scratch, int nx_local, int x_offset, double t,
+                                  int NY_, int NZ_, int NZC_, double DX_, double DY_, double DZ_) {
+    long long nr_local = (long long)nx_local * NY_ * NZ_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nr_local) return;
-    int k  = (int)(idx % NZ);
-    int j  = (int)((idx / NZ) % NY);
-    int lx = (int)(idx / ((long long)NY * NZ));
+    int k  = (int)(idx % NZ_);
+    int j  = (int)((idx / NZ_) % NY_);
+    int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
-    double x = gi * DX, y = j * DY, z = k * DZ;
-    long long pidx = (long long)lx * NY * 2*NZC + j * 2*NZC + k;
+    double x = gi * DX_, y = j * DY_, z = k * DZ_;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
     double d1 = V1[pidx] - func_V1(x, y, z, t);
     double d2 = V2[pidx] - func_V2(x, y, z, t);
     double d3 = V3[pidx] - func_V3(x, y, z, t);
@@ -291,18 +289,19 @@ __global__ void kernel_scale_cplx(GCplx* A, long long nc_local, double scale) {
 // Spectral vorticity: rot_c = ik × V_c  (both in spectral layout)
 __global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx* V3,
                                     GCplx* rot1, GCplx* rot2, GCplx* rot3,
-                                    int ny_local, int y_offset) {
-    long long nc_local = (long long)NX * ny_local * NZC;
+                                    int ny_local, int y_offset,
+                                    int NX_, int NY_, int NZC_) {
+    long long nc_local = (long long)NX_ * ny_local * NZC_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
 
-    int kz      = (int)(idx % NZC);
-    int local_y = (int)((idx / NZC) % ny_local);
-    int gx      = (int)(idx / ((long long)ny_local * NZC));
+    int kz      = (int)(idx % NZC_);
+    int local_y = (int)((idx / NZC_) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * NZC_));
     int gy      = y_offset + local_y;
 
-    double kx = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx = (gx <= NX_/2) ? (double)gx : (double)(gx - NX_);
+    double ky = (gy <= NY_/2) ? (double)gy : (double)(gy - NY_);
     double kzd = (double)kz;
 
     rot1[idx].x = -(ky * V3[idx].y - kzd * V2[idx].y);
@@ -315,18 +314,19 @@ __global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx
 
 // Viscous term: visc_c = -k² V_c  (spectral layout)
 __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
-                                        int ny_local, int y_offset) {
-    long long nc_local = (long long)NX * ny_local * NZC;
+                                        int ny_local, int y_offset,
+                                        int NX_, int NY_, int NZC_) {
+    long long nc_local = (long long)NX_ * ny_local * NZC_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
 
-    int kz      = (int)(idx % NZC);
-    int local_y = (int)((idx / NZC) % ny_local);
-    int gx      = (int)(idx / ((long long)ny_local * NZC));
+    int kz      = (int)(idx % NZC_);
+    int local_y = (int)((idx / NZC_) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * NZC_));
     int gy      = y_offset + local_y;
 
-    double kx = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx = (gx <= NX_/2) ? (double)gx : (double)(gx - NX_);
+    double ky = (gy <= NY_/2) ? (double)gy : (double)(gy - NY_);
     double kzd = (double)kz;
     double k2 = kx*kx + ky*ky + kzd*kzd;
 
@@ -336,18 +336,19 @@ __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
 
 // Projection: make spectral rhs divergence-free (in-place, spectral layout)
 __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
-                                      int ny_local, int y_offset) {
-    long long nc_local = (long long)NX * ny_local * NZC;
+                                      int ny_local, int y_offset,
+                                      int NX_, int NY_, int NZC_) {
+    long long nc_local = (long long)NX_ * ny_local * NZC_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
 
-    int kz      = (int)(idx % NZC);
-    int local_y = (int)((idx / NZC) % ny_local);
-    int gx      = (int)(idx / ((long long)ny_local * NZC));
+    int kz      = (int)(idx % NZC_);
+    int local_y = (int)((idx / NZC_) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * NZC_));
     int gy      = y_offset + local_y;
 
-    double kx = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx = (gx <= NX_/2) ? (double)gx : (double)(gx - NX_);
+    double ky = (gy <= NY_/2) ? (double)gy : (double)(gy - NY_);
     double kzd = (double)kz;
     double k2 = kx*kx + ky*ky + kzd*kzd;
     if (k2 < 1e-10) return;
@@ -363,18 +364,19 @@ __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
 
 // |ik·V_c| per spectral mode → scratch  (spectral layout → linear scratch)
 __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3,
-                                 double* scratch, int ny_local, int y_offset) {
-    long long nc_local = (long long)NX * ny_local * NZC;
+                                 double* scratch, int ny_local, int y_offset,
+                                 int NX_, int NY_, int NZC_) {
+    long long nc_local = (long long)NX_ * ny_local * NZC_;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
 
-    int kz      = (int)(idx % NZC);
-    int local_y = (int)((idx / NZC) % ny_local);
-    int gx      = (int)(idx / ((long long)ny_local * NZC));
+    int kz      = (int)(idx % NZC_);
+    int local_y = (int)((idx / NZC_) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * NZC_));
     int gy      = y_offset + local_y;
 
-    double kx = (gx <= NX/2) ? (double)gx : (double)(gx - NX);
-    double ky = (gy <= NY/2) ? (double)gy : (double)(gy - NY);
+    double kx = (gx <= NX_/2) ? (double)gx : (double)(gx - NX_);
+    double ky = (gy <= NY_/2) ? (double)gy : (double)(gy - NY_);
     double kzd = (double)kz;
 
     double dr = -(kx*V1[idx].y + ky*V2[idx].y + kzd*V3[idx].y);
@@ -384,8 +386,6 @@ __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3
 
 // ============================================================
 // Layout-agnostic element-wise kernels
-// These do NOT need to know whether the data is in X-slab or Y-slab layout —
-// they operate purely on linear local indices.
 // ============================================================
 
 // Add terms to rhs: rhs += visc + f
@@ -459,8 +459,12 @@ struct MGPUState {
 
     int nx_local;          // NX / nGPUs  (X slabs per GPU — real space)
     int ny_local;          // NY / nGPUs  (Y slabs per GPU — spectral space)
-    long long nc_local;    // NX * ny_local * NZC  (== nx_local * NY * NZC when NX==NY)
-    long long nr_local;    // nx_local * NY * NZ   (real elements per GPU, unpadded)
+    long long nc_local;    // NX * ny_local * NZC
+    long long nr_local;    // nx_local * NY * NZ
+
+    // Grid parameters (copied from globals for convenience in host functions)
+    int h_NX, h_NY, h_NZ, h_NZC;
+    double h_DX, h_DY, h_DZ;
 
     // In-place cuFFTXt buffers (velocity, vorticity, work/forcing)
     cudaLibXtDesc* V1_buf;
@@ -525,8 +529,7 @@ static void alloc_mgpu(MGPUState& s, cufftHandle plan_r2c) {
     }
 }
 
-// Synchronize all GPUs — required between user kernels (stream 0) and cuFFTXt calls
-// (internal streams). cuFFTXt multi-GPU uses per-GPU internal streams separate from stream 0.
+// Synchronize all GPUs
 static void sync_all_gpus(const MGPUState& s) {
     for (int g = 0; g < s.nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
@@ -539,15 +542,16 @@ static void sync_all_gpus(const MGPUState& s) {
 // ============================================================
 static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                MGPUState& s) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
     const int nx_local = s.nx_local;
     const int ny_local = s.ny_local;
+    const int NX_ = s.h_NX, NY_ = s.h_NY, NZ_ = s.h_NZ, NZC_ = s.h_NZC;
+    const double DX_ = s.h_DX, DY_ = s.h_DY, DZ_ = s.h_DZ;
 
-    // 1. Spectral vorticity written directly into rot_buf (Y-slab spectral)
-    //    Then subFormat hacked to 3 so cuFFTXt accepts them as Z2D input.
+    // 1. Spectral vorticity → rot_buf (Y-slab spectral)
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
@@ -556,16 +560,15 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
         kernel_compute_rot<<<grid_c, BLOCK>>>(
             (GCplx*)gpu_ptr(s.V1_buf, g), (GCplx*)gpu_ptr(s.V2_buf, g), (GCplx*)gpu_ptr(s.V3_buf, g),
             (GCplx*)gpu_ptr(s.rot1_buf, g), (GCplx*)gpu_ptr(s.rot2_buf, g), (GCplx*)gpu_ptr(s.rot3_buf, g),
-            ny_local, y_offset);
+            ny_local, y_offset, NX_, NY_, NZC_);
     }
-    // subFormat hack: we wrote complex (Y-slab) data directly → mark buffers as "shuffled"
     force_z2d_format(s.rot1_buf);
     force_z2d_format(s.rot2_buf);
     force_z2d_format(s.rot3_buf);
-    // SYNC [A]: kernel_compute_rot (stream 0) vs Z2D below (internal streams)
+    // SYNC [A]
     sync_all_gpus(s);
 
-    // 2. IFFT velocity V_buf: Y-slab complex → X-slab real (padded). subFormat becomes 2.
+    // 2. IFFT velocity V_buf: Y-slab complex → X-slab real
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
@@ -574,10 +577,10 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot1_buf, s.rot1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
-    // SYNC [B]: Z2D (internal streams) vs kernel_cross_product below (stream 0)
+    // SYNC [B]
     sync_all_gpus(s);
 
-    // 4. Real-space cross product V × rot → rot_buf  (X-slab padded layout)
+    // 4. Real-space cross product V × rot → rot_buf
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
@@ -585,17 +588,16 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
         kernel_cross_product<<<grid_r, BLOCK>>>(
             (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
             (double*)gpu_ptr(s.rot1_buf, g), (double*)gpu_ptr(s.rot2_buf, g), (double*)gpu_ptr(s.rot3_buf, g),
-            nx_local);
+            nx_local, NY_, NZ_, NZC_);
     }
-    // rot_buf.subFormat is 2 (INPLACE real) after Z2D → valid for D2Z
-    // SYNC [C]: kernel_cross_product (stream 0) vs D2Z below (internal streams)
+    // SYNC [C]
     sync_all_gpus(s);
 
-    // 5. FFT cross product result rot_buf → Y-slab spectral (subFormat becomes 3)
+    // 5. FFT cross product result rot_buf → Y-slab spectral
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot1_buf, s.rot1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
-    // SYNC [D]: D2Z (internal streams) vs kernel_copy_cplx below (stream 0)
+    // SYNC [D]
     sync_all_gpus(s);
 
     // 6. Copy spectral cross product to rhs_c and scale
@@ -614,38 +616,35 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
 
 // ============================================================
 // Full RHS = nl + visc + f, projected to divergence-free
-// V_buf must be in spectral (subFormat=3, Y-slab) on entry.
-// V_buf is destroyed (consumed by Z2D in compute_nonlinear).
-// Output: rhs{1,2,3}_c per GPU (Y-slab).
 // ============================================================
 static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
                         MGPUState& s, double t) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
     const int nx_local = s.nx_local;
     const int ny_local = s.ny_local;
+    const int NX_ = s.h_NX, NY_ = s.h_NY, NZ_ = s.h_NZ, NZC_ = s.h_NZC;
+    const double DX_ = s.h_DX, DY_ = s.h_DY, DZ_ = s.h_DZ;
 
-    // 1. Viscous: visc_c = -k² V_buf_c  (BEFORE nonlinear which destroys V_buf)
+    // 1. Viscous: visc_c = -k² V_buf_c
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
         int y_offset = g * ny_local;
         int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
-        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf, g), s.visc1_c[g], ny_local, y_offset);
-        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf, g), s.visc2_c[g], ny_local, y_offset);
-        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf, g), s.visc3_c[g], ny_local, y_offset);
+        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf, g), s.visc1_c[g], ny_local, y_offset, NX_, NY_, NZC_);
+        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf, g), s.visc2_c[g], ny_local, y_offset, NX_, NY_, NZC_);
+        kernel_compute_viscous<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf, g), s.visc3_c[g], ny_local, y_offset, NX_, NY_, NZC_);
     }
-    // SYNC [E]: kernel_compute_viscous reads V_buf (stream 0);
-    //           compute_nonlinear below issues Z2D on V_buf (internal streams)
+    // SYNC [E]
     sync_all_gpus(s);
 
-    // 2. Nonlinear: V × rot(V) → rhs_c  (V_buf destroyed inside via Z2D)
+    // 2. Nonlinear: V × rot(V) → rhs_c
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
     // 3. Forcing: fill work_buf real, FFT, scale → f_c
-    //    work_buf.subFormat may be 3 from previous D2Z → force to 2 before writing real data
     force_d2z_format(s.work1_buf);
     force_d2z_format(s.work2_buf);
     force_d2z_format(s.work3_buf);
@@ -656,15 +655,16 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
         int grid_r = (int)((nr_local + BLOCK - 1) / BLOCK);
         kernel_fill_forcing<<<grid_r, BLOCK>>>(
             (double*)gpu_ptr(s.work1_buf, g), (double*)gpu_ptr(s.work2_buf, g),
-            (double*)gpu_ptr(s.work3_buf, g), nx_local, x_offset, t);
+            (double*)gpu_ptr(s.work3_buf, g), nx_local, x_offset, t,
+            NY_, NZ_, NZC_, DX_, DY_, DZ_);
     }
-    // SYNC [F]: kernel_fill_forcing (stream 0) vs D2Z below (internal streams)
+    // SYNC [F]
     sync_all_gpus(s);
 
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
-    // SYNC [G]: D2Z (internal streams) vs kernel_copy_cplx/scale below (stream 0)
+    // SYNC [G]
     sync_all_gpus(s);
 
     #pragma omp parallel for num_threads(nGPUs)
@@ -690,14 +690,14 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
             s.f1_c[g], s.f2_c[g], s.f3_c[g], nc_local);
     }
 
-    // 5. Project rhs to divergence-free space  (Y-slab spectral kernel)
+    // 5. Project rhs to divergence-free space
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
         int y_offset = g * ny_local;
         int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
         kernel_make_div_free<<<grid_c, BLOCK>>>(
-            s.rhs1_c[g], s.rhs2_c[g], s.rhs3_c[g], ny_local, y_offset);
+            s.rhs1_c[g], s.rhs2_c[g], s.rhs3_c[g], ny_local, y_offset, NX_, NY_, NZC_);
     }
 }
 
@@ -850,12 +850,14 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                  MGPUState& s, double t,
                                  double& L2_err, double& max_div) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
     const int nx_local = s.nx_local;
     const int ny_local = s.ny_local;
+    const int NX_ = s.h_NX, NY_ = s.h_NY, NZ_ = s.h_NZ, NZC_ = s.h_NZC;
+    const double DX_ = s.h_DX, DY_ = s.h_DY, DZ_ = s.h_DZ;
 
     // max|div V| in spectral space (Y-slab) — BEFORE IFFT
     #pragma omp parallel for num_threads(nGPUs)
@@ -865,7 +867,7 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
         int gc = (int)((nc_local + BLOCK - 1) / BLOCK);
         kernel_div_abs<<<gc, BLOCK>>>(
             (GCplx*)gpu_ptr(s.V1_buf, g), (GCplx*)gpu_ptr(s.V2_buf, g), (GCplx*)gpu_ptr(s.V3_buf, g),
-            s.d_scratch[g], ny_local, y_offset);
+            s.d_scratch[g], ny_local, y_offset, NX_, NY_, NZC_);
     }
     max_div = 0.0;
     for (int g = 0; g < nGPUs; g++) {
@@ -880,10 +882,10 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
-    // SYNC [H]: Z2D (internal streams) vs kernel_error_sq below (stream 0)
+    // SYNC [H]
     sync_all_gpus(s);
 
-    // Squared error per grid point → d_scratch (linear, nr_local elements)
+    // Squared error per grid point → d_scratch
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
@@ -891,7 +893,8 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
         int gr = (int)((nr_local + BLOCK - 1) / BLOCK);
         kernel_error_sq<<<gr, BLOCK>>>(
             (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
-            s.d_scratch[g], nx_local, x_offset, t);
+            s.d_scratch[g], nx_local, x_offset, t,
+            NY_, NZ_, NZC_, DX_, DY_, DZ_);
     }
     double err_sq = 0.0;
     for (int g = 0; g < nGPUs; g++) {
@@ -900,16 +903,16 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
         thrust::device_ptr<double> sp(s.d_scratch[g]);
         err_sq += thrust::reduce(thrust::device, sp, sp + nr_local, 0.0);
     }
-    L2_err = sqrt(err_sq * DX * DY * DZ);
+    L2_err = sqrt(err_sq * DX_ * DY_ * DZ_);
 
     // Re-FFT V_buf → restore spectral state (Y-slab, subFormat=3)
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
-    // SYNC [I]: D2Z (internal streams) vs kernel_scale_cplx below (stream 0)
+    // SYNC [I]
     sync_all_gpus(s);
 
-    // Renormalize (D2Z is not normalized)
+    // Renormalize
     #pragma omp parallel for num_threads(nGPUs)
     for (int g = 0; g < nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
@@ -923,7 +926,25 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // ============================================================
 // Main
 // ============================================================
-int main() {
+int main(int argc, char** argv) {
+    if (argc < 6) {
+        fprintf(stderr, "Usage: %s NX NY NZ dt NSTEPS\n", argv[0]);
+        return 1;
+    }
+    NX      = atoi(argv[1]);
+    NY      = atoi(argv[2]);
+    NZ      = atoi(argv[3]);
+    TAU     = atof(argv[4]);
+    NT_RUN  = atoi(argv[5]);
+    NZC     = NZ / 2 + 1;
+    NR      = (long long)NX * NY * NZ;
+    NC_TOT  = (long long)NX * NY * NZC;
+    LX = LY = LZ = 2.0 * M_PI;
+    DX = LX / NX; DY = LY / NY; DZ = LZ / NZ;
+    NT_TOTAL = NT_RUN;
+
+    printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
+
     // Query available GPUs
     int nGPUs_avail = 0;
     CUDA_CHECK(cudaGetDeviceCount(&nGPUs_avail));
@@ -934,17 +955,21 @@ int main() {
     for (int g = 0; g < s.nGPUs; g++) s.gpu_ids[g] = g;
 
     if (NX % s.nGPUs != 0) {
-        fprintf(stderr, "NX=%d must be divisible by nGPUs=%d (X-slab decomposition)\n", NX, s.nGPUs);
+        fprintf(stderr, "NX=%d must be divisible by nGPUs=%d\n", NX, s.nGPUs);
         return 1;
     }
     if (NY % s.nGPUs != 0) {
-        fprintf(stderr, "NY=%d must be divisible by nGPUs=%d (Y-slab decomposition)\n", NY, s.nGPUs);
+        fprintf(stderr, "NY=%d must be divisible by nGPUs=%d\n", NY, s.nGPUs);
         return 1;
     }
     s.nx_local  = NX / s.nGPUs;
     s.ny_local  = NY / s.nGPUs;
-    s.nc_local  = (long long)NX * s.ny_local * NZC;   // == nx_local * NY * NZC when NX==NY
+    s.nc_local  = (long long)NX * s.ny_local * NZC;
     s.nr_local  = (long long)s.nx_local * NY * NZ;
+
+    // Store grid params in state for kernel calls
+    s.h_NX = NX; s.h_NY = NY; s.h_NZ = NZ; s.h_NZC = NZC;
+    s.h_DX = DX; s.h_DY = DY; s.h_DZ = DZ;
 
     cout << "============================================================" << endl;
     cout << "  Navier-Stokes Solver - cuFFTXt Multi-GPU (Y-slab FIX)" << endl;
@@ -958,7 +983,7 @@ int main() {
     cout << "Grid: " << NX << " x " << NY << " x " << NZ << endl;
     cout << "  Real  (X-slab): nx_local=" << s.nx_local << " per GPU" << endl;
     cout << "  Spec. (Y-slab): ny_local=" << s.ny_local << " per GPU" << endl;
-    cout << "Steps: " << NT_RUN << " / " << NT_TOTAL << ", dt = " << TAU << endl;
+    cout << "Steps: " << NT_RUN << ", dt = " << TAU << endl;
     cout << "============================================================" << endl;
 
     // Create cuFFTXt plans
@@ -989,14 +1014,14 @@ int main() {
         int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
         kernel_fill_velocity<<<gr, BLOCK>>>(
             (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
-            s.nx_local, x_offset, 0.0);
+            s.nx_local, x_offset, 0.0, NY, NZ, NZC, DX, DY, DZ);
     }
-    sync_all_gpus(s);  // kernel_fill_velocity (stream 0) vs D2Z below (internal streams)
+    sync_all_gpus(s);
 
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
-    sync_all_gpus(s);  // D2Z (internal streams) vs kernel_scale_cplx below (stream 0)
+    sync_all_gpus(s);
 
     // Normalize
     const double inv_N = 1.0 / (double)(NX * NY * NZ);
@@ -1009,7 +1034,7 @@ int main() {
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf, g), s.nc_local, inv_N);
     }
 
-    // Project initial condition to divergence-free space  (Y-slab spectral kernel)
+    // Project initial condition to divergence-free space
     cout << "Projecting to divergence-free space..." << endl;
     #pragma omp parallel for num_threads(s.nGPUs)
     for (int g = 0; g < s.nGPUs; g++) {
@@ -1018,26 +1043,14 @@ int main() {
         int gc = (int)((s.nc_local + BLOCK - 1) / BLOCK);
         kernel_make_div_free<<<gc, BLOCK>>>(
             (GCplx*)gpu_ptr(s.V1_buf, g), (GCplx*)gpu_ptr(s.V2_buf, g), (GCplx*)gpu_ptr(s.V3_buf, g),
-            s.ny_local, y_offset);
+            s.ny_local, y_offset, NX, NY, NZC);
     }
     // V_buf is spectral (Y-slab), subFormat=3 ✓
-
-    // Initial diagnostics
-    {
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, 0.0, L2_err, max_div);
-        cout << "\nInitial condition (t=0):" << endl;
-        cout << "  L2 error:   " << scientific << L2_err << endl;
-        cout << "  max|div V|: " << max_div << "\n" << endl;
-    }
 
     // Time integration
     cout << "============================================================" << endl;
     cout << "  Time Integration (RK4)" << endl;
     cout << "============================================================" << endl;
-    cout << setw(6) << "Step" << setw(12) << "Wall(s)"
-         << setw(15) << "L2 Error" << setw(15) << "Max |div V|" << endl;
-    cout << "------------------------------------------------------------------------" << endl;
 
     double t_wall_total = 0.0;
     cudaEvent_t ev_start, ev_stop;
@@ -1045,42 +1058,43 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
-    for (int it = 0; it <= NT_RUN; ++it) {
+    for (int it = 0; it < NT_RUN; ++it) {
         double t_cur = it * TAU;
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, t_cur, L2_err, max_div);
 
-        cout << setw(6) << it
-             << setw(12) << fixed << setprecision(4) << t_wall_total
-             << setw(15) << scientific << setprecision(4) << L2_err
-             << setw(15) << max_div << endl;
+        CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
+        CUDA_CHECK(cudaEventRecord(ev_start));
 
-        if (it < NT_RUN) {
-            CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
-            CUDA_CHECK(cudaEventRecord(ev_start));
+        rk4_step(plan_r2c, plan_c2r, s, t_cur);
 
-            rk4_step(plan_r2c, plan_c2r, s, t_cur);
-
-            // Sync all GPUs
-            for (int g = 0; g < s.nGPUs; g++) {
-                CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
-
-            CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
-            CUDA_CHECK(cudaEventRecord(ev_stop));
-            CUDA_CHECK(cudaEventSynchronize(ev_stop));
-
-            float ms = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-            t_wall_total += (double)ms * 1e-3;
+        for (int g = 0; g < s.nGPUs; g++) {
+            CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
+
+        CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
+        CUDA_CHECK(cudaEventRecord(ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
+
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
+        t_wall_total += (double)ms * 1e-3;
+    }
+
+    // Final diagnostics only
+    {
+        double t_final = NT_RUN * TAU;
+        double L2_err, max_div;
+        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, L2_err, max_div);
+        cout << "  L2 error   (t=" << fixed << setprecision(6) << t_final << "): "
+             << scientific << setprecision(4) << L2_err << endl;
+        cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+             << scientific << setprecision(4) << max_div << endl;
     }
 
     cout << "============================================================" << endl;
-    cout << "  Total steps: " << NT_RUN << endl;
-    cout << "  Total wall:  " << fixed << setprecision(4) << t_wall_total << " s" << endl;
-    cout << "  Avg/step:    " << t_wall_total / NT_RUN << " s" << endl;
+    cout << "  Total steps:     " << NT_RUN << endl;
+    cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s" << endl;
+    cout << "  Avg per step:    " << t_wall_total / NT_RUN << " s" << endl;
     cout << "============================================================" << endl;
 
     // Cleanup
