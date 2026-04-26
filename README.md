@@ -177,22 +177,17 @@ $$p = (t^2+1) \cos x \cos y \cos z$$
 
 验证参数：$64^3$ 网格，$dt = 5 \times 10^{-5}$，运行 10 步。
 
-### GPU 加速（规划中）
+### GPU 加速
 
-GPU 版本分三个阶段实现：
-
-| 阶段 | 描述 | 状态 |
-|------|------|------|
-| 单节点单 GPU | 基于 cuFFT 的单 GPU 实现 | 开发中 |
-| 单节点多 GPU | NVLink/PCIe 多 GPU 扩展 | 规划中 |
-| 多节点多 GPU | MPI + cuFFT/heFFTe GPU 后端 | 规划中 |
-
-单 GPU 版本设计要点（`NavierStokes_periodic_cufft.cu`，待加入）：
-- 使用 `cufftPlan3d` 全局复用两个 plan（D2Z / Z2D）
-- 实空间无 padding：`RIDX(i,j,k) = i*NY*NZ + j*NZ + k`
-- 归一化约定与 FFTW 一致，forward 后 kernel 手动 $/N$
-- Z2D 可能销毁输入，viscous 算子必须在 nonlinear 之前执行
-- 显存估算：$128^3$ 约 599 MB（10 个实数数组 + 27 个复数数组）
+| 文件 | 描述 |
+|------|------|
+| `NavierStokes_periodic_cufft.cu` | 单节点单 GPU（cuFFT） |
+| `NavierStokes_periodic_cufftxt.cu` | 单节点多 GPU（cuFFTXt） |
+| `NavierStokes_periodic_heffte_gpu1.cu` | 单节点多 GPU（heFFTe+cuFFT，MPI） |
+| `NavierStokes_periodic_heffte_mgpu.cu` | 单节点多 GPU（heFFTe+cuFFT，MPI） |
+| `NavierStokes_periodic_heffte_multigpu.cu` | 多节点多 GPU（heFFTe+cuFFT，MPI） |
+| `NavierStokes_periodic_cufftmp_mgpu.cu` | 单节点多 GPU（cuFFTMp，MPI） |
+| `NavierStokes_periodic_cufftmp_multinode.cu` | 多节点多 GPU（cuFFTMp，MPI） |
 
 ---
 
@@ -200,26 +195,20 @@ GPU 版本分三个阶段实现：
 
 ```
 .
-├── NavierStokes_periodic_fftw.cpp          # FFTW MPI 版（1D slab，参考实现）
-├── NavierStokes_periodic_heffte_v2.cpp     # heFFTe 版（2D pencil）
-├── NavierStokes_periodic_p3dfft.cpp        # p3dfft 版（2D pencil）
-├── NavierStokes_periodic_accfft.cpp        # AccFFT 版（2D pencil，已验证）
-├── test_spectral_derivative.cpp            # FFTW 谱导数验证
-├── test_spectral_derivative_heffte.cpp     # heFFTe 谱导数验证
-├── test_spectral_derivative_p3dfft.cpp     # p3dfft 谱导数验证
-├── test_spectral_derivative_accfft.cpp     # AccFFT 谱导数验证
-├── Makefile_periodic                       # FFTW 版编译
-├── Makefile_heffte                         # heFFTe 版编译
-├── Makefile_p3dfft                         # p3dfft 版编译
-├── Makefile_accfft                         # AccFFT 版编译
-└── pic/                                    # 实验结果图片
-    ├── 并行算法.png
-    ├── 不同绑定下的openmp结果对比.png
-    ├── 对流实验可视化图片1.png
-    ├── 对流实验可视化图片2.png
-    ├── MPI版本优化1取消装置结果对比.png
-    ├── MPI不同plan的优化.png
-    └── MPI+OpenMp混合版本得到最佳优化.png
+├── NavierStokes_periodic_fftw.cpp           # FFTW MPI（1D slab，参考实现）
+├── NavierStokes_periodic_heffte_v2.cpp      # heFFTe CPU（2D pencil）
+├── NavierStokes_periodic_p3dfft.cpp         # p3dfft（2D pencil）
+├── NavierStokes_periodic_accfft.cpp         # AccFFT（2D pencil）
+├── NavierStokes_periodic_cufft.cu           # 单 GPU（cuFFT）
+├── NavierStokes_periodic_cufftxt.cu         # 单节点多 GPU（cuFFTXt）
+├── NavierStokes_periodic_heffte_gpu1.cu     # 单节点多 GPU（heFFTe+cuFFT）
+├── NavierStokes_periodic_heffte_mgpu.cu     # 单节点多 GPU（heFFTe+cuFFT）
+├── NavierStokes_periodic_heffte_multigpu.cu # 多节点多 GPU（heFFTe+cuFFT）
+├── NavierStokes_periodic_cufftmp_mgpu.cu    # 单节点多 GPU（cuFFTMp）
+├── NavierStokes_periodic_cufftmp_multinode.cu # 多节点多 GPU（cuFFTMp）
+├── test_spectral_derivative*.cpp            # 各库谱导数验证
+├── Makefile_*                               # 对应编译文件
+└── pic/                                     # 实验结果图片
 ```
 
 ---
@@ -252,14 +241,54 @@ make -f Makefile_p3dfft
 make -f Makefile_accfft
 ```
 
-### 运行示例
+### 运行
+
+统一格式：`mpirun -np <NP> ./<executable> NX NY NZ dt NSTEPS [OMP_THREADS]`
+
+- `OMP_THREADS`（可选）仅 CPU 版支持，默认使用系统最大线程数
+
+#### CPU 版
 
 ```bash
-# 4 进程运行 FFTW 版
-mpirun -np 4 ./navier_stokes_periodic
+# FFTW MPI（1D slab）
+mpirun -np 4 ./navier_stokes_periodic 64 64 64 1e-4 100 4
 
-# 8 进程运行 heFFTe 版（2D pencil）
-mpirun -np 8 ./navier_stokes_heffte_v2
+# heFFTe（2D pencil）
+mpirun -np 4 ./navier_stokes_heffte_v2 64 64 64 1e-4 100 4
+
+# p3dfft（2D pencil）
+mpirun -np 4 ./navier_stokes_p3dfft 64 64 64 1e-4 100 4
+
+# AccFFT（2D pencil）
+mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 100 4
+```
+
+#### 单 GPU
+
+```bash
+./navier_stokes_cufft 64 64 64 1e-4 100
+```
+
+#### 多 GPU（单节点）
+
+```bash
+# cuFFTXt（无需 MPI）
+./navier_stokes_cufftxt 128 128 128 1e-4 100
+
+# heFFTe + cuFFT
+mpirun -np 4 ./navier_stokes_heffte_gpu1 128 128 128 1e-4 100
+mpirun -np 4 ./navier_stokes_heffte_mgpu 128 128 128 1e-4 100
+
+# cuFFTMp
+mpirun -np 4 ./navier_stokes_cufftmp_mgpu 128 128 128 1e-4 100
+```
+
+#### 多 GPU（多节点）
+
+```bash
+# 2 节点 × 4 GPU = 8 进程
+mpirun -np 8 ./navier_stokes_heffte_multigpu 256 256 256 1e-4 100
+mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100
 ```
 
 ---
