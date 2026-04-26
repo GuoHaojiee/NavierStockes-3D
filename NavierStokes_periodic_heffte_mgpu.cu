@@ -5,28 +5,17 @@
  * Each MPI rank controls one GPU on the same node.
  * GPU assignment: cudaSetDevice(rank % num_local_gpus)
  *
- * heFFTe automatically distributes work via 2D pencil decomposition across all
- * ranks/GPUs. Device-to-device MPI communication is handled internally by heFFTe
- * (requires CUDA-aware MPI, e.g., OpenMPI built with --with-cuda).
+ * Performance fixes vs. previous version:
+ *   - Slab decomposition (Nx1x1) instead of pencil (2x2x2): 1 transpose per FFT
+ *   - GPU-aware MPI path forced via heffte options
+ *   - Persistent heFFTe workspace: avoids cudaMalloc/cudaFree per FFT call,
+ *     and avoids cuIpcOpenMemHandle per FFT call (was the dominant cost)
  *
- * Run: mpirun -np <ngpu> ./navier_stokes_heffte_mgpu NX NY NZ dt NSTEPS
- *
- * ── FIXES vs. original ──────────────────────────────────────────────────────
- * Bug 1 [Correctness]: cudaMemcpyToSymbol() was called BEFORE cudaSetDevice().
- *   All MPI processes start with GPU 0 as the default device, so ranks ≥ 1
- *   were writing constant memory to GPU 0 instead of their assigned GPU.
- *   Kernels on GPU 1,2,… then read uninitialised d_NX/d_NY/d_DX/d_DY/d_DZ.
- *   Fix: call cudaMemcpyToSymbol() AFTER cudaSetDevice().
- *
- * Bug 2 [OOM]: 28 complex device arrays were allocated per rank (12 for all
- *   four RK4 ki stages + 3 tmp + 1 unused div_c + 12 physics intermediates).
- *   For a 256³ grid with 2 GPUs each complex array ≈ 64 MB → ~1.8 GB just in
- *   complex buffers, plus real arrays and heFFTe internal workspace easily
- *   pushing into OOM territory on a shared/partially-occupied GPU.
- *   Fix: accumulate the weighted RK4 sum on-the-fly (ksum += w_i * k_i),
- *   reducing time-stepping complex arrays from 15 to 9, and remove the
- *   never-used div_c array.  Total saving: 7 × ~64 MB ≈ 448 MB per rank.
- * ────────────────────────────────────────────────────────────────────────────
+ * Run:
+ *   mpirun -np <ngpu> --mca pml ucx --mca btl ^openib \
+ *     -x UCX_TLS=cuda_copy,cuda_ipc,sm,self -x UCX_MEMTYPE_CACHE=n \
+ *     -x LD_LIBRARY_PATH \
+ *     ./ns_heffte_mgpu NX NY NZ dt NSTEPS
  */
 
 #include <cmath>
@@ -192,7 +181,6 @@ __global__ void kernel_add_rhs(GCplx* r1, GCplx* r2, GCplx* r3,
     r3[idx].x+=v3[idx].x+f3[idx].x; r3[idx].y+=v3[idx].y+f3[idx].y;
 }
 
-// V = orig + a * k  (used for both intermediate RK4 stages and final update)
 __global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
     const GCplx* o1, const GCplx* o2, const GCplx* o3,
     const GCplx* k1, const GCplx* k2, const GCplx* k3,
@@ -205,8 +193,6 @@ __global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
     V3[idx].x=o3[idx].x+a*k3[idx].x; V3[idx].y=o3[idx].y+a*k3[idx].y;
 }
 
-// FIX (Bug 2): accumulate weighted ki into ksum on-the-fly instead of
-// storing all four ki simultaneously.  ksum += w * k
 __global__ void kernel_rk4_accum(GCplx* s1, GCplx* s2, GCplx* s3,
     const GCplx* k1, const GCplx* k2, const GCplx* k3,
     double w, long long n)
@@ -242,28 +228,20 @@ static BoxGPU make_box(const heffte::box3d<>& b){
     BoxGPU bg; for(int d=0;d<3;d++){bg.lo[d]=b.low[d];bg.sz[d]=b.size[d];} return bg;
 }
 
-// FIX (Bug 2): removed k2v1..k4v3 (9 arrays) and div_c (1 array, never used).
-// Added ksum1_c..ksum3_c for rolling RK4 accumulation.
-// Total complex arrays: 28 → 21  (saving ~448 MB per rank for 256³ / 2 GPU).
 struct GPUArrays {
-    // Physical-space arrays
     GReal *V1_r, *V2_r, *V3_r;
     GReal *rot1_r, *rot2_r, *rot3_r;
     GReal *work1_r, *work2_r, *work3_r;
-    GReal *scratch;                    // used for error/divergence reduction
+    GReal *scratch;
 
-    // Spectral-space: solution
     GCplx *V1_c, *V2_c, *V3_c;
-
-    // Spectral-space: physics intermediates
     GCplx *rot1_c, *rot2_c, *rot3_c;
     GCplx *visc1_c, *visc2_c, *visc3_c;
     GCplx *f1_c, *f2_c, *f3_c;
 
-    // Spectral-space: RK4 time-stepping (9 arrays instead of 15)
-    GCplx *orig1_c, *orig2_c, *orig3_c; // save V at start of step
-    GCplx *ksum1_c, *ksum2_c, *ksum3_c; // rolling weighted sum of ki
-    GCplx *ktmp1_c, *ktmp2_c, *ktmp3_c; // output of current compute_rhs stage
+    GCplx *orig1_c, *orig2_c, *orig3_c;
+    GCplx *ksum1_c, *ksum2_c, *ksum3_c;
+    GCplx *ktmp1_c, *ktmp2_c, *ktmp3_c;
 };
 
 static void alloc_arrays(GPUArrays& g, long long nr, long long nc){
@@ -296,6 +274,9 @@ static void free_arrays(GPUArrays& g){
     cudaFree(g.ktmp1_c);cudaFree(g.ktmp2_c);cudaFree(g.ktmp3_c);
 }
 
+// ============================================================
+// heFFTe wrappers — take persistent workspace pointer
+// ============================================================
 template<typename FFT>
 static void heffte_fwd(FFT& fft, GReal* r, GCplx* c, std::complex<double>* ws){
     fft.forward(r, reinterpret_cast<std::complex<double>*>(c), ws, heffte::scale::none);
@@ -304,39 +285,37 @@ template<typename FFT>
 static void heffte_bwd(FFT& fft, GCplx* c, GReal* r, std::complex<double>* ws){
     fft.backward(reinterpret_cast<std::complex<double>*>(c), r, ws, heffte::scale::full);
 }
-template<typename FFT>
-static void compute_nonlinear(FFT& fft, GPUArrays& g,
-    GCplx* nl1, GCplx* nl2, GCplx* nl3, const BoxGPU& br, const BoxGPU& bc,
-    std::complex<double>* ws)   
 
 // ============================================================
 // Physics
 // ============================================================
 template<typename FFT>
 static void compute_nonlinear(FFT& fft, GPUArrays& g,
-    GCplx* nl1, GCplx* nl2, GCplx* nl3, const BoxGPU& br, const BoxGPU& bc)
+    GCplx* nl1, GCplx* nl2, GCplx* nl3, const BoxGPU& br, const BoxGPU& bc,
+    std::complex<double>* ws)
 {
     int gc=bc.grid(BLOCK), gr=br.grid(BLOCK);
     kernel_compute_rot<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         g.rot1_c,g.rot2_c,g.rot3_c,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    heffte_bwd(fft,g.V1_c,g.V1_r);
-    heffte_bwd(fft,g.V2_c,g.V2_r);
-    heffte_bwd(fft,g.V3_c,g.V3_r);
-    heffte_bwd(fft,g.rot1_c,g.rot1_r);
-    heffte_bwd(fft,g.rot2_c,g.rot2_r);
-    heffte_bwd(fft,g.rot3_c,g.rot3_r);
+    heffte_bwd(fft,g.V1_c,g.V1_r, ws);
+    heffte_bwd(fft,g.V2_c,g.V2_r, ws);
+    heffte_bwd(fft,g.V3_c,g.V3_r, ws);
+    heffte_bwd(fft,g.rot1_c,g.rot1_r, ws);
+    heffte_bwd(fft,g.rot2_c,g.rot2_r, ws);
+    heffte_bwd(fft,g.rot3_c,g.rot3_r, ws);
     kernel_cross_product<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,
         g.rot1_r,g.rot2_r,g.rot3_r,br.n());
-    heffte_fwd(fft,g.rot1_r,nl1);
-    heffte_fwd(fft,g.rot2_r,nl2);
-    heffte_fwd(fft,g.rot3_r,nl3);
+    heffte_fwd(fft,g.rot1_r,nl1, ws);
+    heffte_fwd(fft,g.rot2_r,nl2, ws);
+    heffte_fwd(fft,g.rot3_r,nl3, ws);
 }
 
 template<typename FFT>
 static void compute_rhs(FFT& fft, GPUArrays& g,
     GCplx* r1, GCplx* r2, GCplx* r3,
-    const BoxGPU& br, const BoxGPU& bc, double t)
+    const BoxGPU& br, const BoxGPU& bc, double t,
+    std::complex<double>* ws)
 {
     int gc=bc.grid(BLOCK), gr=br.grid(BLOCK);
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V1_c,g.visc1_c,
@@ -345,30 +324,18 @@ static void compute_rhs(FFT& fft, GPUArrays& g,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V3_c,g.visc3_c,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    compute_nonlinear(fft,g,r1,r2,r3,br,bc);
+    compute_nonlinear(fft,g,r1,r2,r3,br,bc, ws);
     kernel_fill_forcing<<<gr,BLOCK>>>(g.work1_r,g.work2_r,g.work3_r,
         br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
-    heffte_fwd(fft,g.work1_r,g.f1_c);
-    heffte_fwd(fft,g.work2_r,g.f2_c);
-    heffte_fwd(fft,g.work3_r,g.f3_c);
+    heffte_fwd(fft,g.work1_r,g.f1_c, ws);
+    heffte_fwd(fft,g.work2_r,g.f2_c, ws);
+    heffte_fwd(fft,g.work3_r,g.f3_c, ws);
     kernel_add_rhs<<<gc,BLOCK>>>(r1,r2,r3,
         g.visc1_c,g.visc2_c,g.visc3_c,g.f1_c,g.f2_c,g.f3_c,bc.n());
     kernel_make_div_free<<<gc,BLOCK>>>(r1,r2,r3,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
 }
 
-// FIX (Bug 2): memory-efficient RK4 — accumulate weighted sum on-the-fly.
-//
-// Algorithm (weights 1, 2, 2, 1):
-//   orig  ← V_n
-//   ksum  ← 0
-//   ktmp  ← f(V_n,           t)          ;  ksum += 1*ktmp  ;  V ← orig + 0.5*dt*ktmp
-//   ktmp  ← f(V_n+0.5*dt*k1, t+0.5*dt)  ;  ksum += 2*ktmp  ;  V ← orig + 0.5*dt*ktmp
-//   ktmp  ← f(V_n+0.5*dt*k2, t+0.5*dt)  ;  ksum += 2*ktmp  ;  V ← orig +     dt*ktmp
-//   ktmp  ← f(V_n+dt*k3,     t+dt)      ;  ksum +=   ktmp
-//   V     ← orig + (dt/6)*ksum
-//
-// Complex arrays for time-stepping: 9 instead of 15.
 template<typename FFT>
 static void rk4_step(FFT& fft, GPUArrays& g,
     const BoxGPU& br, const BoxGPU& bc, double t,
@@ -377,49 +344,44 @@ static void rk4_step(FFT& fft, GPUArrays& g,
     long long nc=bc.n();
     int gc=bc.grid(BLOCK);
 
-    // ── Save original state ────────────────────────────────────────────────
     CUDA_CHECK(cudaMemcpy(g.orig1_c,g.V1_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.orig2_c,g.V2_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.orig3_c,g.V3_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
 
-    // ── Zero the accumulator ───────────────────────────────────────────────
     CUDA_CHECK(cudaMemset(g.ksum1_c,0,nc*sizeof(GCplx)));
     CUDA_CHECK(cudaMemset(g.ksum2_c,0,nc*sizeof(GCplx)));
     CUDA_CHECK(cudaMemset(g.ksum3_c,0,nc*sizeof(GCplx)));
 
-    // ── Stage 1: k1 ────────────────────────────────────────────────────────
+    // Stage 1
     compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
-    // V ← V_n + 0.5*dt*k1
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         g.orig1_c,g.orig2_c,g.orig3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
 
-    // ── Stage 2: k2 ────────────────────────────────────────────────────────
+    // Stage 2
     compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
-    // V ← V_n + 0.5*dt*k2
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         g.orig1_c,g.orig2_c,g.orig3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
 
-    // ── Stage 3: k3 ────────────────────────────────────────────────────────
+    // Stage 3
     compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
-    // V ← V_n + dt*k3
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         g.orig1_c,g.orig2_c,g.orig3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,TAU,nc);
 
-    // ── Stage 4: k4 ────────────────────────────────────────────────────────
+    // Stage 4
     compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+TAU, ws);
     kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
         g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
 
-    // ── Final update: V_{n+1} = V_n + (dt/6)*(k1+2k2+2k3+k4) ─────────────
+    // Final update
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         g.orig1_c,g.orig2_c,g.orig3_c,
         g.ksum1_c,g.ksum2_c,g.ksum3_c,TAU/6.0,nc);
@@ -427,12 +389,13 @@ static void rk4_step(FFT& fft, GPUArrays& g,
 
 template<typename FFT>
 static pair<double,double> compute_diagnostics(FFT& fft, GPUArrays& g,
-    const BoxGPU& br, const BoxGPU& bc, double t)
+    const BoxGPU& br, const BoxGPU& bc, double t,
+    std::complex<double>* ws)
 {
     int gc=bc.grid(BLOCK), gr=br.grid(BLOCK);
-    heffte_bwd(fft,g.V1_c,g.V1_r);
-    heffte_bwd(fft,g.V2_c,g.V2_r);
-    heffte_bwd(fft,g.V3_c,g.V3_r);
+    heffte_bwd(fft,g.V1_c,g.V1_r, ws);
+    heffte_bwd(fft,g.V2_c,g.V2_r, ws);
+    heffte_bwd(fft,g.V3_c,g.V3_r, ws);
     kernel_error_sq<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.scratch,
         br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
     thrust::device_ptr<double> sp(g.scratch);
@@ -463,15 +426,11 @@ int main(int argc, char** argv) {
     TAU=atof(argv[4]); NT_RUN=atoi(argv[5]);
     LX=LY=LZ=2.0*M_PI; DX=LX/NX; DY=LY/NY; DZ=LZ/NZ;
 
-    // ── GPU assignment ─────────────────────────────────────────────────────
     int num_gpus=0;
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
     int dev = rank % num_gpus;
     CUDA_CHECK(cudaSetDevice(dev));
 
-    // FIX (Bug 1): cudaMemcpyToSymbol MUST come AFTER cudaSetDevice.
-    // Before the fix these writes went to GPU 0 for every rank; kernels on
-    // GPU 1+ then used uninitialised constant memory.
     CUDA_CHECK(cudaMemcpyToSymbol(d_NX,&NX,sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_NY,&NY,sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_DX,&DX,sizeof(double)));
@@ -496,8 +455,7 @@ int main(int argc, char** argv) {
     heffte::box3d<> world_r = {{0,0,0},{NX-1,NY-1,NZ-1}};
     heffte::box3d<> world_c = {{0,0,0},{NX-1,NY-1,NZ/2}};
 
-    // Slab decomposition along X (8x1x1 instead of 2x2x2)
-    // → 1 transpose per FFT instead of 3
+    // Slab decomposition along X (Nx1x1) — 1 transpose per FFT instead of 3
     std::array<int,3> pg = {nprocs, 1, 1};
     auto inboxes  = heffte::split_world(world_r, pg);
     auto outboxes = heffte::split_world(world_c, pg);
@@ -505,7 +463,6 @@ int main(int argc, char** argv) {
 
     if (rank==0) cout << "heFFTe slab grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
 
-    // Force GPU-aware MPI path + lighter reshape
     auto options = heffte::default_options<heffte::backend::cufft>();
     options.use_gpu_aware = true;
     options.use_reorder   = false;
@@ -516,7 +473,6 @@ int main(int argc, char** argv) {
     BoxGPU br=make_box(inbox_r), bc=make_box(outbox_c);
     long long nr=br.n(), nc=bc.n();
 
-    // Print per-rank memory estimate
     if (rank==0) {
         double mb_real = 10.0 * nr * sizeof(GReal)  / (1024.*1024.);
         double mb_cplx = 21.0 * nc * sizeof(GCplx)  / (1024.*1024.);
@@ -524,41 +480,41 @@ int main(int argc, char** argv) {
                mb_real, mb_cplx, mb_real+mb_cplx);
     }
 
-    GPUArrays g; alloc_arrays(g,nr,nc);
-    GPUArrays g; alloc_arrays(g,nr,nc);
+    GPUArrays g;
+    alloc_arrays(g,nr,nc);
 
-    // Persistent workspace for heFFTe — avoids malloc/free per FFT call
+    // Persistent workspace for heFFTe — avoids malloc/free + IPC handle open per FFT
     size_t ws_size = fft.size_workspace();
-    std::complex<double>* d_ws;
+    std::complex<double>* d_ws = nullptr;
     CUDA_CHECK(cudaMalloc(&d_ws, ws_size * sizeof(std::complex<double>)));
     if (rank==0) printf("  heFFTe workspace per rank: %.0f MB\n",
                         ws_size * sizeof(std::complex<double>) / (1024.*1024.));
 
-    // ── Initial condition ──────────────────────────────────────────────────
+    // Initial condition
     kernel_fill_velocity<<<br.grid(BLOCK),BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,
         br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],nr);
-    heffte_fwd(fft,g.V1_r,g.V1_c);
-    heffte_fwd(fft,g.V2_r,g.V2_c);
-    heffte_fwd(fft,g.V3_r,g.V3_c);
+    heffte_fwd(fft,g.V1_r,g.V1_c, d_ws);
+    heffte_fwd(fft,g.V2_r,g.V2_c, d_ws);
+    heffte_fwd(fft,g.V3_r,g.V3_c, d_ws);
     kernel_make_div_free<<<bc.grid(BLOCK),BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],nc);
 
-    // ── Time loop ──────────────────────────────────────────────────────────
+    // Time loop
     double t_wall=0.;
     for(int it=0;it<NT_RUN;++it){
         double tc=it*TAU;
         double t0=MPI_Wtime();
-        rk4_step(fft,g,br,bc,tc);
+        rk4_step(fft,g,br,bc,tc, d_ws);
         CUDA_CHECK(cudaDeviceSynchronize());
         double dt_step=MPI_Wtime()-t0, dt_max;
         MPI_Allreduce(&dt_step,&dt_max,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
         t_wall+=dt_max;
     }
 
-    // ── Final diagnostics ──────────────────────────────────────────────────
+    // Final diagnostics
     {
         double t_final=NT_RUN*TAU;
-        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final);
+        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final, d_ws);
         if(rank==0)
             cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
                  << scientific << setprecision(4) << e << "\n";
