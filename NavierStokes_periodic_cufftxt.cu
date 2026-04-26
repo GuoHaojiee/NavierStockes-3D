@@ -977,10 +977,8 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDeviceProperties(&prop, s.gpu_ids[g]));
         cout << "  GPU " << g << ": " << prop.name << endl;
     }
-    cout << "Grid: " << NX << " x " << NY << " x " << NZ << endl;
     cout << "  Real  (X-slab): nx_local=" << s.nx_local << " per GPU" << endl;
     cout << "  Spec. (Y-slab): ny_local=" << s.ny_local << " per GPU" << endl;
-    cout << "Steps: " << NT_RUN << " / " << NT_TOTAL << ", dt = " << TAU << endl;
     cout << "============================================================" << endl;
 
     // Create cuFFTXt plans
@@ -1082,9 +1080,9 @@ int main(int argc, char** argv) {
     }
 
     cout << "============================================================" << endl;
-    cout << "  Total steps: " << NT_RUN << endl;
-    cout << "  Total wall:  " << fixed << setprecision(4) << t_wall_total << " s" << endl;
-    cout << "  Avg/step:    " << t_wall_total / NT_RUN << " s" << endl;
+    cout << "  Total steps:     " << NT_RUN << endl;
+    cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s" << endl;
+    cout << "  Avg per step:    " << t_wall_total / NT_RUN << " s" << endl;
     cout << "============================================================" << endl;
 
     // Cleanup

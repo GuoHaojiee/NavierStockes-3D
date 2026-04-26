@@ -377,8 +377,6 @@ int main(int argc, char** argv) {
         cout << "  Navier-Stokes — heFFTe cuFFT Backend, Single Node Multi-GPU\n";
         cout << "============================================================\n";
         cout << "MPI ranks: " << nprocs << "  GPUs available per node: " << num_gpus << "\n";
-        cout << "Grid: " << NX << "x" << NY << "x" << NZ << "\n";
-        cout << "Steps: " << NT_RUN << "/" << NT_TOTAL << "  dt=" << TAU << "\n";
     }
     cout << "  Rank " << rank << " → GPU " << dev << " (" << prop.name << ")\n";
     MPI_Barrier(MPI_COMM_WORLD);
@@ -426,6 +424,7 @@ int main(int argc, char** argv) {
     }
     if(rank==0){
         cout<<"============================================================\n";
+        cout<<"  Total steps:     "<<NT_RUN<<"\n";
         cout<<"  Total wall time: "<<fixed<<setprecision(4)<<t_wall<<" s\n";
         cout<<"  Avg per step:    "<<t_wall/NT_RUN<<" s\n";
         cout<<"============================================================\n";
