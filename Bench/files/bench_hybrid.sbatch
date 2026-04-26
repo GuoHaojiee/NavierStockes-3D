@@ -28,14 +28,17 @@ CONTAINER=/scratch/s02230673/ns3d.sqsh
 MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
 NS_DIR=/home/user/guo/NavierStockes-3D
 
-ENV_SETUP="export LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64:\$LD_LIBRARY_PATH; \
-           export OMPI_MCA_btl='^ofi,openib'; \
-           export OMPI_MCA_pml=ob1; \
-           export OMP_NUM_THREADS=2; \
-           export OMP_PROC_BIND=spread; \
-           export OMP_PLACES=cores"
+ENV="export LD_LIBRARY_PATH=\
+/home/user/.local/nvhpc/Linux_x86_64/24.7/comm_libs/12.5/hpcx/hpcx-2.19/ompi/lib:\
+/opt/nvidia/hpc_sdk/Linux_x86_64/24.7/compilers/lib:\
+/home/user/.local/lib:\
+/usr/local/cuda-12.2/lib64:\
+\$LD_LIBRARY_PATH; \
+export OMP_NUM_THREADS=2; \
+export OMP_PROC_BIND=spread; \
+export OMP_PLACES=cores"
 
-SOLVERS=("ns_fftw:fftw" "ns_accfft:accfft" "ns_p3dfft:p3dfft" "ns_heffte_v2:heffte")
+SOLVERS=("ns_fftw_hpcx:fftw" "ns_accfft_hpcx:accfft" "ns_p3dfft_hpcx:p3dfft" "ns_heffte_v2:heffte")
 GRIDS=(128 256 512)
 NSTEPS=10; DT=1e-5; TIMEOUT=900
 
@@ -47,13 +50,11 @@ for solver_entry in "${SOLVERS[@]}"; do
         echo ""
         echo "── [$(date '+%H:%M:%S')] $name  ${grid}^3  hybrid ──"
 
-        # 64 个 srun task → 64 个容器实例 → 64 个 MPI rank
-        # 每个 rank 内 OMP_NUM_THREADS=2，共 128 核
         timeout $TIMEOUT \
             srun \
               --container-image=$CONTAINER \
               --container-mounts="$MOUNTS" \
-              bash -c "$ENV_SETUP; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 2" \
+              bash -c "$ENV; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 2" \
             > $LOG 2>&1
 
         ec=$?

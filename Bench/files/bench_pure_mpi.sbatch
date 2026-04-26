@@ -2,14 +2,9 @@
 #============================================================
 #  bench_pure_mpi.sbatch — Pure MPI: 128 进程 × 1 OMP线程
 #
-#  设计说明：
-#    完全照抄你已验证的 heFFTe 多节点 sbatch 的模式：
-#    srun + bash -c "export LD_LIBRARY_PATH=容器路径; exec 程序"
-#    这样程序用容器自己的 OpenMPI，不会碰宿主机 HPC-X
-#
-#    sbatch 里的循环每次调用一个 srun（一个测试）
-#    srun 启动 128 个容器实例 = 128 个 MPI rank
-#    MPI_Init() 通过 SLURM PMI 协调所有 rank
+#  使用重新编译的 _hpcx 版本（链接 /home/user/.local/nvhpc HPC-X）
+#  RPATH 已写入二进制，srun 启动时自动加载正确的 libmpi.so
+#  此方式与 SLURM PMIx 兼容，同时支持多节点扩展
 #
 #  提交（登录节点）：sbatch bench_pure_mpi.sbatch
 #============================================================
@@ -23,7 +18,6 @@
 #SBATCH --output=/scratch/s02230673/benchmark_results/slurm_pure_mpi_%j.log
 #SBATCH --error=/scratch/s02230673/benchmark_results/slurm_pure_mpi_err_%j.log
 
-# ── 结果目录 ────────────────────────────────────────────────
 RESULT_DIR=/scratch/s02230673/benchmark_results/job_${SLURM_JOB_ID}_pure_mpi
 mkdir -p $RESULT_DIR/logs/{fftw,accfft,p3dfft,heffte}/{128,256,512}
 CSV=$RESULT_DIR/summary_pure_mpi.csv
@@ -35,22 +29,25 @@ echo "  Job: $SLURM_JOB_ID   Node: $SLURM_NODELIST"
 echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
-# ── 容器配置 ────────────────────────────────────────────────
 CONTAINER=/scratch/s02230673/ns3d.sqsh
 MOUNTS="/usr/local/lib/slurm:/usr/local/lib/slurm:ro,/scratch/s02230673:/home/user:rw"
 NS_DIR=/home/user/guo/NavierStockes-3D
 
-# 容器内环境（与 heFFTe 多节点 sbatch 一致）
-ENV_SETUP="export LD_LIBRARY_PATH=/home/user/.local/lib:/usr/local/cuda-12.2/lib64:\$LD_LIBRARY_PATH; \
-           export OMPI_MCA_btl='^ofi,openib'; \
-           export OMPI_MCA_pml=ob1; \
-           export OMP_NUM_THREADS=1"
+# LD_LIBRARY_PATH：RPATH 已处理 libmpi，这里补充 NVHPC 编译器运行时库
+# （ldd 显示需要 /opt/nvidia/hpc_sdk/.../compilers/lib 里的 libnvomp 等）
+ENV="export LD_LIBRARY_PATH=\
+/home/user/.local/nvhpc/Linux_x86_64/24.7/comm_libs/12.5/hpcx/hpcx-2.19/ompi/lib:\
+/opt/nvidia/hpc_sdk/Linux_x86_64/24.7/compilers/lib:\
+/home/user/.local/lib:\
+/usr/local/cuda-12.2/lib64:\
+\$LD_LIBRARY_PATH; \
+export OMP_NUM_THREADS=1"
 
-SOLVERS=("ns_fftw:fftw" "ns_accfft:accfft" "ns_p3dfft:p3dfft" "ns_heffte_v2:heffte")
+# 使用重新编译的 _hpcx 版本
+SOLVERS=("ns_fftw_hpcx:fftw" "ns_accfft_hpcx:accfft" "ns_p3dfft_hpcx:p3dfft" "ns_heffte_v2:heffte")
 GRIDS=(128 256 512)
 NSTEPS=10; DT=1e-5; TIMEOUT=900
 
-# ── 主循环：每次 srun = 一个测试 ────────────────────────────
 for solver_entry in "${SOLVERS[@]}"; do
     exe="${solver_entry%%:*}"
     name="${solver_entry##*:}"
@@ -59,12 +56,13 @@ for solver_entry in "${SOLVERS[@]}"; do
         echo ""
         echo "── [$(date '+%H:%M:%S')] $name  ${grid}^3  pure_mpi ──"
 
-        # 128 个 srun task → 128 个容器实例 → 128 个 MPI rank
+        # srun 启动 128 个容器实例 = 128 个 MPI rank
+        # 二进制 RPATH 指向正确的 HPC-X，PMIx 兼容
         timeout $TIMEOUT \
             srun \
               --container-image=$CONTAINER \
               --container-mounts="$MOUNTS" \
-              bash -c "$ENV_SETUP; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 1" \
+              bash -c "$ENV; cd $NS_DIR && exec ./$exe $grid $grid $grid $DT $NSTEPS 1" \
             > $LOG 2>&1
 
         ec=$?
