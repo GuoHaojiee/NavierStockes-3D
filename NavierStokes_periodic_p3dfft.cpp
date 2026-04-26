@@ -778,8 +778,6 @@ int main(int argc, char** argv) {
 
     MPI_Barrier(MPI_COMM_WORLD);
     Cp3dfft_clean();
-    fftw_cleanup_threads();
-    fftw_cleanup();
     MPI_Finalize();
     return 0;
 }

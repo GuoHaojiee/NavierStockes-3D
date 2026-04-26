@@ -805,9 +805,9 @@ int main(int argc, char** argv) {
     accfft_free(tmp_c);
 
     accfft_destroy_plan(plan);
-    accfft_cleanup();
     MPI_Comm_free(&c_comm);
-
+    MPI_Barrier(MPI_COMM_WORLD);
+    accfft_cleanup();
     MPI_Finalize();
     return 0;
 }
