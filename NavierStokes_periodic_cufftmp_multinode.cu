@@ -390,6 +390,10 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    // FIX: Z2D 之后 V_buf/rot_buf 都是实空间 X-slab,手动标 INPLACE
+    force_d2z_format(s.V1_buf); force_d2z_format(s.V2_buf); force_d2z_format(s.V3_buf);
+    force_d2z_format(s.rot1_buf); force_d2z_format(s.rot2_buf); force_d2z_format(s.rot3_buf);
+
     kernel_cross_product<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         (double*)gpu_ptr(s.rot1_buf), (double*)gpu_ptr(s.rot2_buf), (double*)gpu_ptr(s.rot3_buf),
@@ -400,6 +404,9 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // FIX: D2Z 之后标 SHUFFLED
+    force_z2d_format(s.rot1_buf); force_z2d_format(s.rot2_buf); force_z2d_format(s.rot3_buf);
 
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot1_buf), s.rhs1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot2_buf), s.rhs2_c, nc);
@@ -431,6 +438,9 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // FIX: D2Z 之后标 SHUFFLED
+    force_z2d_format(s.work1_buf); force_z2d_format(s.work2_buf); force_z2d_format(s.work3_buf);
 
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf), s.f1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf), s.f2_c, nc);
@@ -537,9 +547,13 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    // FIX: Z2D 之后标 INPLACE (实空间)
+    force_d2z_format(s.V1_buf); force_d2z_format(s.V2_buf); force_d2z_format(s.V3_buf);
+
     kernel_error_sq<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         s.scratch, s.nx_local, s.x_offset, t);
+
     CUDA_CHECK(cudaDeviceSynchronize());
     double local_sq = thrust::reduce(thrust::device, sp, sp + nr, 0.0);
     double global_sq = 0.0;
@@ -550,6 +564,9 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // FIX: D2Z 之后标 SHUFFLED
+    force_z2d_format(s.V1_buf); force_z2d_format(s.V2_buf); force_z2d_format(s.V3_buf);
 
     kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), nc, inv_N);
@@ -650,12 +667,17 @@ int main(int argc, char** argv) {
             (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
             s.nx_local, s.x_offset, 0.0);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaDeviceSynchronize());   // ← 加回这行
 
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    // FIX: cufftMp 不会自动把 subFormat 设为 SHUFFLED，必须手动
+    force_z2d_format(s.V1_buf);
+    force_z2d_format(s.V2_buf);
+    force_z2d_format(s.V3_buf);
 
     const double inv_N = 1.0/(double)(NX*NY*NZ);
     {
