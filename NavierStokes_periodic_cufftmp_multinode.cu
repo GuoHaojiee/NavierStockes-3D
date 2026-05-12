@@ -801,10 +801,10 @@ int main(int argc, char** argv) {
     CUFFT_CHECK(cufftMakePlan3d(plan_c2r, NX, NY, NZ, CUFFT_Z2D, &ws_c2r));
 
     // Explicit subformat defaults (belt-and-braces; the macros override per-call).
-    CUFFT_CHECK(cufftXtSetSubformatDefault(plan_r2c,
-        CUFFT_XT_FORMAT_INPLACE, CUFFT_XT_FORMAT_INPLACE_SHUFFLED));
-    CUFFT_CHECK(cufftXtSetSubformatDefault(plan_c2r,
-        CUFFT_XT_FORMAT_INPLACE_SHUFFLED, CUFFT_XT_FORMAT_INPLACE));
+    // CUFFT_CHECK(cufftXtSetSubformatDefault(plan_r2c,
+    //     CUFFT_XT_FORMAT_INPLACE, CUFFT_XT_FORMAT_INPLACE_SHUFFLED));
+    // CUFFT_CHECK(cufftXtSetSubformatDefault(plan_c2r,
+    //     CUFFT_XT_FORMAT_INPLACE_SHUFFLED, CUFFT_XT_FORMAT_INPLACE));
 
     alloc_state(s, plan_r2c);
 
