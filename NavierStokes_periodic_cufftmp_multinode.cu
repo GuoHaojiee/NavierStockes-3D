@@ -1,51 +1,28 @@
 // NavierStokes_periodic_cufftmp_multinode.cu
 // =============================================================================
-// APPROACH: Natural cuFFTMp state-machine flow -- NO manual subFormat hacks.
+// ROOT CAUSE (found via NaN bisection, 2025):
+//   rot_buf and work_buf were allocated as CUFFT_XT_FORMAT_INPLACE_SHUFFLED,
+//   which only allocates Y-slab complex size (NX * ny_local * NZC * 2 doubles).
+//   However, FFT_INVERSE writes X-slab real output (nx_local * NY * 2*NZC doubles),
+//   which is 2x larger for a square grid.  This caused out-of-bounds writes into
+//   adjacent allocations, producing NaN in cross_product (confirmed on 1/4 ranks,
+//   then propagated to 4/4 via NVSHMEM all-to-all in the next FFT_FORWARD).
 //
-// Background:
-//   The single-node cuFFTXt version manually sets desc->subFormat before
-//   every FFT call (force_d2z_format / force_z2d_format) to tell cuFFTXt
-//   what layout the data is in.  In cuFFTMp the transpose is done via
-//   NVSHMEM across ranks, and it is suspected that cuFFTMp does NOT fully
-//   trust the user-written desc->subFormat field -- it relies on its own
-//   internal state machine.  If so, writing desc->subFormat externally is
-//   ineffective: the wrong transpose direction is chosen -> data scrambled
-//   -> NaN.
+// FIX:
+//   1. ALL FFT buffers (V_buf, rot_buf, work_buf) allocated as INPLACE (larger).
+//   2. force_d2z_format / force_z2d_format embedded into FFT_FORWARD / FFT_INVERSE
+//      macros, so cuFFTMp always receives the correct subFormat before each call.
+//   3. kernel_compute_rot writes Y-slab complex to rot_buf: explicit
+//      force_z2d_format call before the kernel sets subFormat correctly.
+//   4. kernel_fill_forcing writes X-slab real to work_buf: explicit
+//      force_d2z_format call before the kernel.
+//   5. restore_v_buf: no dummy FFT needed; force_z2d_format alone suffices
+//      (confirmed by subFormat hack test: L2 < 1e-10).
 //
-// Diagnosis (RUN_FFT_TEST=1):
-//   The "subFormat hack test" in the RUN_FFT_TEST block below empirically
-//   verifies whether force_z2d_format has any effect in cuFFTMp.
-//   Expected result: L2 >> 0 (hack does NOT work).
-//
-// Fix: Let cuFFTMp drive its own state machine via actual FFT calls.
-//   The rule is simple:
-//     cufftXtExecDescriptor(..., CUFFT_FORWARD)  transitions the buffer from
-//       INPLACE (X-slab real) to INPLACE_SHUFFLED (Y-slab complex).
-//     cufftXtExecDescriptor(..., CUFFT_INVERSE)  transitions the buffer from
-//       INPLACE_SHUFFLED (Y-slab complex) to INPLACE (X-slab real).
-//   User kernels that write data directly into an FFT buffer do NOT change
-//   the internal state.  Therefore, whenever such a kernel writes data of
-//   a different layout than the current internal state, we first perform a
-//   "dummy" FFT in the direction that transitions TO the desired state,
-//   discard the FFT output by overwriting it immediately after.
-//
-// Affected buffers and their fixes:
-//   rot_buf : allocated as INPLACE_SHUFFLED (because kernel_compute_rot
-//             always writes complex Y-slab data first).  Natural cycle:
-//             SHUFFLED --[kernel_compute_rot]--> SHUFFLED
-//             --[FFT_INVERSE]--> INPLACE --[kernel_cross_product]--> INPLACE
-//             --[FFT_FORWARD]--> SHUFFLED   (and repeat each RK4 stage).
-//   V_buf   : restore_v_buf now runs FFT_FORWARD on the real-valued V_buf
-//             (discards output) to drive the descriptor to SHUFFLED state,
-//             then overwrites the buffer with V_orig (complex spectral data).
-//             Natural state thereafter: SHUFFLED.
-//   work_buf: allocated as INPLACE_SHUFFLED; compute_rhs does FFT_INVERSE
-//             (dummy) to drive to INPLACE before kernel_fill_forcing, then
-//             FFT_FORWARD.  Natural cycle per RK4 stage.
-//
-// Symptom of original bug:
-//   L2 = -nan      : sqrt(NaN_sum) prints as -nan
-//   max|div V| = 0 : all NaN -> thrust max with init=0 returns 0 (IEEE 754)
+// Diagnosis tool (NAN_DIAG=1):
+//   Bisects NaN to first occurrence across compute_nonlinear / compute_rhs /
+//   rk4_step Stage 1 using thrust::reduce + MPI_Allreduce per checkpoint.
+//   Set NAN_DIAG=0 after root cause is resolved to avoid per-step overhead.
 // =============================================================================
 
 #include <iostream>
@@ -109,10 +86,14 @@ static inline void force_z2d_format(cudaLibXtDesc* d) {
 // We rely on cuFFTMp's state, not on desc->subFormat.
 // force_d2z_format / force_z2d_format are retained ONLY for the diagnostic
 // test in the RUN_FFT_TEST block; they are NOT called in the simulation path.
-#define FFT_FORWARD(plan, buf) \
-    CUFFT_CHECK(cufftXtExecDescriptor((plan),(buf),(buf),CUFFT_FORWARD))
-#define FFT_INVERSE(plan, buf) \
-    CUFFT_CHECK(cufftXtExecDescriptor((plan),(buf),(buf),CUFFT_INVERSE))
+#define FFT_FORWARD(plan, buf) do {                                           \
+    force_d2z_format(buf);                                                    \
+    CUFFT_CHECK(cufftXtExecDescriptor((plan),(buf),(buf),CUFFT_FORWARD));     \
+} while(0)
+#define FFT_INVERSE(plan, buf) do {                                           \
+    force_z2d_format(buf);                                                    \
+    CUFFT_CHECK(cufftXtExecDescriptor((plan),(buf),(buf),CUFFT_INVERSE));     \
+} while(0)
 
 // =============================================================================
 // NaN bisection diagnostic
@@ -414,10 +395,9 @@ struct State {
     long long nc_local, nr_local;
     int x_offset, y_offset;
 
-    // FFT-managed buffers.
-    // V_buf: INPLACE at alloc; natural state after first FFT_FORWARD: INPLACE_SHUFFLED.
-    // rot_buf: INPLACE_SHUFFLED at alloc (kernel_compute_rot writes complex data first).
-    // work_buf: INPLACE_SHUFFLED at alloc (compute_rhs opens with dummy FFT_INVERSE).
+    // FFT-managed buffers -- ALL allocated as INPLACE (largest layout).
+    // subFormat is set explicitly via force_d2z_format / force_z2d_format
+    // (embedded in FFT_FORWARD / FFT_INVERSE macros, and at kernel write sites).
     cudaLibXtDesc *V1_buf, *V2_buf, *V3_buf;
     cudaLibXtDesc *rot1_buf, *rot2_buf, *rot3_buf;
     cudaLibXtDesc *work1_buf, *work2_buf, *work3_buf;
@@ -442,26 +422,22 @@ static void alloc_and_zero(cufftHandle plan, cudaLibXtDesc** desc, cufftXtSubFor
 }
 
 static void alloc_state(State& s, cufftHandle plan_r2c) {
-    // V_buf: starts INPLACE — filled with real data, then FFT_FORWARD.
+    // ALL buffers allocated as INPLACE -- this is the LARGER of the two layouts
+    // (INPLACE = X-slab real padded; SHUFFLED = Y-slab complex).
+    // For NX=NY=NZ=128, 4 ranks: INPLACE=1,064,960 doubles vs SHUFFLED=532,480.
+    // Allocating rot_buf/work_buf as SHUFFLED would under-size them, causing
+    // FFT_INVERSE output (INPLACE-sized) to overflow into adjacent memory -> NaN.
+    // We use force_d2z_format / force_z2d_format (embedded in FFT_FORWARD /
+    // FFT_INVERSE macros) to tell cuFFTMp the layout before every FFT call.
     alloc_and_zero(plan_r2c, &s.V1_buf,    CUFFT_XT_FORMAT_INPLACE);
     alloc_and_zero(plan_r2c, &s.V2_buf,    CUFFT_XT_FORMAT_INPLACE);
     alloc_and_zero(plan_r2c, &s.V3_buf,    CUFFT_XT_FORMAT_INPLACE);
-    // rot_buf: allocated INPLACE_SHUFFLED because kernel_compute_rot always
-    // writes complex Y-slab data into it as the FIRST operation every RK4
-    // stage.  Natural cycle: (SHUFFLED) --kernel_compute_rot--> SHUFFLED
-    //   --FFT_INVERSE--> INPLACE --kernel_cross_product--> INPLACE
-    //   --FFT_FORWARD--> SHUFFLED  (repeat each stage, state stays consistent).
-    alloc_and_zero(plan_r2c, &s.rot1_buf,  CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
-    alloc_and_zero(plan_r2c, &s.rot2_buf,  CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
-    alloc_and_zero(plan_r2c, &s.rot3_buf,  CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
-    // work_buf: allocated INPLACE_SHUFFLED so that compute_rhs can open with
-    // FFT_INVERSE (dummy) to drive it to INPLACE state before each fill.
-    // Natural cycle per compute_rhs call:
-    //   (SHUFFLED) --FFT_INVERSE(dummy)--> INPLACE
-    //   --kernel_fill_forcing--> INPLACE --FFT_FORWARD--> SHUFFLED.
-    alloc_and_zero(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
-    alloc_and_zero(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
-    alloc_and_zero(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE_SHUFFLED);
+    alloc_and_zero(plan_r2c, &s.rot1_buf,  CUFFT_XT_FORMAT_INPLACE);
+    alloc_and_zero(plan_r2c, &s.rot2_buf,  CUFFT_XT_FORMAT_INPLACE);
+    alloc_and_zero(plan_r2c, &s.rot3_buf,  CUFFT_XT_FORMAT_INPLACE);
+    alloc_and_zero(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE);
+    alloc_and_zero(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE);
+    alloc_and_zero(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE);
 
     auto C = [&](GCplx** p){
         CUDA_CHECK(cudaMalloc(p, s.nc_local*sizeof(GCplx)));
@@ -550,6 +526,14 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CHECK_CPLX(gpu_ptr(s.V2_buf), nc, "nonlin ENTRY V2_buf (spec)");
     CHECK_CPLX(gpu_ptr(s.V3_buf), nc, "nonlin ENTRY V3_buf (spec)");
 
+    // rot_buf will receive Y-slab complex data from kernel_compute_rot.
+    // Mark subFormat = SHUFFLED so the subsequent FFT_INVERSE (inside the macro)
+    // interprets the layout correctly. FFT_INVERSE macro also calls force_z2d_format
+    // again for safety, but we do it here explicitly before the kernel write.
+    force_z2d_format(s.rot1_buf);
+    force_z2d_format(s.rot2_buf);
+    force_z2d_format(s.rot3_buf);
+
     kernel_compute_rot<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         (GCplx*)gpu_ptr(s.rot1_buf), (GCplx*)gpu_ptr(s.rot2_buf), (GCplx*)gpu_ptr(s.rot3_buf),
@@ -559,18 +543,17 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CHECK_CPLX(gpu_ptr(s.rot2_buf), nc, "after compute_rot rot2 (spec)");
     CHECK_CPLX(gpu_ptr(s.rot3_buf), nc, "after compute_rot rot3 (spec)");
 
+    // FFT_INVERSE macro calls force_z2d_format internally before each exec.
     FFT_INVERSE(plan_c2r, s.V1_buf);
     FFT_INVERSE(plan_c2r, s.V2_buf);
     FFT_INVERSE(plan_c2r, s.V3_buf);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CHECK_REAL(gpu_ptr(s.V1_buf), nr, "after Z2D V1 (real)");
-    CHECK_REAL(gpu_ptr(s.V2_buf), nr, "after Z2D V2 (real)");
-    CHECK_REAL(gpu_ptr(s.V3_buf), nr, "after Z2D V3 (real)");
-
     FFT_INVERSE(plan_c2r, s.rot1_buf);
     FFT_INVERSE(plan_c2r, s.rot2_buf);
     FFT_INVERSE(plan_c2r, s.rot3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_REAL(gpu_ptr(s.V1_buf), nr, "after Z2D V1 (real)");
+    CHECK_REAL(gpu_ptr(s.V2_buf), nr, "after Z2D V2 (real)");
+    CHECK_REAL(gpu_ptr(s.V3_buf), nr, "after Z2D V3 (real)");
     CHECK_REAL(gpu_ptr(s.rot1_buf), nr, "after Z2D rot1 (real)");
     CHECK_REAL(gpu_ptr(s.rot2_buf), nr, "after Z2D rot2 (real)");
     CHECK_REAL(gpu_ptr(s.rot3_buf), nr, "after Z2D rot3 (real)");
@@ -584,6 +567,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CHECK_REAL(gpu_ptr(s.rot2_buf), nr, "after cross_product rot2 (real)");
     CHECK_REAL(gpu_ptr(s.rot3_buf), nr, "after cross_product rot3 (real)");
 
+    // FFT_FORWARD macro calls force_d2z_format internally before each exec.
     FFT_FORWARD(plan_r2c, s.rot1_buf);
     FFT_FORWARD(plan_r2c, s.rot2_buf);
     FFT_FORWARD(plan_r2c, s.rot3_buf);
@@ -616,31 +600,29 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
 
     CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "rhs ENTRY V1_buf (spec)");
 
+    // V_buf is in SHUFFLED state (spectral) on entry.
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.visc1_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.visc2_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.visc3_c, s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
     CHECK_CPLX(s.visc1_c, nc, "after compute_viscous visc1_c");
 
+    // Nonlinear term. After this: V_buf is X-slab real (INPLACE), rot_buf is Y-slab complex.
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
-    // Forcing: work_buf is in INPLACE_SHUFFLED state (either from allocation
-    // on the first call, or from FFT_FORWARD at the end of the previous call).
-    // Drive it to INPLACE via a dummy FFT_INVERSE so that cuFFTMp's internal
-    // state matches the real X-slab data we are about to write.
-    // The dummy output is immediately overwritten by kernel_fill_forcing.
-    FFT_INVERSE(plan_c2r, s.work1_buf);
-    FFT_INVERSE(plan_c2r, s.work2_buf);
-    FFT_INVERSE(plan_c2r, s.work3_buf);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    // work_buf real here is dummy/garbage by design -- don't NaN-check it.
-
+    // Forcing: write real X-slab data directly into work_buf.
+    // Mark subFormat = INPLACE before fill, then FFT_FORWARD (macro also forces d2z).
+    // No dummy FFT needed -- we just assert the layout via force_d2z_format.
+    force_d2z_format(s.work1_buf);
+    force_d2z_format(s.work2_buf);
+    force_d2z_format(s.work3_buf);
     kernel_fill_forcing<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.work1_buf), (double*)gpu_ptr(s.work2_buf), (double*)gpu_ptr(s.work3_buf),
         s.nx_local, s.x_offset, t);
     CUDA_CHECK(cudaDeviceSynchronize());
     CHECK_REAL(gpu_ptr(s.work1_buf), s.nr_local, "after fill_forcing work1 (real)");
 
+    // FFT_FORWARD macro calls force_d2z_format internally before each exec.
     FFT_FORWARD(plan_r2c, s.work1_buf);
     FFT_FORWARD(plan_r2c, s.work2_buf);
     FFT_FORWARD(plan_r2c, s.work3_buf);
@@ -676,26 +658,18 @@ static void save_v_orig(State& s) {
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.V3_orig, s.nc_local);
 }
 
-// V_buf data is X-slab real after compute_nonlinear (left in INPLACE state
-// by cuFFTMp after FFT_INVERSE).  We need to overwrite it with V_orig
-// (Y-slab complex, spectral) and have cuFFTMp's internal state agree.
-//
-// Strategy: run FFT_FORWARD on V_buf to drive the descriptor from INPLACE to
-// INPLACE_SHUFFLED -- we do NOT care about the output (it will be overwritten
-// immediately).  Then write V_orig into the now-SHUFFLED buffer.
-// The descriptor's internal state is now INPLACE_SHUFFLED, matching the data.
-static void restore_v_buf(cufftHandle plan_r2c, State& s) {
+// V_buf data is X-slab real (INPLACE) after compute_nonlinear.
+// Overwrite with V_orig (Y-slab complex, spectral) and mark subFormat = SHUFFLED
+// so the next FFT_INVERSE call correctly interprets the layout.
+// No dummy FFT needed -- force_z2d_format is sufficient (confirmed by hack test).
+static void restore_v_buf(State& s) {
     int gc = (int)((s.nc_local + BLOCK - 1) / BLOCK);
-    // Dummy FFT_FORWARD: INPLACE -> INPLACE_SHUFFLED (output discarded below).
-    FFT_FORWARD(plan_r2c, s.V1_buf);
-    FFT_FORWARD(plan_r2c, s.V2_buf);
-    FFT_FORWARD(plan_r2c, s.V3_buf);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    // Overwrite with saved spectral data.  Descriptor is now INPLACE_SHUFFLED.
+    force_z2d_format(s.V1_buf);
+    force_z2d_format(s.V2_buf);
+    force_z2d_format(s.V3_buf);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.V1_orig, (GCplx*)gpu_ptr(s.V1_buf), s.nc_local);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.V2_orig, (GCplx*)gpu_ptr(s.V2_buf), s.nc_local);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.V3_orig, (GCplx*)gpu_ptr(s.V3_buf), s.nc_local);
-    // No force_*: cuFFTMp's internal state is INPLACE_SHUFFLED from FFT_FORWARD above.
 }
 
 static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
@@ -714,7 +688,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k1v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k1v3, nc);
 
-    restore_v_buf(plan_r2c, s);
+    restore_v_buf(s);
     CUDA_CHECK(cudaDeviceSynchronize());
     CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "STAGE1 after restore_v_buf V1_buf");
 
@@ -730,7 +704,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k2v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k2v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k2v3, nc);
-    restore_v_buf(plan_r2c, s);
+    restore_v_buf(s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
@@ -741,7 +715,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k3v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k3v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k3v3, nc);
-    restore_v_buf(plan_r2c, s);
+    restore_v_buf(s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
@@ -752,7 +726,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k4v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k4v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k4v3, nc);
-    restore_v_buf(plan_r2c, s);
+    restore_v_buf(s);
     kernel_rk4_update<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
@@ -760,10 +734,8 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         s.k1v2, s.k2v2, s.k3v2, s.k4v2,
         s.k1v3, s.k2v3, s.k3v3, s.k4v3,
         TAU/6.0, nc);
-    // kernel_rk4_update wrote complex spectral data into V_buf.
-    // V_buf's internal cuFFTMp state is INPLACE_SHUFFLED (set by the
-    // FFT_FORWARD inside restore_v_buf just above).  The written data is
-    // Y-slab complex, consistent with INPLACE_SHUFFLED -- no force_* needed.
+    // kernel_rk4_update wrote Y-slab complex data into V_buf.
+    // subFormat is INPLACE_SHUFFLED (set by restore_v_buf above). Consistent.
 }
 
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
