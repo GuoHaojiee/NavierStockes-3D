@@ -1036,9 +1036,9 @@ int main(int argc, char** argv) {
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.nc_local, inv_N);
-        kernel_make_div_free<<<gc, BLOCK>>>(
-            (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-            s.ny_local, s.y_offset);
+        // kernel_make_div_free<<<gc, BLOCK>>>(
+        //     (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
+        //     s.ny_local, s.y_offset);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     // V_buf is now Y-slab complex (spectral).
