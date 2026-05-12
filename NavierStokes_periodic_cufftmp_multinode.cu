@@ -18,6 +18,11 @@
 //      force_d2z_format call before the kernel.
 //   5. restore_v_buf: no dummy FFT needed; force_z2d_format alone suffices
 //      (confirmed by subFormat hack test: L2 < 1e-10).
+//   6. warmup_buffers: each FFT buffer is driven through one FORWARD+INVERSE
+//      cycle on zero data after alloc_state, before IC.  This forces cuFFTMp
+//      to initialize per-buffer transpose metadata (NVSHMEM symmetric heap,
+//      peer mappings) so that subsequent hacked-subFormat FFT calls on
+//      rot/work buffers work correctly rather than producing silent garbage.
 //
 // Diagnosis tool (NAN_DIAG=1):
 //   Bisects NaN to first occurrence across compute_nonlinear / compute_rhs /
@@ -468,6 +473,33 @@ static void free_state(State& s) {
     cudaFree(s.k1v3); cudaFree(s.k2v3); cudaFree(s.k3v3); cudaFree(s.k4v3);
     cudaFree(s.V1_orig); cudaFree(s.V2_orig); cudaFree(s.V3_orig);
     cudaFree(s.scratch);
+}
+
+// =============================================================================
+// Warm-up: drive each FFT buffer through one full FORWARD+INVERSE cycle on
+// zero data.  This forces cuFFTMp to lazy-initialize its per-buffer internal
+// state (transpose plans, NVSHMEM symmetric heap allocations, etc.) under the
+// natural state flow.
+//
+// Without this, rot1/2/3_buf and work1/2/3_buf are VIRGIN (alloc'd as INPLACE,
+// never FFT'd) when compute_nonlinear's first FFT_INVERSE runs with a hacked
+// subFormat.  cuFFTMp's transpose metadata is set up for the alloc format
+// (INPLACE), so a hacked SHUFFLED inverse on a virgin buffer produces garbage
+// silently.  One warm-up round-trip forces the metadata to be established
+// consistently before any simulation FFT call.
+// =============================================================================
+static void warmup_buffers(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s) {
+    auto warm = [&](cudaLibXtDesc* buf) {
+        CUDA_CHECK(cudaMemset(gpu_ptr(buf), 0, gpu_size_bytes(buf)));
+        FFT_FORWARD(plan_r2c, buf);   // INPLACE (zeros) -> SHUFFLED (zeros)
+        FFT_INVERSE(plan_c2r, buf);   // SHUFFLED (zeros) -> INPLACE (zeros)
+        CUDA_CHECK(cudaMemset(gpu_ptr(buf), 0, gpu_size_bytes(buf)));
+    };
+    warm(s.V1_buf);    warm(s.V2_buf);    warm(s.V3_buf);
+    warm(s.rot1_buf);  warm(s.rot2_buf);  warm(s.rot3_buf);
+    warm(s.work1_buf); warm(s.work2_buf); warm(s.work3_buf);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (s.rank == 0) printf("FFT buffers warmed up.\n");
 }
 
 // =============================================================================
@@ -973,6 +1005,13 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+
+    // Warm up all FFT buffers: one zero-data FORWARD+INVERSE cycle per buffer.
+    // Forces cuFFTMp to initialize per-buffer transpose metadata (NVSHMEM heap,
+    // peer mappings, etc.) before any simulation FFT call that relies on a
+    // hacked subFormat.  Without this, virgin rot/work buffers produce silent
+    // garbage on the first hacked FFT_INVERSE.
+    warmup_buffers(plan_r2c, plan_c2r, s);
 
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
     {
