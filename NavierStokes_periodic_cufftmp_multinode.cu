@@ -115,6 +115,35 @@ static inline void force_z2d_format(cudaLibXtDesc* d) {
     CUFFT_CHECK(cufftXtExecDescriptor((plan),(buf),(buf),CUFFT_INVERSE))
 
 // =============================================================================
+// NaN bisection diagnostic
+// Set NAN_DIAG=1 and run with NT_RUN=1 to find first occurrence of NaN/Inf.
+// Set NAN_DIAG=0 after root cause is found.
+// =============================================================================
+#define NAN_DIAG 1
+
+#if NAN_DIAG
+// Returns true if buffer contains NaN/Inf on ANY rank.
+// n_doubles = total double-precision elements to scan (complex => 2*nc; real => nr or n_padded).
+static bool has_nan(const void* buf, long long n_doubles, const char* label, int rank, int nprocs) {
+    thrust::device_ptr<const double> dp((const double*)buf);
+    double local_sum = thrust::reduce(thrust::device, dp, dp + n_doubles, 0.0);
+    int local_bad = (std::isnan(local_sum) || std::isinf(local_sum)) ? 1 : 0;
+    int global_bad = 0;
+    MPI_Allreduce(&local_bad, &global_bad, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (global_bad > 0 && rank == 0)
+        printf("  *** NaN/Inf in: %-50s (bad on %d/%d ranks, local sum=%g)\n",
+               label, global_bad, nprocs, local_sum);
+    fflush(stdout);
+    return global_bad > 0;
+}
+#define CHECK_CPLX(buf, n, label)  has_nan((const void*)(buf), 2LL*(long long)(n), label, s.rank, s.nprocs)
+#define CHECK_REAL(buf, n, label)  has_nan((const void*)(buf),   (long long)(n),   label, s.rank, s.nprocs)
+#else
+#define CHECK_CPLX(...) ((void)0)
+#define CHECK_REAL(...) ((void)0)
+#endif
+
+// =============================================================================
 // Manufactured-solution functions (unchanged)
 // =============================================================================
 __host__ __device__ double func_V1(double x,double y,double z,double t){return (t*t+1.)*exp(sin(3.*x+3.*y))*cos(6.*z);}
@@ -517,43 +546,51 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
 
-    // Compute spectral curl: write Y-slab complex data DIRECTLY into rot_buf.
-    // rot_buf internal state is already INPLACE_SHUFFLED (either from
-    // allocation on the first stage, or from the FFT_FORWARD at the end of
-    // the previous stage).  No force_* needed.
+    CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "nonlin ENTRY V1_buf (spec)");
+    CHECK_CPLX(gpu_ptr(s.V2_buf), nc, "nonlin ENTRY V2_buf (spec)");
+    CHECK_CPLX(gpu_ptr(s.V3_buf), nc, "nonlin ENTRY V3_buf (spec)");
+
     kernel_compute_rot<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         (GCplx*)gpu_ptr(s.rot1_buf), (GCplx*)gpu_ptr(s.rot2_buf), (GCplx*)gpu_ptr(s.rot3_buf),
         s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(gpu_ptr(s.rot1_buf), nc, "after compute_rot rot1 (spec)");
+    CHECK_CPLX(gpu_ptr(s.rot2_buf), nc, "after compute_rot rot2 (spec)");
+    CHECK_CPLX(gpu_ptr(s.rot3_buf), nc, "after compute_rot rot3 (spec)");
 
-    // Inverse-FFT V and rot to real space.
-    // V_buf state: INPLACE_SHUFFLED (spectral, from either initial conditions
-    //   or the previous restore_v_buf).
-    // rot_buf state: INPLACE_SHUFFLED (spectral, written by kernel_compute_rot
-    //   above; state matches because rot_buf cycles naturally through SHUFFLED).
     FFT_INVERSE(plan_c2r, s.V1_buf);
     FFT_INVERSE(plan_c2r, s.V2_buf);
     FFT_INVERSE(plan_c2r, s.V3_buf);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_REAL(gpu_ptr(s.V1_buf), nr, "after Z2D V1 (real)");
+    CHECK_REAL(gpu_ptr(s.V2_buf), nr, "after Z2D V2 (real)");
+    CHECK_REAL(gpu_ptr(s.V3_buf), nr, "after Z2D V3 (real)");
+
     FFT_INVERSE(plan_c2r, s.rot1_buf);
     FFT_INVERSE(plan_c2r, s.rot2_buf);
     FFT_INVERSE(plan_c2r, s.rot3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_REAL(gpu_ptr(s.rot1_buf), nr, "after Z2D rot1 (real)");
+    CHECK_REAL(gpu_ptr(s.rot2_buf), nr, "after Z2D rot2 (real)");
+    CHECK_REAL(gpu_ptr(s.rot3_buf), nr, "after Z2D rot3 (real)");
 
-    // Real-space cross product (V x rot). Result written into rot_buf as
-    // X-slab real -- matches what FFT_FORWARD will expect (INPLACE).
     kernel_cross_product<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         (double*)gpu_ptr(s.rot1_buf), (double*)gpu_ptr(s.rot2_buf), (double*)gpu_ptr(s.rot3_buf),
         s.nx_local);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_REAL(gpu_ptr(s.rot1_buf), nr, "after cross_product rot1 (real)");
+    CHECK_REAL(gpu_ptr(s.rot2_buf), nr, "after cross_product rot2 (real)");
+    CHECK_REAL(gpu_ptr(s.rot3_buf), nr, "after cross_product rot3 (real)");
 
-    // Forward-FFT rot back to spectral. V_buf is intentionally LEFT in real
-    // X-slab state -- restore_v_buf will overwrite it with V_orig (spectral).
     FFT_FORWARD(plan_r2c, s.rot1_buf);
     FFT_FORWARD(plan_r2c, s.rot2_buf);
     FFT_FORWARD(plan_r2c, s.rot3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(gpu_ptr(s.rot1_buf), nc, "after D2Z rot1 (spec)");
+    CHECK_CPLX(gpu_ptr(s.rot2_buf), nc, "after D2Z rot2 (spec)");
+    CHECK_CPLX(gpu_ptr(s.rot3_buf), nc, "after D2Z rot3 (spec)");
 
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot1_buf), s.rhs1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot2_buf), s.rhs2_c, nc);
@@ -561,6 +598,10 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs1_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs2_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs3_c, nc, inv_N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.rhs1_c, nc, "nonlin EXIT rhs1_c (V\xd7rot only)");
+    CHECK_CPLX(s.rhs2_c, nc, "nonlin EXIT rhs2_c (V\xd7rot only)");
+    CHECK_CPLX(s.rhs3_c, nc, "nonlin EXIT rhs3_c (V\xd7rot only)");
 }
 
 // ENTRY: V_buf data is Y-slab complex (spectral, from initial conditions or
@@ -573,13 +614,14 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
 
-    // Viscous: V is currently Y-slab complex (spectral).
+    CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "rhs ENTRY V1_buf (spec)");
+
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.visc1_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.visc2_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.visc3_c, s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.visc1_c, nc, "after compute_viscous visc1_c");
 
-    // Nonlinear term. After this: V_buf is X-slab real, rot_buf is Y-slab complex.
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
     // Forcing: work_buf is in INPLACE_SHUFFLED state (either from allocation
@@ -591,15 +633,19 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     FFT_INVERSE(plan_c2r, s.work2_buf);
     FFT_INVERSE(plan_c2r, s.work3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
-    // work_buf is now INPLACE.  Fill real X-slab forcing values.
+    // work_buf real here is dummy/garbage by design -- don't NaN-check it.
+
     kernel_fill_forcing<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.work1_buf), (double*)gpu_ptr(s.work2_buf), (double*)gpu_ptr(s.work3_buf),
         s.nx_local, s.x_offset, t);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_REAL(gpu_ptr(s.work1_buf), s.nr_local, "after fill_forcing work1 (real)");
+
     FFT_FORWARD(plan_r2c, s.work1_buf);
     FFT_FORWARD(plan_r2c, s.work2_buf);
     FFT_FORWARD(plan_r2c, s.work3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(gpu_ptr(s.work1_buf), nc, "after D2Z work1 (spec)");
 
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf), s.f1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf), s.f2_c, nc);
@@ -608,14 +654,19 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     kernel_scale_cplx<<<gc, BLOCK>>>(s.f2_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.f3_c, nc, inv_N);
     CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.f1_c, nc, "after scale f1_c");
 
     kernel_add_to_rhs<<<gc, BLOCK>>>(
         s.rhs1_c, s.rhs2_c, s.rhs3_c,
         s.visc1_c, s.visc2_c, s.visc3_c,
         s.f1_c, s.f2_c, s.f3_c, nc);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.rhs1_c, nc, "after add_to_rhs rhs1_c");
 
     kernel_make_div_free<<<gc, BLOCK>>>(
         s.rhs1_c, s.rhs2_c, s.rhs3_c, s.ny_local, s.y_offset);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.rhs1_c, nc, "rhs EXIT rhs1_c (final)");
 }
 
 static void save_v_orig(State& s) {
@@ -652,45 +703,55 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
 
     save_v_orig(s);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(s.V1_orig, nc, "after save_v_orig V1_orig");
+    CHECK_CPLX(s.V2_orig, nc, "after save_v_orig V2_orig");
+    CHECK_CPLX(s.V3_orig, nc, "after save_v_orig V3_orig");
 
+    // --- STAGE 1 ---
     compute_rhs(plan_r2c, plan_c2r, s, t);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k1v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k1v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k1v3, nc);
 
     restore_v_buf(plan_r2c, s);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "STAGE1 after restore_v_buf V1_buf");
+
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k1v1, s.k1v2, s.k1v3, 0.5*TAU, nc);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CHECK_CPLX(gpu_ptr(s.V1_buf), nc, "STAGE1 after rk4_axpy V1_buf=Vo+0.5*tau*k1");
 
+    // --- STAGE 2 --- (no NAN_DIAG checks here -- if Stage 1 was clean, this part is structurally identical)
     compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k2v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k2v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k2v3, nc);
-
     restore_v_buf(plan_r2c, s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k2v1, s.k2v2, s.k2v3, 0.5*TAU, nc);
 
+    // --- STAGE 3 ---
     compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k3v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k3v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k3v3, nc);
-
     restore_v_buf(plan_r2c, s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k3v1, s.k3v2, s.k3v3, TAU, nc);
 
+    // --- STAGE 4 ---
     compute_rhs(plan_r2c, plan_c2r, s, t + TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k4v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k4v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k4v3, nc);
-
     restore_v_buf(plan_r2c, s);
     kernel_rk4_update<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
