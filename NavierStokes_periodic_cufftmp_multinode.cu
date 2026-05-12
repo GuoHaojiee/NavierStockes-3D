@@ -811,6 +811,104 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
 }
 
 // =============================================================================
+// LAYOUT PROBE
+// Inject V1 = cos(KX0 * x) into the real buffer, forward-FFT, then scan the
+// complex Y-slab buffer to find which linear indices hold the non-zero modes.
+// This directly reveals the actual INPLACE_SHUFFLED storage order at runtime.
+// =============================================================================
+__global__ void kernel_probe_fill_cosX(double* V, int nx_local, int x_offset, int KX0) {
+    long long n_padded = (long long)nx_local * d_NY * (2 * d_NZC);
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_padded) return;
+    int k_padded = (int)(idx % (2 * d_NZC));
+    int j        = (int)((idx / (2 * d_NZC)) % d_NY);
+    int lx       = (int)(idx / ((long long)d_NY * (2 * d_NZC)));
+    int gi = x_offset + lx;
+    (void)j;
+    if (k_padded >= d_NZ) { V[idx] = 0.0; return; }
+    V[idx] = cos(2.0 * M_PI * (double)KX0 * (double)gi / (double)d_NX);
+}
+
+static void probe_layout(cufftHandle plan_r2c, State& s, int KX0, const char* tag) {
+    const long long n_padded = (long long)s.nx_local * NY * (2 * NZC);
+    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    int gp = (int)((n_padded   + BLOCK - 1) / BLOCK);
+    int gc = (int)((s.nc_local + BLOCK - 1) / BLOCK);
+
+    CUDA_CHECK(cudaMemset(gpu_ptr(s.V1_buf), 0, gpu_size_bytes(s.V1_buf)));
+    kernel_probe_fill_cosX<<<gp, BLOCK>>>(
+        (double*)gpu_ptr(s.V1_buf), s.nx_local, s.x_offset, KX0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    FFT_FORWARD(plan_r2c, s.V1_buf);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    kernel_scale_cplx<<<gc, BLOCK>>>(
+        (GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<GCplx> host(s.nc_local);
+    CUDA_CHECK(cudaMemcpy(host.data(), gpu_ptr(s.V1_buf),
+                          s.nc_local * sizeof(GCplx), cudaMemcpyDeviceToHost));
+
+    if (s.rank == 0) {
+        printf("\n=== %s: V = cos(%d * x) ===\n", tag, KX0);
+        printf("Expected non-zero modes: (kx,ky,kz)=(%d,0,0) and (%d,0,0), amplitude~0.5\n",
+               KX0, NX - KX0);
+        printf("NX=%d NY=%d NZC=%d ny_local(rank0)=%d\n", NX, NY, NZC, s.ny_local);
+        // Predicted idx for both candidate layouts (ky=0 => local_y=0 on the rank holding y_offset=0)
+        // Layout A: buf[gx][local_y][kz]
+        long long predA_pos = (long long)KX0        * s.ny_local * NZC;
+        long long predA_neg = (long long)(NX - KX0) * s.ny_local * NZC;
+        // Layout B: buf[local_y][gx][kz]
+        long long predB_pos = (long long)KX0        * NZC;
+        long long predB_neg = (long long)(NX - KX0) * NZC;
+        printf("Layout-A predicted idx (rank with ky=0): %lld and %lld\n", predA_pos, predA_neg);
+        printf("Layout-B predicted idx (rank with ky=0): %lld and %lld\n", predB_pos, predB_neg);
+        fflush(stdout);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (int r = 0; r < s.nprocs; ++r) {
+        if (r == s.rank) {
+            printf("--- rank %d  y_offset=%d  ny_local=%d ---\n",
+                   s.rank, s.y_offset, s.ny_local);
+            int found = 0;
+            for (long long idx = 0; idx < s.nc_local; ++idx) {
+                double mag = sqrt(host[idx].x * host[idx].x +
+                                  host[idx].y * host[idx].y);
+                if (mag > 0.05) {
+                    // Layout A: [gx][local_y][kz]
+                    long long A_gx = idx / ((long long)s.ny_local * NZC);
+                    long long A_ly = (idx / NZC) % s.ny_local;
+                    long long A_kz = idx % NZC;
+                    // Layout B: [local_y][gx][kz]
+                    long long B_ly = idx / ((long long)NX * NZC);
+                    long long B_gx = (idx / NZC) % NX;
+                    long long B_kz = idx % NZC;
+                    printf("  idx=%lld  V=(%+.6f, %+.6f)  |V|=%.6f\n"
+                           "    Layout-A: gx=%lld  local_y=%lld  kz=%lld  -> gy=%lld\n"
+                           "    Layout-B: local_y=%lld  gx=%lld  kz=%lld  -> gy=%lld\n",
+                           idx,
+                           host[idx].x, host[idx].y, mag,
+                           A_gx, A_ly, A_kz, (long long)s.y_offset + A_ly,
+                           B_ly, B_gx, B_kz, (long long)s.y_offset + B_ly);
+                    ++found;
+                    if (found >= 8) { printf("  ... (truncated)\n"); break; }
+                }
+            }
+            if (found == 0)
+                printf("  (no entries with |V| > 0.05 on this rank)\n");
+            fflush(stdout);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    CUDA_CHECK(cudaMemset(gpu_ptr(s.V1_buf), 0, gpu_size_bytes(s.V1_buf)));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 int main(int argc, char** argv) {
@@ -1013,6 +1111,21 @@ int main(int argc, char** argv) {
     // garbage on the first hacked FFT_INVERSE.
     warmup_buffers(plan_r2c, plan_c2r, s);
 
+    // =========================================================================
+    // LAYOUT PROBE: run BEFORE IC to identify actual INPLACE_SHUFFLED layout.
+    // Injects cos(2*x), FFTs, and prints which linear idx holds the non-zero
+    // spectral modes.  Compare actual idx against Layout-A / Layout-B predictions
+    // printed above to determine the true storage order.
+    // Remove or #if 0 this block after layout is confirmed.
+    // =========================================================================
+    if (s.rank == 0) cout << "\n--- Layout probe (remove after layout confirmed) ---\n" << flush;
+    probe_layout(plan_r2c, s, 2, "PROBE-X(KX0=2)");
+    // After warmup, V1_buf is zeroed+clean.  Drive it back to INPLACE state
+    // (warmup already left it that way, but be explicit after probe_layout).
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (s.rank == 0) cout << "--- Layout probe done ---\n\n" << flush;
+    // =========================================================================
+
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
     {
         int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
@@ -1036,9 +1149,9 @@ int main(int argc, char** argv) {
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.nc_local, inv_N);
-        kernel_make_div_free<<<gc, BLOCK>>>(
-            (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-            s.ny_local, s.y_offset);
+        // kernel_make_div_free<<<gc, BLOCK>>>(
+        //     (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
+        //     s.ny_local, s.y_offset);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     // V_buf is now Y-slab complex (spectral).
