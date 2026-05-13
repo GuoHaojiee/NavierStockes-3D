@@ -105,7 +105,7 @@ static inline void force_z2d_format(cudaLibXtDesc* d) {
 // Set NAN_DIAG=1 and run with NT_RUN=1 to find first occurrence of NaN/Inf.
 // Set NAN_DIAG=0 after root cause is found.
 // =============================================================================
-#define NAN_DIAG 1
+#define NAN_DIAG 0
 
 #if NAN_DIAG
 // Returns true if buffer contains NaN/Inf on ANY rank.
