@@ -274,9 +274,11 @@ __global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx
     long long nc_local = (long long)d_NX * ny_local * d_NZC;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
+    // Layout-A (confirmed by probe): [gx][local_y][kz]
+    // idx = gx * ny_local * NZC + local_y * NZC + kz
     int kz      = (int)(idx % d_NZC);
-    int gx      = (int)((idx / d_NZC) % d_NX);
-    int local_y = (int)(idx / ((long long)d_NX * d_NZC));
+    int local_y = (int)((idx / d_NZC) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
     int gy = y_offset + local_y;
     double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
     double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
@@ -294,9 +296,10 @@ __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
     long long nc_local = (long long)d_NX * ny_local * d_NZC;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
+    // Layout-A (confirmed by probe): [gx][local_y][kz]
     int kz      = (int)(idx % d_NZC);
-    int gx      = (int)((idx / d_NZC) % d_NX);
-    int local_y = (int)(idx / ((long long)d_NX * d_NZC));
+    int local_y = (int)((idx / d_NZC) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
     int gy = y_offset + local_y;
     double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
     double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
@@ -311,9 +314,10 @@ __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
     long long nc_local = (long long)d_NX * ny_local * d_NZC;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
+    // Layout-A (confirmed by probe): [gx][local_y][kz]
     int kz      = (int)(idx % d_NZC);
-    int gx      = (int)((idx / d_NZC) % d_NX);
-    int local_y = (int)(idx / ((long long)d_NX * d_NZC));
+    int local_y = (int)((idx / d_NZC) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
     int gy = y_offset + local_y;
     double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
     double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
@@ -334,9 +338,10 @@ __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3
     long long nc_local = (long long)d_NX * ny_local * d_NZC;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
+    // Layout-A (confirmed by probe): [gx][local_y][kz]
     int kz      = (int)(idx % d_NZC);
-    int gx      = (int)((idx / d_NZC) % d_NX);
-    int local_y = (int)(idx / ((long long)d_NX * d_NZC));
+    int local_y = (int)((idx / d_NZC) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
     int gy = y_offset + local_y;
     double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
     double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
@@ -981,9 +986,6 @@ int main(int argc, char** argv) {
     CUFFT_CHECK(cufftMpAttachComm(plan_c2r, CUFFT_COMM_MPI, &world));
 
     // ★ SetSubformatDefault MUST be called BEFORE MakePlan3d.
-    // cuFFTMp uses this to configure internal transpose metadata at plan-build time.
-    // Calling it after MakePlan3d (or not at all) leaves the plan with wrong
-    // default subformats, causing silent garbage on the first hacked FFT call.
     CUFFT_CHECK(cufftXtSetSubformatDefault(plan_r2c,
         CUFFT_XT_FORMAT_INPLACE,
         CUFFT_XT_FORMAT_INPLACE_SHUFFLED));
