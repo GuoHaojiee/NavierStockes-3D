@@ -1158,7 +1158,7 @@ int main(int argc, char** argv) {
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
     // NOTE: IC and simulation are SKIPPED in this alloc-probe build.
     // Jump directly to cleanup.
-    goto cleanup;
+    if (error) goto cleanup;
     {
         int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
         // V_buf was alloc_and_zero'd as INPLACE.  Fill real X-slab values
