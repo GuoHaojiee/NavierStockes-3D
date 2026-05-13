@@ -1155,15 +1155,22 @@ int main(int argc, char** argv) {
 
     if (s.rank == 0) cout << "\n(Experiment complete — skipping simulation)\n" << flush;
 
+    // Cleanup and exit — simulation loop is not needed for this probe.
+    free_state(s);
+    CUFFT_CHECK(cufftDestroy(plan_r2c));
+    CUFFT_CHECK(cufftDestroy(plan_c2r));
+    MPI_Finalize();
+    return 0;
+
+    // -----------------------------------------------------------------------
+    // Simulation code below is intentionally unreachable in this probe build.
+    // Kept for reference / easy restoration.
+    // -----------------------------------------------------------------------
+    if (false)
+    {
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
-    // NOTE: IC and simulation are SKIPPED in this alloc-probe build.
-    // Jump directly to cleanup.
-    if (error) goto cleanup;
     {
         int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
-        // V_buf was alloc_and_zero'd as INPLACE.  Fill real X-slab values
-        // and FFT_FORWARD -- naturally consistent with INPLACE state.
-        // No force_* needed.
         kernel_fill_velocity<<<gr, BLOCK>>>(
             (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
             s.nx_local, s.x_offset, 0.0);
@@ -1181,14 +1188,8 @@ int main(int argc, char** argv) {
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.nc_local, inv_N);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.nc_local, inv_N);
-        // kernel_make_div_free<<<gc, BLOCK>>>(
-        //     (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-        //     s.ny_local, s.y_offset);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
-    // V_buf is now Y-slab complex (spectral).
-    // cuFFTMp internal state is INPLACE_SHUFFLED after FFT_FORWARD above.
-    // No force_* needed.
 
     double t_wall = 0.0;
     for (int it = 0; it < NT_RUN; ++it) {
@@ -1222,10 +1223,9 @@ int main(int argc, char** argv) {
         cout << "============================================================\n" << flush;
     }
 
-    cleanup:
     free_state(s);
     CUFFT_CHECK(cufftDestroy(plan_r2c));
     CUFFT_CHECK(cufftDestroy(plan_c2r));
     MPI_Finalize();
     return 0;
-}
+    } // end if(false)
