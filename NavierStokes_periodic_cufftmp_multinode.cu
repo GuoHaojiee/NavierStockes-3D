@@ -980,15 +980,20 @@ int main(int argc, char** argv) {
     CUFFT_CHECK(cufftMpAttachComm(plan_r2c, CUFFT_COMM_MPI, &world));
     CUFFT_CHECK(cufftMpAttachComm(plan_c2r, CUFFT_COMM_MPI, &world));
 
+    // ★ SetSubformatDefault MUST be called BEFORE MakePlan3d.
+    // cuFFTMp uses this to configure internal transpose metadata at plan-build time.
+    // Calling it after MakePlan3d (or not at all) leaves the plan with wrong
+    // default subformats, causing silent garbage on the first hacked FFT call.
+    CUFFT_CHECK(cufftXtSetSubformatDefault(plan_r2c,
+        CUFFT_XT_FORMAT_INPLACE,
+        CUFFT_XT_FORMAT_INPLACE_SHUFFLED));
+    CUFFT_CHECK(cufftXtSetSubformatDefault(plan_c2r,
+        CUFFT_XT_FORMAT_INPLACE_SHUFFLED,
+        CUFFT_XT_FORMAT_INPLACE));
+
     size_t ws_r2c = 0, ws_c2r = 0;
     CUFFT_CHECK(cufftMakePlan3d(plan_r2c, NX, NY, NZ, CUFFT_D2Z, &ws_r2c));
     CUFFT_CHECK(cufftMakePlan3d(plan_c2r, NX, NY, NZ, CUFFT_Z2D, &ws_c2r));
-
-    // Explicit subformat defaults (belt-and-braces; the macros override per-call).
-    // CUFFT_CHECK(cufftXtSetSubformatDefault(plan_r2c,
-    //     CUFFT_XT_FORMAT_INPLACE, CUFFT_XT_FORMAT_INPLACE_SHUFFLED));
-    // CUFFT_CHECK(cufftXtSetSubformatDefault(plan_c2r,
-    //     CUFFT_XT_FORMAT_INPLACE_SHUFFLED, CUFFT_XT_FORMAT_INPLACE));
 
     alloc_state(s, plan_r2c);
 
@@ -1110,21 +1115,6 @@ int main(int argc, char** argv) {
     // hacked subFormat.  Without this, virgin rot/work buffers produce silent
     // garbage on the first hacked FFT_INVERSE.
     warmup_buffers(plan_r2c, plan_c2r, s);
-
-    // =========================================================================
-    // LAYOUT PROBE: run BEFORE IC to identify actual INPLACE_SHUFFLED layout.
-    // Injects cos(2*x), FFTs, and prints which linear idx holds the non-zero
-    // spectral modes.  Compare actual idx against Layout-A / Layout-B predictions
-    // printed above to determine the true storage order.
-    // Remove or #if 0 this block after layout is confirmed.
-    // =========================================================================
-    if (s.rank == 0) cout << "\n--- Layout probe (remove after layout confirmed) ---\n" << flush;
-    probe_layout(plan_r2c, s, 2, "PROBE-X(KX0=2)");
-    // After warmup, V1_buf is zeroed+clean.  Drive it back to INPLACE state
-    // (warmup already left it that way, but be explicit after probe_layout).
-    CUDA_CHECK(cudaDeviceSynchronize());
-    if (s.rank == 0) cout << "--- Layout probe done ---\n\n" << flush;
-    // =========================================================================
 
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
     {
