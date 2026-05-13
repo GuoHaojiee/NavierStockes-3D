@@ -930,17 +930,16 @@ int main(int argc, char** argv) {
     TAU = atof(argv[4]); NT_RUN = atoi(argv[5]);
     NZC = NZ/2 + 1;
     LX = LY = LZ = 2.0*M_PI; DX = LX/NX; DY = LY/NY; DZ = LZ/NZ;
-    cudaMemcpyToSymbol(d_NX,  &NX,  sizeof(int));
-    cudaMemcpyToSymbol(d_NY,  &NY,  sizeof(int));
-    cudaMemcpyToSymbol(d_NZ,  &NZ,  sizeof(int));
-    cudaMemcpyToSymbol(d_NZC, &NZC, sizeof(int));
-    cudaMemcpyToSymbol(d_DX,  &DX,  sizeof(double));
-    cudaMemcpyToSymbol(d_DY,  &DY,  sizeof(double));
-    cudaMemcpyToSymbol(d_DZ,  &DZ,  sizeof(double));
-    if (s.rank == 0)
-        printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
 
-    // node-local GPU binding
+    // =========================================================================
+    // ★ FIX: bind to correct GPU BEFORE any cudaMemcpyToSymbol.
+    // cudaMemcpyToSymbol writes to the *current* device's constant memory.
+    // All ranks default to device 0, so ranks 1..P-1 would write NX/NY/NZ to
+    // GPU 0, leaving their own GPU's d_NX/d_NY/d_NZC = 0.  Kernels on those
+    // ranks then compute n_padded = nx_local * 0 * 0 = 0 and return immediately,
+    // leaving the buffer all-zeros.  cuFFTMp sees correct data only from rank 0,
+    // giving amplitude = nx_local/(2*NX) = 0.125 instead of 0.5.
+    // =========================================================================
     MPI_Comm node_comm;
     MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, s.rank, MPI_INFO_NULL, &node_comm);
     MPI_Comm_rank(node_comm, &s.local_rank);
@@ -954,9 +953,20 @@ int main(int argc, char** argv) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     s.gpu = s.local_rank;
-    CUDA_CHECK(cudaSetDevice(s.gpu));
+    CUDA_CHECK(cudaSetDevice(s.gpu));          // ★ must be before cudaMemcpyToSymbol
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, s.gpu));
+
+    // Now current device = this rank's actual GPU; constants land in the right place.
+    cudaMemcpyToSymbol(d_NX,  &NX,  sizeof(int));
+    cudaMemcpyToSymbol(d_NY,  &NY,  sizeof(int));
+    cudaMemcpyToSymbol(d_NZ,  &NZ,  sizeof(int));
+    cudaMemcpyToSymbol(d_NZC, &NZC, sizeof(int));
+    cudaMemcpyToSymbol(d_DX,  &DX,  sizeof(double));
+    cudaMemcpyToSymbol(d_DY,  &DY,  sizeof(double));
+    cudaMemcpyToSymbol(d_DZ,  &DZ,  sizeof(double));
+    if (s.rank == 0)
+        printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
 
     if (NX % s.nprocs != 0 || NY % s.nprocs != 0) {
         if (s.rank == 0)
@@ -1229,5 +1239,3 @@ int main(int argc, char** argv) {
     MPI_Finalize();
     return 0;
     } // end if(false)
-}
-
