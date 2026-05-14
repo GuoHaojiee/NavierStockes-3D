@@ -171,49 +171,49 @@ static void free_arrays(GPUArrays& g){
     cudaFree(g.tmp1_c);cudaFree(g.tmp2_c);cudaFree(g.tmp3_c);cudaFree(g.div_c);}
 
 template<typename FFT>
-static void heffte_fwd(FFT& fft,GReal* r,GCplx* c){fft.forward(r,reinterpret_cast<std::complex<double>*>(c),heffte::scale::none);}
+static void heffte_fwd(FFT& fft,GReal* r,GCplx* c,std::complex<double>* ws){fft.forward(r,reinterpret_cast<std::complex<double>*>(c),ws,heffte::scale::none);}
 template<typename FFT>
-static void heffte_bwd(FFT& fft,GCplx* c,GReal* r){fft.backward(reinterpret_cast<std::complex<double>*>(c),r,heffte::scale::full);}
+static void heffte_bwd(FFT& fft,GCplx* c,GReal* r,std::complex<double>* ws){fft.backward(reinterpret_cast<std::complex<double>*>(c),r,ws,heffte::scale::full);}
 
 template<typename FFT>
-static void compute_nonlinear(FFT& fft,GPUArrays& g,GCplx* nl1,GCplx* nl2,GCplx* nl3,const BoxGPU& br,const BoxGPU& bc){
+static void compute_nonlinear(FFT& fft,GPUArrays& g,GCplx* nl1,GCplx* nl2,GCplx* nl3,const BoxGPU& br,const BoxGPU& bc,std::complex<double>* ws){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
     kernel_compute_rot<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.rot1_c,g.rot2_c,g.rot3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    heffte_bwd(fft,g.V1_c,g.V1_r);heffte_bwd(fft,g.V2_c,g.V2_r);heffte_bwd(fft,g.V3_c,g.V3_r);
-    heffte_bwd(fft,g.rot1_c,g.rot1_r);heffte_bwd(fft,g.rot2_c,g.rot2_r);heffte_bwd(fft,g.rot3_c,g.rot3_r);
+    heffte_bwd(fft,g.V1_c,g.V1_r,ws);heffte_bwd(fft,g.V2_c,g.V2_r,ws);heffte_bwd(fft,g.V3_c,g.V3_r,ws);
+    heffte_bwd(fft,g.rot1_c,g.rot1_r,ws);heffte_bwd(fft,g.rot2_c,g.rot2_r,ws);heffte_bwd(fft,g.rot3_c,g.rot3_r,ws);
     kernel_cross_product<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.rot1_r,g.rot2_r,g.rot3_r,br.n());
-    heffte_fwd(fft,g.rot1_r,nl1);heffte_fwd(fft,g.rot2_r,nl2);heffte_fwd(fft,g.rot3_r,nl3);}
+    heffte_fwd(fft,g.rot1_r,nl1,ws);heffte_fwd(fft,g.rot2_r,nl2,ws);heffte_fwd(fft,g.rot3_r,nl3,ws);}
 template<typename FFT>
-static void compute_rhs(FFT& fft,GPUArrays& g,GCplx* r1,GCplx* r2,GCplx* r3,const BoxGPU& br,const BoxGPU& bc,double t){
+static void compute_rhs(FFT& fft,GPUArrays& g,GCplx* r1,GCplx* r2,GCplx* r3,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V1_c,g.visc1_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V2_c,g.visc2_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V3_c,g.visc3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    compute_nonlinear(fft,g,r1,r2,r3,br,bc);
+    compute_nonlinear(fft,g,r1,r2,r3,br,bc,ws);
     kernel_fill_forcing<<<gr,BLOCK>>>(g.work1_r,g.work2_r,g.work3_r,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
-    heffte_fwd(fft,g.work1_r,g.f1_c);heffte_fwd(fft,g.work2_r,g.f2_c);heffte_fwd(fft,g.work3_r,g.f3_c);
+    heffte_fwd(fft,g.work1_r,g.f1_c,ws);heffte_fwd(fft,g.work2_r,g.f2_c,ws);heffte_fwd(fft,g.work3_r,g.f3_c,ws);
     kernel_add_rhs<<<gc,BLOCK>>>(r1,r2,r3,g.visc1_c,g.visc2_c,g.visc3_c,g.f1_c,g.f2_c,g.f3_c,bc.n());
     kernel_make_div_free<<<gc,BLOCK>>>(r1,r2,r3,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());}
 template<typename FFT>
-static void rk4_step(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t){
+static void rk4_step(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
     long long nc=bc.n();int gc=bc.grid(BLOCK);
     CUDA_CHECK(cudaMemcpy(g.tmp1_c,g.V1_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.tmp2_c,g.V2_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.tmp3_c,g.V3_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
-    compute_rhs(fft,g,g.k1v1,g.k1v2,g.k1v3,br,bc,t);
+    compute_rhs(fft,g,g.k1v1,g.k1v2,g.k1v3,br,bc,t,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k1v1,g.k1v2,g.k1v3,0.5*TAU,nc);
-    compute_rhs(fft,g,g.k2v1,g.k2v2,g.k2v3,br,bc,t+0.5*TAU);
+    compute_rhs(fft,g,g.k2v1,g.k2v2,g.k2v3,br,bc,t+0.5*TAU,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k2v1,g.k2v2,g.k2v3,0.5*TAU,nc);
-    compute_rhs(fft,g,g.k3v1,g.k3v2,g.k3v3,br,bc,t+0.5*TAU);
+    compute_rhs(fft,g,g.k3v1,g.k3v2,g.k3v3,br,bc,t+0.5*TAU,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k3v1,g.k3v2,g.k3v3,TAU,nc);
-    compute_rhs(fft,g,g.k4v1,g.k4v2,g.k4v3,br,bc,t+TAU);
+    compute_rhs(fft,g,g.k4v1,g.k4v2,g.k4v3,br,bc,t+TAU,ws);
     kernel_rk4_update<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,
         g.k1v1,g.k2v1,g.k3v1,g.k4v1,g.k1v2,g.k2v2,g.k3v2,g.k4v2,
         g.k1v3,g.k2v3,g.k3v3,g.k4v3,TAU/6.,nc);}
 template<typename FFT>
-static pair<double,double> compute_diagnostics(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t){
+static pair<double,double> compute_diagnostics(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
-    heffte_bwd(fft,g.V1_c,g.V1_r);heffte_bwd(fft,g.V2_c,g.V2_r);heffte_bwd(fft,g.V3_c,g.V3_r);
+    heffte_bwd(fft,g.V1_c,g.V1_r,ws);heffte_bwd(fft,g.V2_c,g.V2_r,ws);heffte_bwd(fft,g.V3_c,g.V3_r,ws);
     kernel_error_sq<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.scratch,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
     thrust::device_ptr<double> sp(g.scratch);
     double le=thrust::reduce(thrust::device,sp,sp+br.n()),ge;
@@ -281,26 +281,42 @@ int main(int argc, char** argv) {
     {
     heffte::box3d<> world_r={{0,0,0},{NX-1,NY-1,NZ-1}};
     heffte::box3d<> world_c={{0,0,0},{NX-1,NY-1,NZ/2}};
-    auto pg=heffte::proc_setup_min_surface(world_r,nprocs);
+    // Slab decomposition along X (Nx1x1) — 1 transpose per FFT instead of 3.
+    // Matches the single-node mgpu version; aligns with cuFFTMp's X-slab layout.
+    std::array<int,3> pg = {nprocs, 1, 1};
     auto inboxes=heffte::split_world(world_r,pg);
     auto outboxes=heffte::split_world(world_c,pg);
     heffte::box3d<> inbox_r=inboxes[rank],outbox_c=outboxes[rank];
-    if(rank==0) cout<<"heFFTe pencil grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
+    if(rank==0) cout<<"heFFTe slab grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
 
-    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,2,MPI_COMM_WORLD);
+    // Force GPU-aware MPI path; skip data reordering; use alltoallv collective.
+    auto options = heffte::default_options<heffte::backend::cufft>();
+    options.use_gpu_aware = true;
+    options.use_reorder   = false;
+    options.algorithm     = heffte::reshape_algorithm::alltoallv;
+
+    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,2,MPI_COMM_WORLD,options);
     BoxGPU br=make_box(inbox_r),bc=make_box(outbox_c);
     long long nr=br.n(),nc=bc.n();
     GPUArrays g;alloc_arrays(g,nr,nc);
 
+    // Persistent heFFTe workspace — avoids cudaMalloc/cudaFree and IPC handle
+    // open/close on every FFT call (dominant cost in the previous version).
+    size_t ws_size = fft.size_workspace();
+    std::complex<double>* d_ws = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_ws, ws_size * sizeof(std::complex<double>)));
+    if (rank==0) printf("  heFFTe workspace per rank: %.0f MB\n",
+                        ws_size * sizeof(std::complex<double>) / (1024.*1024.));
+
     kernel_fill_velocity<<<br.grid(BLOCK),BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],nr);
-    heffte_fwd(fft,g.V1_r,g.V1_c);heffte_fwd(fft,g.V2_r,g.V2_c);heffte_fwd(fft,g.V3_r,g.V3_c);
+    heffte_fwd(fft,g.V1_r,g.V1_c,d_ws);heffte_fwd(fft,g.V2_r,g.V2_c,d_ws);heffte_fwd(fft,g.V3_r,g.V3_c,d_ws);
     kernel_make_div_free<<<bc.grid(BLOCK),BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],nc);
 
     double t_wall=0.;
     for(int it=0;it<NT_RUN;++it){
         double tc=it*TAU;
         double t0=MPI_Wtime();
-        rk4_step(fft,g,br,bc,tc);
+        rk4_step(fft,g,br,bc,tc,d_ws);
         CUDA_CHECK(cudaDeviceSynchronize());
         double dt=MPI_Wtime()-t0,dtmax;
         MPI_Allreduce(&dt,&dtmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
@@ -308,7 +324,7 @@ int main(int argc, char** argv) {
     }
     {
         double t_final=NT_RUN*TAU;
-        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final);
+        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final,d_ws);
         if(rank==0)
             cout<<"  L2 error (t="<<fixed<<setprecision(6)<<t_final<<"): "
                 <<scientific<<setprecision(4)<<e<<"\n";
@@ -319,6 +335,7 @@ int main(int argc, char** argv) {
                     <<"  Avg per step:    "<<t_wall/NT_RUN<<" s\n"
                     <<"============================================================\n";}
     free_arrays(g);
+    cudaFree(d_ws);
     }
     MPI_Finalize();
     return 0;
