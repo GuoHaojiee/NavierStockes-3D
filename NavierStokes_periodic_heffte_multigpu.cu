@@ -240,11 +240,6 @@ int main(int argc, char** argv) {
     TAU=atof(argv[4]); NT_RUN=atoi(argv[5]);
     NT_TOTAL=NT_RUN;
     LX=LY=LZ=2.0*M_PI; DX=LX/NX; DY=LY/NY; DZ=LZ/NZ;
-    cudaMemcpyToSymbol(d_NX,&NX,sizeof(int));
-    cudaMemcpyToSymbol(d_NY,&NY,sizeof(int));
-    cudaMemcpyToSymbol(d_DX,&DX,sizeof(double));
-    cudaMemcpyToSymbol(d_DY,&DY,sizeof(double));
-    cudaMemcpyToSymbol(d_DZ,&DZ,sizeof(double));
     if (rank==0) printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n",NX,NY,NZ,TAU,NT_RUN);
 
     // ---- GPU assignment: multi-node via node-local communicator ----
@@ -257,7 +252,19 @@ int main(int argc, char** argv) {
     MPI_Comm_size(node_comm, &local_size);
     MPI_Comm_free(&node_comm);
 
+    // CRITICAL: bind to the correct GPU BEFORE any cudaMemcpyToSymbol.
+    // cudaMemcpyToSymbol writes to the *current* device's constant memory.
+    // If symbols are written before cudaSetDevice, ranks with local_rank>0 end up
+    // running kernels on a GPU whose d_NX=d_NY=d_DX=d_DY=d_DZ=0, corrupting the
+    // initial condition and producing a meaningless L2 error.
     CUDA_CHECK(cudaSetDevice(local_rank));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(d_NX,&NX,sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_NY,&NY,sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_DX,&DX,sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_DY,&DY,sizeof(double)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_DZ,&DZ,sizeof(double)));
+
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, local_rank));
 
