@@ -64,8 +64,19 @@
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
 #include <omp.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// Run mode / phase timing (see common_mode.h).
+//   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
+//   g_with_force = false (bench) : f = 0; forcing fill, its 3 FFTs, copies and
+//                                  scaling are skipped; work*_buf / f*_c not allocated.
+// Single process drives several GPUs, so phases are timed on the host; every
+// mark is preceded by a sync of all GPUs (existing SYNC points are reused).
+static bool g_with_force = true;
+static nsmode::CpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 typedef cufftDoubleReal    GReal;
 typedef cufftDoubleComplex GCplx;
@@ -268,6 +279,20 @@ __global__ void kernel_error_sq(const double* V1, const double* V2, const double
     scratch[idx] = d1*d1 + d2*d2 + d3*d3;
 }
 
+// |v|^2 per point → scratch (bench-mode kinetic-energy diagnostic; padded real read)
+__global__ void kernel_energy_sq(const double* V1, const double* V2, const double* V3,
+                                  double* scratch, int nx_local, int NY_, int NZ_, int NZC_) {
+    long long nr_local = (long long)nx_local * NY_ * NZ_;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nr_local) return;
+    int k  = (int)(idx % NZ_);
+    int j  = (int)((idx / NZ_) % NY_);
+    int lx = (int)(idx / ((long long)NY_ * NZ_));
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
+    scratch[idx] = v1*v1 + v2*v2 + v3*v3;
+}
+
 // ============================================================
 // SPECTRAL-SPACE KERNELS (Y-slab layout, subFormat=3)
 // Take (ny_local, y_offset). Each GPU holds all NX × all NZC, but only ny_local
@@ -403,6 +428,20 @@ __global__ void kernel_add_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
     rhs3[idx].y += visc3[idx].y + f3[idx].y;
 }
 
+// bench mode (f = 0): rhs += visc
+__global__ void kernel_add_visc_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
+                                        const GCplx* visc1, const GCplx* visc2, const GCplx* visc3,
+                                        long long nc_local) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nc_local) return;
+    rhs1[idx].x += visc1[idx].x;
+    rhs1[idx].y += visc1[idx].y;
+    rhs2[idx].x += visc2[idx].x;
+    rhs2[idx].y += visc2[idx].y;
+    rhs3[idx].x += visc3[idx].x;
+    rhs3[idx].y += visc3[idx].y;
+}
+
 // RK4 intermediate: V = orig + alpha * k
 __global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
                                   const GCplx* o1, const GCplx* o2, const GCplx* o3,
@@ -473,13 +512,13 @@ struct MGPUState {
     cudaLibXtDesc* rot1_buf;
     cudaLibXtDesc* rot2_buf;
     cudaLibXtDesc* rot3_buf;
-    cudaLibXtDesc* work1_buf;
-    cudaLibXtDesc* work2_buf;
-    cudaLibXtDesc* work3_buf;
+    cudaLibXtDesc* work1_buf = nullptr;   // forcing only (verify mode)
+    cudaLibXtDesc* work2_buf = nullptr;
+    cudaLibXtDesc* work3_buf = nullptr;
 
     // Per-GPU spectral-only arrays (regular cudaMalloc, size nc_local)
     GCplx* visc1_c[MAX_GPUS], *visc2_c[MAX_GPUS], *visc3_c[MAX_GPUS];
-    GCplx* f1_c[MAX_GPUS],    *f2_c[MAX_GPUS],    *f3_c[MAX_GPUS];
+    GCplx* f1_c[MAX_GPUS] = {}, *f2_c[MAX_GPUS] = {}, *f3_c[MAX_GPUS] = {};  // forcing only (verify)
     GCplx* rhs1_c[MAX_GPUS],  *rhs2_c[MAX_GPUS],  *rhs3_c[MAX_GPUS];
     GCplx* k1v1[MAX_GPUS], *k2v1[MAX_GPUS], *k3v1[MAX_GPUS], *k4v1[MAX_GPUS];
     GCplx* k1v2[MAX_GPUS], *k2v2[MAX_GPUS], *k3v2[MAX_GPUS], *k4v2[MAX_GPUS];
@@ -505,13 +544,18 @@ static void alloc_mgpu(MGPUState& s, cufftHandle plan_r2c) {
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot1_buf,  CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot2_buf,  CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot3_buf,  CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE));
+    // Forcing-only buffers (used solely by the forcing block of compute_rhs)
+    if (g_with_force) {
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE));
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE));
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE));
+    }
 
     // Per-GPU spectral-only arrays
     alloc_per_gpu_cplx(s, s.visc1_c); alloc_per_gpu_cplx(s, s.visc2_c); alloc_per_gpu_cplx(s, s.visc3_c);
-    alloc_per_gpu_cplx(s, s.f1_c);    alloc_per_gpu_cplx(s, s.f2_c);    alloc_per_gpu_cplx(s, s.f3_c);
+    if (g_with_force) {
+        alloc_per_gpu_cplx(s, s.f1_c); alloc_per_gpu_cplx(s, s.f2_c); alloc_per_gpu_cplx(s, s.f3_c);
+    }
     alloc_per_gpu_cplx(s, s.rhs1_c);  alloc_per_gpu_cplx(s, s.rhs2_c);  alloc_per_gpu_cplx(s, s.rhs3_c);
     alloc_per_gpu_cplx(s, s.k1v1);    alloc_per_gpu_cplx(s, s.k2v1);
     alloc_per_gpu_cplx(s, s.k3v1);    alloc_per_gpu_cplx(s, s.k4v1);
@@ -535,6 +579,12 @@ static void sync_all_gpus(const MGPUState& s) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+}
+
+// Phase mark that first synchronises every GPU (host timer)
+static void mark_sync(const MGPUState& s, nsmode::Phase p) {
+    sync_all_gpus(s);
+    g_timer.mark(p);
 }
 
 // ============================================================
@@ -567,6 +617,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     force_z2d_format(s.rot3_buf);
     // SYNC [A]
     sync_all_gpus(s);
+    g_timer.mark(PH_SPEC);
 
     // 2. IFFT velocity V_buf: Y-slab complex → X-slab real
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
@@ -579,6 +630,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
     // SYNC [B]
     sync_all_gpus(s);
+    g_timer.mark(PH_FFT);
 
     // 4. Real-space cross product V × rot → rot_buf
     #pragma omp parallel for num_threads(nGPUs)
@@ -592,6 +644,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     }
     // SYNC [C]
     sync_all_gpus(s);
+    g_timer.mark(PH_PHYS);
 
     // 5. FFT cross product result rot_buf → Y-slab spectral
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot1_buf, s.rot1_buf));
@@ -599,6 +652,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
     // SYNC [D]
     sync_all_gpus(s);
+    g_timer.mark(PH_FFT);
 
     // 6. Copy spectral cross product to rhs_c and scale
     #pragma omp parallel for num_threads(nGPUs)
@@ -640,54 +694,70 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
     }
     // SYNC [E]
     sync_all_gpus(s);
+    g_timer.mark(PH_SPEC);   // also absorbs the previous RK4 copy/restore/axpy kernels
 
     // 2. Nonlinear: V × rot(V) → rhs_c
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
-    // 3. Forcing: fill work_buf real, FFT, scale → f_c
-    force_d2z_format(s.work1_buf);
-    force_d2z_format(s.work2_buf);
-    force_d2z_format(s.work3_buf);
-    #pragma omp parallel for num_threads(nGPUs)
-    for (int g = 0; g < nGPUs; g++) {
-        CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
-        int x_offset = g * nx_local;
-        int grid_r = (int)((nr_local + BLOCK - 1) / BLOCK);
-        kernel_fill_forcing<<<grid_r, BLOCK>>>(
-            (double*)gpu_ptr(s.work1_buf, g), (double*)gpu_ptr(s.work2_buf, g),
-            (double*)gpu_ptr(s.work3_buf, g), nx_local, x_offset, t,
-            NY_, NZ_, NZC_, DX_, DY_, DZ_);
-    }
-    // SYNC [F]
-    sync_all_gpus(s);
+    if (g_with_force) {
+        // Close the spectral phase (nl copy/scale) before timing the forcing block.
+        mark_sync(s, PH_SPEC);
+        // 3. Forcing: fill work_buf real, FFT, scale → f_c  [verify only]
+        force_d2z_format(s.work1_buf);
+        force_d2z_format(s.work2_buf);
+        force_d2z_format(s.work3_buf);
+        #pragma omp parallel for num_threads(nGPUs)
+        for (int g = 0; g < nGPUs; g++) {
+            CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
+            int x_offset = g * nx_local;
+            int grid_r = (int)((nr_local + BLOCK - 1) / BLOCK);
+            kernel_fill_forcing<<<grid_r, BLOCK>>>(
+                (double*)gpu_ptr(s.work1_buf, g), (double*)gpu_ptr(s.work2_buf, g),
+                (double*)gpu_ptr(s.work3_buf, g), nx_local, x_offset, t,
+                NY_, NZ_, NZC_, DX_, DY_, DZ_);
+        }
+        // SYNC [F]
+        sync_all_gpus(s);
 
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
-    // SYNC [G]
-    sync_all_gpus(s);
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
+        // SYNC [G]
+        sync_all_gpus(s);
 
-    #pragma omp parallel for num_threads(nGPUs)
-    for (int g = 0; g < nGPUs; g++) {
-        CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
-        int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
-        kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf, g), s.f1_c[g], nc_local);
-        kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf, g), s.f2_c[g], nc_local);
-        kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work3_buf, g), s.f3_c[g], nc_local);
-        kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f1_c[g], nc_local, inv_N);
-        kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f2_c[g], nc_local, inv_N);
-        kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f3_c[g], nc_local, inv_N);
-    }
+        #pragma omp parallel for num_threads(nGPUs)
+        for (int g = 0; g < nGPUs; g++) {
+            CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
+            int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
+            kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf, g), s.f1_c[g], nc_local);
+            kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf, g), s.f2_c[g], nc_local);
+            kernel_copy_cplx<<<grid_c, BLOCK>>>((GCplx*)gpu_ptr(s.work3_buf, g), s.f3_c[g], nc_local);
+            kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f1_c[g], nc_local, inv_N);
+            kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f2_c[g], nc_local, inv_N);
+            kernel_scale_cplx<<<grid_c, BLOCK>>>(s.f3_c[g], nc_local, inv_N);
+        }
+        mark_sync(s, PH_FORCE);
 
-    // 4. rhs += visc + f
-    #pragma omp parallel for num_threads(nGPUs)
-    for (int g = 0; g < nGPUs; g++) {
-        CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
-        int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
-        kernel_add_to_rhs<<<grid_c, BLOCK>>>(
-            s.rhs1_c[g], s.rhs2_c[g], s.rhs3_c[g],
-            s.visc1_c[g], s.visc2_c[g], s.visc3_c[g],
-            s.f1_c[g], s.f2_c[g], s.f3_c[g], nc_local);
+        // 4. rhs += visc + f
+        #pragma omp parallel for num_threads(nGPUs)
+        for (int g = 0; g < nGPUs; g++) {
+            CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
+            int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
+            kernel_add_to_rhs<<<grid_c, BLOCK>>>(
+                s.rhs1_c[g], s.rhs2_c[g], s.rhs3_c[g],
+                s.visc1_c[g], s.visc2_c[g], s.visc3_c[g],
+                s.f1_c[g], s.f2_c[g], s.f3_c[g], nc_local);
+        }
+    } else {
+        // 4'. bench mode (f = 0): rhs += visc
+        #pragma omp parallel for num_threads(nGPUs)
+        for (int g = 0; g < nGPUs; g++) {
+            CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
+            int grid_c = (int)((nc_local + BLOCK - 1) / BLOCK);
+            kernel_add_visc_to_rhs<<<grid_c, BLOCK>>>(
+                s.rhs1_c[g], s.rhs2_c[g], s.rhs3_c[g],
+                s.visc1_c[g], s.visc2_c[g], s.visc3_c[g], nc_local);
+        }
     }
 
     // 5. Project rhs to divergence-free space
@@ -847,9 +917,10 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // V_buf is spectral (subFormat=3, Y-slab) on entry.
 // V_buf is IFFT'd to real, error computed, then re-FFT'd to restore spectral state.
 // ============================================================
+// verify: L2_or_energy = L2 error; bench: kinetic energy 0.5*sum|v|^2
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
-                                 MGPUState& s, double t,
-                                 double& L2_err, double& max_div) {
+                                 MGPUState& s, double t, bool verify,
+                                 double& L2_or_energy, double& max_div) {
     const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
@@ -891,10 +962,15 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
         int x_offset = g * nx_local;
         int gr = (int)((nr_local + BLOCK - 1) / BLOCK);
-        kernel_error_sq<<<gr, BLOCK>>>(
-            (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
-            s.d_scratch[g], nx_local, x_offset, t,
-            NY_, NZ_, NZC_, DX_, DY_, DZ_);
+        if (verify)
+            kernel_error_sq<<<gr, BLOCK>>>(
+                (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
+                s.d_scratch[g], nx_local, x_offset, t,
+                NY_, NZ_, NZC_, DX_, DY_, DZ_);
+        else
+            kernel_energy_sq<<<gr, BLOCK>>>(
+                (double*)gpu_ptr(s.V1_buf, g), (double*)gpu_ptr(s.V2_buf, g), (double*)gpu_ptr(s.V3_buf, g),
+                s.d_scratch[g], nx_local, NY_, NZ_, NZC_);
     }
     double err_sq = 0.0;
     for (int g = 0; g < nGPUs; g++) {
@@ -903,7 +979,7 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
         thrust::device_ptr<double> sp(s.d_scratch[g]);
         err_sq += thrust::reduce(thrust::device, sp, sp + nr_local, 0.0);
     }
-    L2_err = sqrt(err_sq * DX_ * DY_ * DZ_);
+    L2_or_energy = verify ? sqrt(err_sq * DX_ * DY_ * DZ_) : 0.5 * err_sq;
 
     // Re-FFT V_buf → restore spectral state (Y-slab, subFormat=3)
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
@@ -928,9 +1004,19 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // ============================================================
 int main(int argc, char** argv) {
     if (argc < 6) {
-        fprintf(stderr, "Usage: %s NX NY NZ dt NSTEPS\n", argv[0]);
+        fprintf(stderr, "Usage: %s %s\n", argv[0], nsmode::usage_tail(false));
         return 1;
     }
+    nsmode::RunArgs rargs;
+    {
+        std::string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/false, rargs, perr)) {
+            fprintf(stderr, "Error: %s\nUsage: %s %s\n", perr.c_str(), argv[0], nsmode::usage_tail(false));
+            return 1;
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
     NX      = atoi(argv[1]);
     NY      = atoi(argv[2]);
     NZ      = atoi(argv[3]);
@@ -984,6 +1070,8 @@ int main(int argc, char** argv) {
     cout << "  Real  (X-slab): nx_local=" << s.nx_local << " per GPU" << endl;
     cout << "  Spec. (Y-slab): ny_local=" << s.ny_local << " per GPU" << endl;
     cout << "Steps: " << NT_RUN << ", dt = " << TAU << endl;
+    cout << "Run mode: " << nsmode::mode_name(mode)
+         << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
     cout << "============================================================" << endl;
 
     // Create cuFFTXt plans
@@ -1063,6 +1151,7 @@ int main(int argc, char** argv) {
 
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
         CUDA_CHECK(cudaEventRecord(ev_start));
+        g_timer.start();
 
         rk4_step(plan_r2c, plan_c2r, s, t_cur);
 
@@ -1070,6 +1159,7 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        g_timer.mark(PH_SPEC);   // final RK4 update (all GPUs synced above)
 
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[0]));
         CUDA_CHECK(cudaEventRecord(ev_stop));
@@ -1080,13 +1170,18 @@ int main(int argc, char** argv) {
         t_wall_total += (double)ms * 1e-3;
     }
 
-    // Final diagnostics only
+    // Final diagnostics only (not timed)
     {
         double t_final = NT_RUN * TAU;
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, L2_err, max_div);
-        cout << "  L2 error   (t=" << fixed << setprecision(6) << t_final << "): "
-             << scientific << setprecision(4) << L2_err << endl;
+        double L2_or_E, max_div;
+        const bool verify = (mode == nsmode::MODE_VERIFY);
+        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, verify, L2_or_E, max_div);
+        if (verify)
+            cout << "  L2 error   (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << L2_or_E << endl;
+        else
+            cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(10) << L2_or_E << endl;
         cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
              << scientific << setprecision(4) << max_div << endl;
     }
@@ -1095,6 +1190,7 @@ int main(int argc, char** argv) {
     cout << "  Total steps:     " << NT_RUN << endl;
     cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s" << endl;
     cout << "  Avg per step:    " << t_wall_total / NT_RUN << " s" << endl;
+    nsmode::print_phase_summary(g_timer.acc, t_wall_total, NT_RUN, mode);
     cout << "============================================================" << endl;
 
     // Cleanup
@@ -1104,12 +1200,14 @@ int main(int argc, char** argv) {
 
     CUFFT_CHECK(cufftXtFree(s.V1_buf));    CUFFT_CHECK(cufftXtFree(s.V2_buf));    CUFFT_CHECK(cufftXtFree(s.V3_buf));
     CUFFT_CHECK(cufftXtFree(s.rot1_buf));  CUFFT_CHECK(cufftXtFree(s.rot2_buf));  CUFFT_CHECK(cufftXtFree(s.rot3_buf));
-    CUFFT_CHECK(cufftXtFree(s.work1_buf)); CUFFT_CHECK(cufftXtFree(s.work2_buf)); CUFFT_CHECK(cufftXtFree(s.work3_buf));
+    if (s.work1_buf) {
+        CUFFT_CHECK(cufftXtFree(s.work1_buf)); CUFFT_CHECK(cufftXtFree(s.work2_buf)); CUFFT_CHECK(cufftXtFree(s.work3_buf));
+    }
 
     for (int g = 0; g < s.nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
         cudaFree(s.visc1_c[g]); cudaFree(s.visc2_c[g]); cudaFree(s.visc3_c[g]);
-        cudaFree(s.f1_c[g]);    cudaFree(s.f2_c[g]);    cudaFree(s.f3_c[g]);
+        cudaFree(s.f1_c[g]);    cudaFree(s.f2_c[g]);    cudaFree(s.f3_c[g]);   // nullptr in bench: no-op
         cudaFree(s.rhs1_c[g]);  cudaFree(s.rhs2_c[g]);  cudaFree(s.rhs3_c[g]);
         cudaFree(s.k1v1[g]); cudaFree(s.k2v1[g]); cudaFree(s.k3v1[g]); cudaFree(s.k4v1[g]);
         cudaFree(s.k1v2[g]); cudaFree(s.k2v2[g]); cudaFree(s.k3v2[g]); cudaFree(s.k4v2[g]);
