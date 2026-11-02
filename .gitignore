@@ -1,0 +1,13 @@
+# Build artifacts (executables, objects)
+navier_stokes_*
+ns_*
+test_spectral_derivative
+test_spectral_derivative_accfft
+test_spectral_derivative_heffte
+test_spectral_derivative_p3dfft
+*.o
+*.a
+*.so
+# Run logs
+*.log
+slurm-*.out
