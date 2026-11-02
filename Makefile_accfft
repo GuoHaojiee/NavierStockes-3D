@@ -1,7 +1,7 @@
 # Makefile for AccFFT版本求解器
 
 CXX = mpicxx
-CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp -fno-math-errno
 
 # AccFFT路径（安装在用户目录）
 ACCFFT_DIR = /home/guohaojie/.local

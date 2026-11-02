@@ -1,7 +1,7 @@
 # Makefile for p3dfft版本Navier-Stokes求解器
 
 CXX = mpicxx
-CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp -fno-math-errno
 
 # p3dfft路径（安装在用户目录）
 P3DFFT_DIR = /home/guohaojie/.local

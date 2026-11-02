@@ -3,7 +3,7 @@
 # 编译器设置
 CC = mpicc
 CXX = mpicxx
-CXXFLAGS = -O3 -std=c++11 -Wall -fopenmp
+CXXFLAGS = -O3 -std=c++11 -Wall -fopenmp -fno-math-errno
 
 # FFTW路径（系统安装）
 FFTW_INC = -I/usr/include

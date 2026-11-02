@@ -100,7 +100,7 @@ export PATH=$_NVHPC_ARCH/compilers/bin:$MPI_HOME/bin:/opt/ucx-1.17/bin:$PATH
 
 ```bash
 # FFTW3（MPI 多进程）
-$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
+$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_fftw.cpp \
     -I/opt/fftw3/include -L/opt/fftw3/lib \
     -lfftw3_threads -lfftw3 -lfftw3_mpi -lpthread -lm \
@@ -108,7 +108,7 @@ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
     -o ns_fftw
 
 # AccFFT（MPI 多进程）
-$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
+$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_accfft.cpp \
     -I/opt/accfft/include -I/opt/fftw3/include \
     -L/opt/accfft/lib -L/opt/fftw3/lib \
@@ -122,7 +122,7 @@ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
 
 # P3DFFT v2（MPI 多进程）
 NVHPC_COMPLIB=$NVHPC/Linux_x86_64/$NVHPC_VERSION/compilers/lib
-$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
+$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_p3dfft.cpp \
     -I$P3DFFT_HOME/include -I/opt/fftw3/include \
     -L$P3DFFT_HOME/lib -L/opt/fftw3/lib -L$NVHPC_COMPLIB \
@@ -139,7 +139,7 @@ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp \
 # heFFTe CPU（MPI 多进程）
 nvcc -O3 -std=c++17 -arch=sm_80 \
     -ccbin $MPI_HOME/bin/mpicxx \
-    -Xcompiler -fopenmp \
+    -Xcompiler -fopenmp -Xcompiler -fno-math-errno \
     -I$HEFFTE_DIR/include -I/opt/fftw3/include \
     NavierStokes_periodic_heffte_v2.cpp \
     -L$HEFFTE_DIR/lib -lheffte \

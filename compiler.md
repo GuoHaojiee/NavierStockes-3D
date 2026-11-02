@@ -48,13 +48,13 @@ cd /home/user/guo/NavierStockes-3D
 
 ```bash
 # FFTW3
-mpicxx -O3 -std=c++17 -fopenmp \
+mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_fftw.cpp \
     -lfftw3_threads -lfftw3 -lfftw3_mpi -lpthread -lm \
     -o ns_fftw
 
 # AccFFT
-mpicxx -O3 -std=c++17 -fopenmp \
+mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_accfft.cpp \
     -I/home/user/.local/include \
     -L/home/user/.local/lib \
@@ -66,7 +66,7 @@ mpicxx -O3 -std=c++17 -fopenmp \
 
 # P3DFFT
 P3DFFT_HOME=/home/user/.local/p3dfft_v2
-mpicxx -O3 -std=c++17 -fopenmp \
+mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_p3dfft.cpp \
     -I$P3DFFT_HOME/include \
     -I/home/user/.local/include \
@@ -84,7 +84,7 @@ mpicxx -O3 -std=c++17 -fopenmp \
 # heFFTe v2 (CPU)
 nvcc -O3 -std=c++17 -arch=sm_80 \
     -ccbin /usr/bin/mpicxx \
-    -Xcompiler -fopenmp \
+    -Xcompiler -fopenmp -Xcompiler -fno-math-errno \
     -I/home/user/.local/include \
     -I/usr/local/cuda-12.2/include \
     NavierStokes_periodic_heffte_v2.cpp \
