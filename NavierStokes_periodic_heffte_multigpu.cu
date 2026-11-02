@@ -28,8 +28,19 @@
 #include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// Run mode / phase timing (see common_mode.h).
+//   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
+//   g_with_force = false (bench) : f = 0; forcing fill and its 3 forward FFTs are
+//                                  skipped; work*_r / f*_c are not allocated.
+// heFFTe (cufft backend, no user stream) runs on the default stream, so the
+// cudaEvent-based phase timer brackets its transforms correctly.
+static bool g_with_force = true;
+static nsmode::GpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 typedef double             GReal;
 typedef cufftDoubleComplex GCplx;
@@ -92,6 +103,10 @@ __global__ void kernel_error_sq(const GReal* V1,const GReal* V2,const GReal* V3,
     double x=(li+lo0)*d_DX,y=(lj+lo1)*d_DY,z=(lk+lo2)*d_DZ;
     double d1=V1[idx]-func_V1(x,y,z,t),d2=V2[idx]-func_V2(x,y,z,t),d3=V3[idx]-func_V3(x,y,z,t);
     err[idx]=d1*d1+d2*d2+d3*d3;}
+// |v|^2 per point (bench-mode kinetic-energy diagnostic)
+__global__ void kernel_energy_sq(const GReal* V1,const GReal* V2,const GReal* V3,GReal* out,long long n){
+    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
+    double v1=V1[idx],v2=V2[idx],v3=V3[idx];out[idx]=v1*v1+v2*v2+v3*v3;}
 static __device__ __forceinline__ double kx_fold(int gi){return gi<=d_NX/2?(double)gi:(double)(gi-d_NX);}
 static __device__ __forceinline__ double ky_fold(int gj){return gj<=d_NY/2?(double)gj:(double)(gj-d_NY);}
 __global__ void kernel_compute_rot(const GCplx* V1,const GCplx* V2,const GCplx* V3,GCplx* R1,GCplx* R2,GCplx* R3,int lo0,int lo1,int lo2,int s0,int s1,int s2,long long n){
@@ -119,6 +134,12 @@ __global__ void kernel_add_rhs(GCplx* r1,GCplx* r2,GCplx* r3,const GCplx* v1,con
     r1[idx].x+=v1[idx].x+f1[idx].x;r1[idx].y+=v1[idx].y+f1[idx].y;
     r2[idx].x+=v2[idx].x+f2[idx].x;r2[idx].y+=v2[idx].y+f2[idx].y;
     r3[idx].x+=v3[idx].x+f3[idx].x;r3[idx].y+=v3[idx].y+f3[idx].y;}
+// bench mode (f = 0): rhs += visc
+__global__ void kernel_add_visc_rhs(GCplx* r1,GCplx* r2,GCplx* r3,const GCplx* v1,const GCplx* v2,const GCplx* v3,long long n){
+    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
+    r1[idx].x+=v1[idx].x;r1[idx].y+=v1[idx].y;
+    r2[idx].x+=v2[idx].x;r2[idx].y+=v2[idx].y;
+    r3[idx].x+=v3[idx].x;r3[idx].y+=v3[idx].y;}
 __global__ void kernel_rk4_axpy(GCplx* V1,GCplx* V2,GCplx* V3,const GCplx* o1,const GCplx* o2,const GCplx* o3,const GCplx* k1,const GCplx* k2,const GCplx* k3,double a,long long n){
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
     V1[idx].x=o1[idx].x+a*k1[idx].x;V1[idx].y=o1[idx].y+a*k1[idx].y;
@@ -147,17 +168,19 @@ struct BoxGPU{int lo[3],sz[3];long long n()const{return(long long)sz[0]*sz[1]*sz
 static BoxGPU make_box(const heffte::box3d<>& b){BoxGPU bg;for(int d=0;d<3;d++){bg.lo[d]=b.low[d];bg.sz[d]=b.size[d];}return bg;}
 
 struct GPUArrays{
-    GReal *V1_r,*V2_r,*V3_r,*rot1_r,*rot2_r,*rot3_r,*work1_r,*work2_r,*work3_r,*scratch;
+    GReal *V1_r,*V2_r,*V3_r,*rot1_r,*rot2_r,*rot3_r,*scratch;
+    GReal *work1_r=nullptr,*work2_r=nullptr,*work3_r=nullptr;   // forcing only (verify)
     GCplx *V1_c,*V2_c,*V3_c,*rot1_c,*rot2_c,*rot3_c;
-    GCplx *visc1_c,*visc2_c,*visc3_c,*f1_c,*f2_c,*f3_c;
+    GCplx *visc1_c,*visc2_c,*visc3_c;
+    GCplx *f1_c=nullptr,*f2_c=nullptr,*f3_c=nullptr;             // forcing only (verify)
     GCplx *k1v1,*k1v2,*k1v3,*k2v1,*k2v2,*k2v3,*k3v1,*k3v2,*k3v3,*k4v1,*k4v2,*k4v3;
     GCplx *tmp1_c,*tmp2_c,*tmp3_c,*div_c;
 };
 static void alloc_arrays(GPUArrays& g,long long nr,long long nc){
     gm(&g.V1_r,nr);gm(&g.V2_r,nr);gm(&g.V3_r,nr);gm(&g.rot1_r,nr);gm(&g.rot2_r,nr);gm(&g.rot3_r,nr);
-    gm(&g.work1_r,nr);gm(&g.work2_r,nr);gm(&g.work3_r,nr);gm(&g.scratch,max(nr,nc));
+    if(g_with_force){gm(&g.work1_r,nr);gm(&g.work2_r,nr);gm(&g.work3_r,nr);}gm(&g.scratch,max(nr,nc));
     gm(&g.V1_c,nc);gm(&g.V2_c,nc);gm(&g.V3_c,nc);gm(&g.rot1_c,nc);gm(&g.rot2_c,nc);gm(&g.rot3_c,nc);
-    gm(&g.visc1_c,nc);gm(&g.visc2_c,nc);gm(&g.visc3_c,nc);gm(&g.f1_c,nc);gm(&g.f2_c,nc);gm(&g.f3_c,nc);
+    gm(&g.visc1_c,nc);gm(&g.visc2_c,nc);gm(&g.visc3_c,nc);if(g_with_force){gm(&g.f1_c,nc);gm(&g.f2_c,nc);gm(&g.f3_c,nc);}
     gm(&g.k1v1,nc);gm(&g.k1v2,nc);gm(&g.k1v3,nc);gm(&g.k2v1,nc);gm(&g.k2v2,nc);gm(&g.k2v3,nc);
     gm(&g.k3v1,nc);gm(&g.k3v2,nc);gm(&g.k3v3,nc);gm(&g.k4v1,nc);gm(&g.k4v2,nc);gm(&g.k4v3,nc);
     gm(&g.tmp1_c,nc);gm(&g.tmp2_c,nc);gm(&g.tmp3_c,nc);gm(&g.div_c,nc);}
@@ -179,49 +202,67 @@ template<typename FFT>
 static void compute_nonlinear(FFT& fft,GPUArrays& g,GCplx* nl1,GCplx* nl2,GCplx* nl3,const BoxGPU& br,const BoxGPU& bc,std::complex<double>* ws){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
     kernel_compute_rot<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.rot1_c,g.rot2_c,g.rot3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
+    g_timer.mark(PH_SPEC);
     heffte_bwd(fft,g.V1_c,g.V1_r,ws);heffte_bwd(fft,g.V2_c,g.V2_r,ws);heffte_bwd(fft,g.V3_c,g.V3_r,ws);
     heffte_bwd(fft,g.rot1_c,g.rot1_r,ws);heffte_bwd(fft,g.rot2_c,g.rot2_r,ws);heffte_bwd(fft,g.rot3_c,g.rot3_r,ws);
+    g_timer.mark(PH_FFT);
     kernel_cross_product<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.rot1_r,g.rot2_r,g.rot3_r,br.n());
-    heffte_fwd(fft,g.rot1_r,nl1,ws);heffte_fwd(fft,g.rot2_r,nl2,ws);heffte_fwd(fft,g.rot3_r,nl3,ws);}
+    g_timer.mark(PH_PHYS);
+    heffte_fwd(fft,g.rot1_r,nl1,ws);heffte_fwd(fft,g.rot2_r,nl2,ws);heffte_fwd(fft,g.rot3_r,nl3,ws);
+    g_timer.mark(PH_FFT);}
 template<typename FFT>
 static void compute_rhs(FFT& fft,GPUArrays& g,GCplx* r1,GCplx* r2,GCplx* r3,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V1_c,g.visc1_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V2_c,g.visc2_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     kernel_compute_viscous<<<gc,BLOCK>>>(g.V3_c,g.visc3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
+    g_timer.mark(PH_SPEC);
     compute_nonlinear(fft,g,r1,r2,r3,br,bc,ws);
-    kernel_fill_forcing<<<gr,BLOCK>>>(g.work1_r,g.work2_r,g.work3_r,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
-    heffte_fwd(fft,g.work1_r,g.f1_c,ws);heffte_fwd(fft,g.work2_r,g.f2_c,ws);heffte_fwd(fft,g.work3_r,g.f3_c,ws);
-    kernel_add_rhs<<<gc,BLOCK>>>(r1,r2,r3,g.visc1_c,g.visc2_c,g.visc3_c,g.f1_c,g.f2_c,g.f3_c,bc.n());
-    kernel_make_div_free<<<gc,BLOCK>>>(r1,r2,r3,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());}
+    if(g_with_force){   // forcing [verify only]
+        kernel_fill_forcing<<<gr,BLOCK>>>(g.work1_r,g.work2_r,g.work3_r,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
+        heffte_fwd(fft,g.work1_r,g.f1_c,ws);heffte_fwd(fft,g.work2_r,g.f2_c,ws);heffte_fwd(fft,g.work3_r,g.f3_c,ws);
+        g_timer.mark(PH_FORCE);
+        kernel_add_rhs<<<gc,BLOCK>>>(r1,r2,r3,g.visc1_c,g.visc2_c,g.visc3_c,g.f1_c,g.f2_c,g.f3_c,bc.n());
+    }else{              // bench mode (f = 0): rhs += visc
+        kernel_add_visc_rhs<<<gc,BLOCK>>>(r1,r2,r3,g.visc1_c,g.visc2_c,g.visc3_c,bc.n());
+    }
+    kernel_make_div_free<<<gc,BLOCK>>>(r1,r2,r3,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
+    g_timer.mark(PH_SPEC);}
 template<typename FFT>
 static void rk4_step(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
     long long nc=bc.n();int gc=bc.grid(BLOCK);
     CUDA_CHECK(cudaMemcpy(g.tmp1_c,g.V1_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.tmp2_c,g.V2_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.tmp3_c,g.V3_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
+    g_timer.mark(PH_SPEC);
     compute_rhs(fft,g,g.k1v1,g.k1v2,g.k1v3,br,bc,t,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k1v1,g.k1v2,g.k1v3,0.5*TAU,nc);
+    g_timer.mark(PH_SPEC);
     compute_rhs(fft,g,g.k2v1,g.k2v2,g.k2v3,br,bc,t+0.5*TAU,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k2v1,g.k2v2,g.k2v3,0.5*TAU,nc);
+    g_timer.mark(PH_SPEC);
     compute_rhs(fft,g,g.k3v1,g.k3v2,g.k3v3,br,bc,t+0.5*TAU,ws);
     kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,g.k3v1,g.k3v2,g.k3v3,TAU,nc);
+    g_timer.mark(PH_SPEC);
     compute_rhs(fft,g,g.k4v1,g.k4v2,g.k4v3,br,bc,t+TAU,ws);
     kernel_rk4_update<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.tmp1_c,g.tmp2_c,g.tmp3_c,
         g.k1v1,g.k2v1,g.k3v1,g.k4v1,g.k1v2,g.k2v2,g.k3v2,g.k4v2,
-        g.k1v3,g.k2v3,g.k3v3,g.k4v3,TAU/6.,nc);}
+        g.k1v3,g.k2v3,g.k3v3,g.k4v3,TAU/6.,nc);
+    g_timer.mark(PH_SPEC);}
+// Returns {L2 error (verify) or kinetic energy 0.5*sum|v|^2 (bench), max|div V|}
 template<typename FFT>
-static pair<double,double> compute_diagnostics(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws){
+static pair<double,double> compute_diagnostics(FFT& fft,GPUArrays& g,const BoxGPU& br,const BoxGPU& bc,double t,std::complex<double>* ws,bool verify){
     int gc=bc.grid(BLOCK),gr=br.grid(BLOCK);
     heffte_bwd(fft,g.V1_c,g.V1_r,ws);heffte_bwd(fft,g.V2_c,g.V2_r,ws);heffte_bwd(fft,g.V3_c,g.V3_r,ws);
-    kernel_error_sq<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.scratch,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
+    if(verify) kernel_error_sq<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.scratch,br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
+    else       kernel_energy_sq<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,g.scratch,br.n());
     thrust::device_ptr<double> sp(g.scratch);
     double le=thrust::reduce(thrust::device,sp,sp+br.n()),ge;
     MPI_Reduce(&le,&ge,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
     kernel_div_abs<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,g.scratch,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     double ld=thrust::reduce(thrust::device,sp,sp+bc.n(),0.,thrust::maximum<double>()),gd;
     MPI_Reduce(&ld,&gd,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-    return{sqrt(ge*DX*DY*DZ),gd};}
+    return{verify?sqrt(ge*DX*DY*DZ):0.5*ge,gd};}
 
 // ============================================================
 // Main
@@ -233,9 +274,19 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
 
     if (argc < 6) {
-        if (rank==0) fprintf(stderr,"Usage: %s NX NY NZ dt NSTEPS\n",argv[0]);
+        if (rank==0) fprintf(stderr,"Usage: %s %s\n",argv[0],nsmode::usage_tail(false));
         MPI_Abort(MPI_COMM_WORLD,1);
     }
+    nsmode::RunArgs rargs;
+    {
+        std::string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/false, rargs, perr)) {
+            if (rank==0) fprintf(stderr,"Error: %s\nUsage: %s %s\n",perr.c_str(),argv[0],nsmode::usage_tail(false));
+            MPI_Abort(MPI_COMM_WORLD,1);
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
     NX=atoi(argv[1]); NY=atoi(argv[2]); NZ=atoi(argv[3]);
     TAU=atof(argv[4]); NT_RUN=atoi(argv[5]);
     NT_TOTAL=NT_RUN;
@@ -273,6 +324,8 @@ int main(int argc, char** argv) {
         cout << "  Navier-Stokes — heFFTe cuFFT Backend, Multi-Node Multi-GPU\n";
         cout << "============================================================\n";
         cout << "Total MPI ranks: " << nprocs << "  GPUs per node: " << local_size << "\n";
+        cout << "Run mode: " << nsmode::mode_name(mode)
+             << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
     }
     if (rank==0) cout << "  Rank " << rank << " → local GPU " << local_rank << " (" << prop.name << ")\n";
     MPI_Barrier(MPI_COMM_WORLD);
@@ -311,28 +364,43 @@ int main(int argc, char** argv) {
     heffte_fwd(fft,g.V1_r,g.V1_c,d_ws);heffte_fwd(fft,g.V2_r,g.V2_c,d_ws);heffte_fwd(fft,g.V3_r,g.V3_c,d_ws);
     kernel_make_div_free<<<bc.grid(BLOCK),BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],nc);
 
+    g_timer.init();
     double t_wall=0.;
     for(int it=0;it<NT_RUN;++it){
         double tc=it*TAU;
         double t0=MPI_Wtime();
+        g_timer.start();
         rk4_step(fft,g,br,bc,tc,d_ws);
         CUDA_CHECK(cudaDeviceSynchronize());
+        g_timer.collect();
         double dt=MPI_Wtime()-t0,dtmax;
         MPI_Allreduce(&dt,&dtmax,1,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
         t_wall+=dtmax;
     }
-    {
+    double phase_max[nsmode::PH_COUNT];
+    nsmode::reduce_phases_max(g_timer.acc, phase_max);
+    g_timer.destroy();
+    {   // diagnostics (not timed)
         double t_final=NT_RUN*TAU;
-        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final,d_ws);
-        if(rank==0)
-            cout<<"  L2 error (t="<<fixed<<setprecision(6)<<t_final<<"): "
-                <<scientific<<setprecision(4)<<e<<"\n";
+        const bool verify=(mode==nsmode::MODE_VERIFY);
+        auto [e,d]=compute_diagnostics(fft,g,br,bc,t_final,d_ws,verify);
+        if(rank==0){
+            if(verify)
+                cout<<"  L2 error (t="<<fixed<<setprecision(6)<<t_final<<"): "
+                    <<scientific<<setprecision(4)<<e<<"\n";
+            else
+                cout<<"  Kinetic energy 0.5*sum|v|^2 (t="<<fixed<<setprecision(6)<<t_final<<"): "
+                    <<scientific<<setprecision(10)<<e<<"\n";
+            cout<<"  max|div V| (t="<<fixed<<setprecision(6)<<t_final<<"): "
+                <<scientific<<setprecision(4)<<d<<"\n";
+        }
     }
     if(rank==0){cout<<"============================================================\n"
                     <<"  Total steps:     "<<NT_RUN<<"\n"
                     <<"  Total wall time: "<<fixed<<setprecision(4)<<t_wall<<" s\n"
-                    <<"  Avg per step:    "<<t_wall/NT_RUN<<" s\n"
-                    <<"============================================================\n";}
+                    <<"  Avg per step:    "<<t_wall/NT_RUN<<" s\n"<<flush;
+                nsmode::print_phase_summary(phase_max,t_wall,NT_RUN,mode);
+                cout<<"============================================================\n";}
     free_arrays(g);
     cudaFree(d_ws);
     }
