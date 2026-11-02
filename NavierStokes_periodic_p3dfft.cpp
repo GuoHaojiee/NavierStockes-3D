@@ -24,8 +24,16 @@
 #include <omp.h>
 #include <fftw3.h>
 #include <p3dfft.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// 运行模式与分阶段计时（见 common_mode.h）
+//   g_with_force = true  (verify)：每次 RHS 计算解析外力 f（原始行为）
+//   g_with_force = false (bench) ：f = 0，跳过外力填充、3 次正向 FFT 与相加
+static bool g_with_force = true;
+static nsmode::CpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 // ==============================================================================
 // 解析解与强迫项（与 FFTW 版本完全一致）
@@ -324,6 +332,7 @@ void compute_nonlinear(const P3DCtx& ctx,
 
     // 1. 频谱空间计算旋度（rot_c = ik × V_c，非归一化）
     compute_rot(ctx, V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c);
+    g_timer.mark(PH_SPEC);
 
     // 2. 逆变换到实空间（btran_c2r 会破坏输入，必须先复制）
     //    结果为 N * V_phys，除以 N 得到物理值
@@ -336,6 +345,7 @@ void compute_nonlinear(const P3DCtx& ctx,
     Cp3dfft_btran_c2r(reinterpret_cast<double*>(rot1_tmp.data()), rot1_r.data(), op_b);
     Cp3dfft_btran_c2r(reinterpret_cast<double*>(rot2_tmp.data()), rot2_r.data(), op_b);
     Cp3dfft_btran_c2r(reinterpret_cast<double*>(rot3_tmp.data()), rot3_r.data(), op_b);
+    g_timer.mark(PH_FFT);   // 含 btran 前保护输入的复制（库会破坏输入）
 
     // btran_c2r 输出 = N * V_phys，除以 N 得到物理值
     double inv_n = ctx.norm_inv;
@@ -366,11 +376,13 @@ void compute_nonlinear(const P3DCtx& ctx,
             }
         }
     }
+    g_timer.mark(PH_PHYS);
 
     // 4. 正变换回频谱空间（不归一化，nl_c = DFT(cross) = N * FFT_norm(cross)）
     Cp3dfft_ftran_r2c(rot1_r.data(), reinterpret_cast<double*>(nl1_c.data()), op_f);
     Cp3dfft_ftran_r2c(rot2_r.data(), reinterpret_cast<double*>(nl2_c.data()), op_f);
     Cp3dfft_ftran_r2c(rot3_r.data(), reinterpret_cast<double*>(nl3_c.data()), op_f);
+    g_timer.mark(PH_FFT);
 }
 
 // ==============================================================================
@@ -421,39 +433,52 @@ void compute_rhs(const P3DCtx& ctx,
     compute_viscous(ctx, V1_c, visc1_c);
     compute_viscous(ctx, V2_c, visc2_c);
     compute_viscous(ctx, V3_c, visc3_c);
+    g_timer.mark(PH_SPEC);
 
-    // 3. 外力项 f（实空间 → 频谱空间，不归一化）
-    // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
-    #pragma omp parallel for collapse(3)
-    for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
-        for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
-            for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
-                size_t idx = idx_r(ctx, i, j, k);
-                double x = phys_x(ctx, i, dx);
-                double y = phys_y(ctx, j, dy);
-                double z = phys_z(ctx, k, dz);
-                work_r1[idx] = func_f1(x, y, z, t);
-                work_r2[idx] = func_f2(x, y, z, t);
-                work_r3[idx] = func_f3(x, y, z, t);
+    size_t nc = static_cast<size_t>(ctx.fsize[0]) * ctx.fsize[1] * ctx.fsize[2];
+    if (g_with_force) {
+        // 3. 外力项 f（实空间 → 频谱空间，不归一化）[仅 verify]
+        // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
+        #pragma omp parallel for collapse(3)
+        for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+            for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
+                for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+                    size_t idx = idx_r(ctx, i, j, k);
+                    double x = phys_x(ctx, i, dx);
+                    double y = phys_y(ctx, j, dy);
+                    double z = phys_z(ctx, k, dz);
+                    work_r1[idx] = func_f1(x, y, z, t);
+                    work_r2[idx] = func_f2(x, y, z, t);
+                    work_r3[idx] = func_f3(x, y, z, t);
+                }
             }
         }
-    }
-    // f_c = DFT(f) = N * FFT_norm(f)，与 V_c, nl_c, visc_c 约定一致（不归一化）
-    Cp3dfft_ftran_r2c(work_r1.data(), reinterpret_cast<double*>(f1_c.data()), op_f);
-    Cp3dfft_ftran_r2c(work_r2.data(), reinterpret_cast<double*>(f2_c.data()), op_f);
-    Cp3dfft_ftran_r2c(work_r3.data(), reinterpret_cast<double*>(f3_c.data()), op_f);
+        // f_c = DFT(f) = N * FFT_norm(f)，与 V_c, nl_c, visc_c 约定一致（不归一化）
+        Cp3dfft_ftran_r2c(work_r1.data(), reinterpret_cast<double*>(f1_c.data()), op_f);
+        Cp3dfft_ftran_r2c(work_r2.data(), reinterpret_cast<double*>(f2_c.data()), op_f);
+        Cp3dfft_ftran_r2c(work_r3.data(), reinterpret_cast<double*>(f3_c.data()), op_f);
+        g_timer.mark(PH_FORCE);
 
-    // 4. 组合各项：RHS = v×rot(v) + P∆V + f（均为非归一化 DFT）
-    size_t nc = static_cast<size_t>(ctx.fsize[0]) * ctx.fsize[1] * ctx.fsize[2];
-    #pragma omp parallel for
-    for (size_t idx = 0; idx < nc; ++idx) {
-        rhs1_c[idx] = nl1_c[idx] + visc1_c[idx] + f1_c[idx];
-        rhs2_c[idx] = nl2_c[idx] + visc2_c[idx] + f2_c[idx];
-        rhs3_c[idx] = nl3_c[idx] + visc3_c[idx] + f3_c[idx];
+        // 4. 组合各项：RHS = v×rot(v) + P∆V + f（均为非归一化 DFT）
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < nc; ++idx) {
+            rhs1_c[idx] = nl1_c[idx] + visc1_c[idx] + f1_c[idx];
+            rhs2_c[idx] = nl2_c[idx] + visc2_c[idx] + f2_c[idx];
+            rhs3_c[idx] = nl3_c[idx] + visc3_c[idx] + f3_c[idx];
+        }
+    } else {
+        // 4'. bench 模式（f = 0）：RHS = v×rot(v) + P∆V
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < nc; ++idx) {
+            rhs1_c[idx] = nl1_c[idx] + visc1_c[idx];
+            rhs2_c[idx] = nl2_c[idx] + visc2_c[idx];
+            rhs3_c[idx] = nl3_c[idx] + visc3_c[idx];
+        }
     }
 
     // 5. 投影：使 RHS 无散（P 算子）
     make_div_free(ctx, rhs1_c, rhs2_c, rhs3_c, div_c, phi_c);
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -494,6 +519,7 @@ void rk4_step(const P3DCtx& ctx,
         tmp_v2[i] = V2_c[i] + 0.5 * dt * k1_v2[i];
         tmp_v3[i] = V3_c[i] + 0.5 * dt * k1_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k2 = RHS(V^n + dt/2 * k1, t + dt/2)
     compute_rhs(ctx, tmp_v1, tmp_v2, tmp_v3, k2_v1, k2_v2, k2_v3,
@@ -508,6 +534,7 @@ void rk4_step(const P3DCtx& ctx,
         tmp_v2[i] = V2_c[i] + 0.5 * dt * k2_v2[i];
         tmp_v3[i] = V3_c[i] + 0.5 * dt * k2_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k3 = RHS(V^n + dt/2 * k2, t + dt/2)
     compute_rhs(ctx, tmp_v1, tmp_v2, tmp_v3, k3_v1, k3_v2, k3_v3,
@@ -522,6 +549,7 @@ void rk4_step(const P3DCtx& ctx,
         tmp_v2[i] = V2_c[i] + dt * k3_v2[i];
         tmp_v3[i] = V3_c[i] + dt * k3_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k4 = RHS(V^n + dt * k3, t + dt)
     compute_rhs(ctx, tmp_v1, tmp_v2, tmp_v3, k4_v1, k4_v2, k4_v3,
@@ -537,6 +565,7 @@ void rk4_step(const P3DCtx& ctx,
         V2_c[i] += (dt / 6.0) * (k1_v2[i] + 2.0 * k2_v2[i] + 2.0 * k3_v2[i] + k4_v2[i]);
         V3_c[i] += (dt / 6.0) * (k1_v3[i] + 2.0 * k2_v3[i] + 2.0 * k3_v3[i] + k4_v3[i]);
     }
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -551,16 +580,27 @@ int main(int argc, char** argv) {
 
     if (argc < 6) {
         if (rank == 0) {
-            cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS [OMP_threads]\n";
-            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100\n";
+            cerr << "Usage: " << argv[0] << " " << nsmode::usage_tail(true) << "\n";
+            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100 4 bench\n";
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    nsmode::RunArgs rargs;
+    {
+        string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/true, rargs, perr)) {
+            if (rank == 0) cerr << "Error: " << perr << "\nUsage: " << argv[0] << " "
+                                << nsmode::usage_tail(true) << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
 
     int nx = atoi(argv[1]), ny = atoi(argv[2]), nz = atoi(argv[3]);
     double dt = atof(argv[4]);
     int nt_run = atoi(argv[5]);
-    int nthreads = (argc > 6) ? atoi(argv[6]) : omp_get_max_threads();
+    int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
 
     const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;
     double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
@@ -593,6 +633,8 @@ int main(int argc, char** argv) {
         cout << "MPI processes: " << nprocs
              << " (2D grid " << dims[0] << "x" << dims[1] << ")\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
+        cout << "Run mode: " << nsmode::mode_name(mode)
+             << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
     }
 
@@ -641,13 +683,16 @@ int main(int argc, char** argv) {
     vector<double>               V1_r(local_size_r), V2_r(local_size_r), V3_r(local_size_r);
     vector<complex<double>>      V1_c(local_size_c), V2_c(local_size_c), V3_c(local_size_c);
 
-    vector<double>               work_r1(local_size_r), work_r2(local_size_r), work_r3(local_size_r);
+    // 外力缓冲（work_r 实空间 + f_c 频谱）仅 verify 模式分配；只在 compute_rhs 的外力分支中使用
+    const size_t force_r = g_with_force ? local_size_r : 0;
+    const size_t force_c = g_with_force ? local_size_c : 0;
+    vector<double>               work_r1(force_r), work_r2(force_r), work_r3(force_r);
     vector<double>               rot1_r(local_size_r), rot2_r(local_size_r), rot3_r(local_size_r);
 
     vector<complex<double>>      rot1_c(local_size_c), rot2_c(local_size_c), rot3_c(local_size_c);
     vector<complex<double>>      nl1_c(local_size_c), nl2_c(local_size_c), nl3_c(local_size_c);
     vector<complex<double>>      visc1_c(local_size_c), visc2_c(local_size_c), visc3_c(local_size_c);
-    vector<complex<double>>      f1_c(local_size_c), f2_c(local_size_c), f3_c(local_size_c);
+    vector<complex<double>>      f1_c(force_c), f2_c(force_c), f3_c(force_c);
     vector<complex<double>>      div_c(local_size_c), phi_c(local_size_c);
 
     vector<complex<double>>      k1_v1(local_size_c), k1_v2(local_size_c), k1_v3(local_size_c);
@@ -687,8 +732,8 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 误差计算辅助函数
     // ------------------------------------------------------------------
-    auto compute_error = [&](double time) -> pair<double, double> {
-        // btran_c2r 会破坏输入，必须复制
+    // V_c → V_r（物理值；btran_c2r 会破坏输入，必须复制）
+    auto to_physical = [&]() {
         vector<complex<double>> c1(V1_c), c2(V2_c), c3(V3_c);
         unsigned char op_b[] = "tff";
         Cp3dfft_btran_c2r(reinterpret_cast<double*>(c1.data()), V1_r.data(), op_b);
@@ -704,7 +749,10 @@ int main(int argc, char** argv) {
             V2_r[idx] *= inv_n;
             V3_r[idx] *= inv_n;
         }
+    };
 
+    auto compute_error = [&](double time) -> pair<double, double> {
+        to_physical();
         // 循环顺序 k(z)→j(y)→i(x)：x 最内层，stride=1，缓存友好。
         double local_err = 0.0, local_max = 0.0;
         for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
@@ -729,6 +777,24 @@ int main(int argc, char** argv) {
         return {sqrt(global_err * dx * dy * dz), global_max};
     };
 
+    // 总动能 0.5·Σ|v|²（物理空间逐点求和，bench 模式下的结果合理性检查）
+    auto compute_energy = [&]() -> double {
+        to_physical();
+        double local_e = 0.0;
+        #pragma omp parallel for collapse(3) reduction(+:local_e)
+        for (int k = ctx.istart[2]; k <= ctx.iend[2]; ++k) {
+            for (int j = ctx.istart[1]; j <= ctx.iend[1]; ++j) {
+                for (int i = ctx.istart[0]; i <= ctx.iend[0]; ++i) {
+                    size_t idx = idx_r(ctx, i, j, k);
+                    local_e += V1_r[idx]*V1_r[idx] + V2_r[idx]*V2_r[idx] + V3_r[idx]*V3_r[idx];
+                }
+            }
+        }
+        double global_e = 0.0;
+        MPI_Reduce(&local_e, &global_e, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        return 0.5 * global_e;
+    };
+
     // ------------------------------------------------------------------
     // 时间推进（RK4）
     // ------------------------------------------------------------------
@@ -737,6 +803,7 @@ int main(int argc, char** argv) {
     for (ptrdiff_t it = 0; it < nt_run; ++it) {
         double t_cur = it * dt;
         double t0 = MPI_Wtime();
+        g_timer.start();
         rk4_step(ctx, V1_c, V2_c, V3_c,
                  V1_r, V2_r, V3_r,
                  work_r1, work_r2, work_r3,
@@ -758,12 +825,28 @@ int main(int argc, char** argv) {
         t_wall_total += global_step;
     }
 
+    double phase_max[nsmode::PH_COUNT];
+    nsmode::reduce_phases_max(g_timer.acc, phase_max);
+
+    // 以下诊断均不计入计时
     {
         double t_final = nt_run * dt;
-        auto [errL2, errLinf] = compute_error(t_final);
+        double max_div = compute_div_max(ctx, V1_c, V2_c, V3_c);
+        if (mode == nsmode::MODE_VERIFY) {
+            auto [errL2, errLinf] = compute_error(t_final);
+            (void)errLinf;
+            if (rank == 0)
+                cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(4) << errL2 << "\n";
+        } else {
+            double ekin = compute_energy();
+            if (rank == 0)
+                cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(10) << ekin << "\n";
+        }
         if (rank == 0)
-            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
-                 << scientific << setprecision(4) << errL2 << "\n";
+            cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << max_div << "\n";
     }
 
     if (rank == 0) {
@@ -773,6 +856,8 @@ int main(int argc, char** argv) {
         cout << "  Total steps:     " << nt_run << "\n";
         cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s\n";
         cout << "  Avg per step:    " << t_wall_total / nt_run << " s\n";
+        cout << flush;
+        nsmode::print_phase_summary(phase_max, t_wall_total, nt_run, mode);
         cout << "============================================================\n";
     }
 
