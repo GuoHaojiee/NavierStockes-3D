@@ -7,8 +7,17 @@
 #include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// Run mode / phase timing (see common_mode.h).
+//   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
+//   g_with_force = false (bench) : f = 0; forcing fill, its 3 FFTs and scaling are
+//                                  skipped; work*_r / f*_c are not allocated.
+static bool g_with_force = true;
+static nsmode::GpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 typedef cufftDoubleReal    GReal;
 typedef cufftDoubleComplex GCplx;
@@ -60,9 +69,9 @@ struct GPUArrays {
     GCplx *rot1_c, *rot2_c, *rot3_c;
     // Viscous term (spectral)
     GCplx *visc1_c, *visc2_c, *visc3_c;
-    // Forcing: real work arrays + spectral result
-    GReal *work1_r, *work2_r, *work3_r;
-    GCplx *f1_c, *f2_c, *f3_c;
+    // Forcing: real work arrays + spectral result (verify mode only; nullptr in bench)
+    GReal *work1_r = nullptr, *work2_r = nullptr, *work3_r = nullptr;
+    GCplx *f1_c = nullptr, *f2_c = nullptr, *f3_c = nullptr;
     // RK4 stages (k_i arrays, 4 stages × 3 components)
     GCplx *k1v1, *k1v2, *k1v3;
     GCplx *k2v1, *k2v2, *k2v3;
@@ -297,6 +306,20 @@ __global__ void kernel_add_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
     rhs3[idx].y += visc3[idx].y + f3[idx].y;
 }
 
+// bench mode (f = 0): rhs += visc
+__global__ void kernel_add_visc_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
+                                        const GCplx* visc1, const GCplx* visc2, const GCplx* visc3,
+                                        long long total) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    rhs1[idx].x += visc1[idx].x;
+    rhs1[idx].y += visc1[idx].y;
+    rhs2[idx].x += visc2[idx].x;
+    rhs2[idx].y += visc2[idx].y;
+    rhs3[idx].x += visc3[idx].x;
+    rhs3[idx].y += visc3[idx].y;
+}
+
 // RK4 intermediate: V = orig + alpha * k
 __global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
                                   const GCplx* orig1, const GCplx* orig2, const GCplx* orig3,
@@ -347,6 +370,15 @@ __global__ void kernel_error_sq(const GReal* V1_r, const GReal* V2_r, const GRea
     err_r[idx] = d1*d1 + d2*d2 + d3*d3;
 }
 
+// |v|^2 per grid point (bench-mode kinetic-energy diagnostic)
+__global__ void kernel_energy_sq(const GReal* V1_r, const GReal* V2_r, const GReal* V3_r,
+                                  GReal* e_r) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= d_NR) return;
+    double v1 = V1_r[idx], v2 = V2_r[idx], v3 = V3_r[idx];
+    e_r[idx] = v1*v1 + v2*v2 + v3*v3;
+}
+
 // Compute |ik·V_c| (spectral divergence magnitude) per mode
 __global__ void kernel_div_abs(const GCplx* V1_c, const GCplx* V2_c, const GCplx* V3_c,
                                 GReal* div_r) {
@@ -381,6 +413,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     // 1. Spectral vorticity (reads V_c)
     kernel_compute_rot<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c,
                                           g.rot1_c, g.rot2_c, g.rot3_c);
+    g_timer.mark(PH_SPEC);
     // 2. V_c → V_r (may destroy V_c)
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.V1_c, g.V1_r));
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.V2_c, g.V2_r));
@@ -389,16 +422,20 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.rot1_c, g.rot1_r));
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.rot2_c, g.rot2_r));
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.rot3_c, g.rot3_r));
+    g_timer.mark(PH_FFT);
     // 4. Real-space cross product V_r × rot_r → rot_r
     kernel_cross_product<<<GRID_R, BLOCK>>>(g.V1_r, g.V2_r, g.V3_r,
                                              g.rot1_r, g.rot2_r, g.rot3_r);
+    g_timer.mark(PH_PHYS);
     // 5. rot_r → rhs_c (as nl), normalize
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.rot1_r, rhs1_c));
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.rot2_r, rhs2_c));
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.rot3_r, rhs3_c));
+    g_timer.mark(PH_FFT);
     kernel_scale_cplx<<<GRID_C, BLOCK>>>(rhs1_c, NC_TOT, inv_N);
     kernel_scale_cplx<<<GRID_C, BLOCK>>>(rhs2_c, NC_TOT, inv_N);
     kernel_scale_cplx<<<GRID_C, BLOCK>>>(rhs3_c, NC_TOT, inv_N);
+    g_timer.mark(PH_SPEC);
 }
 
 // ============================================================
@@ -416,25 +453,34 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
     kernel_compute_viscous<<<GRID_C, BLOCK>>>(g.V1_c, g.visc1_c);
     kernel_compute_viscous<<<GRID_C, BLOCK>>>(g.V2_c, g.visc2_c);
     kernel_compute_viscous<<<GRID_C, BLOCK>>>(g.V3_c, g.visc3_c);
+    g_timer.mark(PH_SPEC);
 
     // 2. Nonlinear: V × rot(V) → rhs_c  (V_c destroyed inside)
     compute_nonlinear(plan_r2c, plan_c2r, g, rhs1_c, rhs2_c, rhs3_c);
 
-    // 3. Forcing: fill work_r, forward FFT, normalize
-    kernel_fill_forcing<<<GRID_R, BLOCK>>>(g.work1_r, g.work2_r, g.work3_r, t);
-    CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work1_r, g.f1_c));
-    CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work2_r, g.f2_c));
-    CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work3_r, g.f3_c));
-    kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f1_c, NC_TOT, inv_N);
-    kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f2_c, NC_TOT, inv_N);
-    kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f3_c, NC_TOT, inv_N);
+    if (g_with_force) {
+        // 3. Forcing: fill work_r, forward FFT, normalize  [verify only]
+        kernel_fill_forcing<<<GRID_R, BLOCK>>>(g.work1_r, g.work2_r, g.work3_r, t);
+        CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work1_r, g.f1_c));
+        CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work2_r, g.f2_c));
+        CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.work3_r, g.f3_c));
+        kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f1_c, NC_TOT, inv_N);
+        kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f2_c, NC_TOT, inv_N);
+        kernel_scale_cplx<<<GRID_C, BLOCK>>>(g.f3_c, NC_TOT, inv_N);
+        g_timer.mark(PH_FORCE);
 
-    // 4. Combine: rhs += visc + f  (rhs already has nl from step 2)
-    kernel_add_to_rhs<<<GRID_C, BLOCK>>>(rhs1_c, rhs2_c, rhs3_c,
-                                          g.visc1_c, g.visc2_c, g.visc3_c,
-                                          g.f1_c, g.f2_c, g.f3_c, NC_TOT);
+        // 4. Combine: rhs += visc + f  (rhs already has nl from step 2)
+        kernel_add_to_rhs<<<GRID_C, BLOCK>>>(rhs1_c, rhs2_c, rhs3_c,
+                                              g.visc1_c, g.visc2_c, g.visc3_c,
+                                              g.f1_c, g.f2_c, g.f3_c, NC_TOT);
+    } else {
+        // 4'. bench mode (f = 0): rhs += visc
+        kernel_add_visc_to_rhs<<<GRID_C, BLOCK>>>(rhs1_c, rhs2_c, rhs3_c,
+                                                   g.visc1_c, g.visc2_c, g.visc3_c, NC_TOT);
+    }
     // 5. Project: make rhs divergence-free
     kernel_make_div_free<<<GRID_C, BLOCK>>>(rhs1_c, rhs2_c, rhs3_c);
+    g_timer.mark(PH_SPEC);
 }
 
 // ============================================================
@@ -447,6 +493,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUDA_CHECK(cudaMemcpy(g.V1_c_orig, g.V1_c, NC_TOT * sizeof(GCplx), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.V2_c_orig, g.V2_c, NC_TOT * sizeof(GCplx), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.V3_c_orig, g.V3_c, NC_TOT * sizeof(GCplx), cudaMemcpyDeviceToDevice));
+    g_timer.mark(PH_SPEC);
 
     // k1 = RHS(V^n, t)  — V_c destroyed inside
     compute_rhs(plan_r2c, plan_c2r, g, g.k1v1, g.k1v2, g.k1v3, t);
@@ -455,6 +502,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
     kernel_rk4_axpy<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c,
                                         g.V1_c_orig, g.V2_c_orig, g.V3_c_orig,
                                         g.k1v1, g.k1v2, g.k1v3, 0.5*TAU, NC_TOT);
+    g_timer.mark(PH_SPEC);
 
     // k2 = RHS(V^n + τ/2*k1, t + τ/2)
     compute_rhs(plan_r2c, plan_c2r, g, g.k2v1, g.k2v2, g.k2v3, t + 0.5*TAU);
@@ -463,6 +511,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
     kernel_rk4_axpy<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c,
                                         g.V1_c_orig, g.V2_c_orig, g.V3_c_orig,
                                         g.k2v1, g.k2v2, g.k2v3, 0.5*TAU, NC_TOT);
+    g_timer.mark(PH_SPEC);
 
     // k3 = RHS(V^n + τ/2*k2, t + τ/2)
     compute_rhs(plan_r2c, plan_c2r, g, g.k3v1, g.k3v2, g.k3v3, t + 0.5*TAU);
@@ -471,6 +520,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
     kernel_rk4_axpy<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c,
                                         g.V1_c_orig, g.V2_c_orig, g.V3_c_orig,
                                         g.k3v1, g.k3v2, g.k3v3, TAU, NC_TOT);
+    g_timer.mark(PH_SPEC);
 
     // k4 = RHS(V^n + τ*k3, t + τ)
     compute_rhs(plan_r2c, plan_c2r, g, g.k4v1, g.k4v2, g.k4v3, t + TAU);
@@ -483,17 +533,19 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
         g.k1v2, g.k2v2, g.k3v2, g.k4v2,
         g.k1v3, g.k2v3, g.k3v3, g.k4v3,
         TAU / 6.0, NC_TOT);
+    g_timer.mark(PH_SPEC);
 }
 
 // ============================================================
-// Diagnostics: L2 error and max|div V|
+// Diagnostics: L2 error (verify) or kinetic energy 0.5*sum|v|^2 (bench),
+// and max|div V|.
 //
 // V_c is destroyed by Z2D then restored by D2Z+scale.
 // After this call V_c is consistent with V_r (to FFT round-trip precision).
 // ============================================================
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
-                                 GPUArrays& g, double t,
-                                 double& L2_err, double& max_div) {
+                                 GPUArrays& g, double t, bool verify,
+                                 double& L2_or_energy, double& max_div) {
     const double inv_N = 1.0 / (double)(NX * NY * NZ);
 
     // 1. V_c → V_r (Z2D, may destroy V_c)
@@ -501,11 +553,14 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.V2_c, g.V2_r));
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.V3_c, g.V3_r));
 
-    // 2. Squared error → d_scratch, then reduce
-    kernel_error_sq<<<GRID_R, BLOCK>>>(g.V1_r, g.V2_r, g.V3_r, g.d_scratch, t);
+    // 2. Squared error (verify) or |v|^2 (bench) → d_scratch, then reduce
+    if (verify)
+        kernel_error_sq<<<GRID_R, BLOCK>>>(g.V1_r, g.V2_r, g.V3_r, g.d_scratch, t);
+    else
+        kernel_energy_sq<<<GRID_R, BLOCK>>>(g.V1_r, g.V2_r, g.V3_r, g.d_scratch);
     thrust::device_ptr<double> sp(g.d_scratch);
-    double err_sq = thrust::reduce(thrust::device, sp, sp + NR, 0.0);
-    L2_err = sqrt(err_sq * DX * DY * DZ);
+    double sq = thrust::reduce(thrust::device, sp, sp + NR, 0.0);
+    L2_or_energy = verify ? sqrt(sq * DX * DY * DZ) : 0.5 * sq;
 
     // 3. Restore V_c: V_r → V_c (D2Z) + normalize
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.V1_r, g.V1_c));
@@ -526,10 +581,21 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // ============================================================
 int main(int argc, char** argv) {
     if (argc < 6) {
-        cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS" << endl;
-        cerr << "  Example: " << argv[0] << " 64 64 64 0.00001 100" << endl;
+        cerr << "Usage: " << argv[0] << " " << nsmode::usage_tail(false) << endl;
+        cerr << "  Example: " << argv[0] << " 64 64 64 0.00001 100 bench" << endl;
         return 1;
     }
+    nsmode::RunArgs rargs;
+    {
+        std::string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/false, rargs, perr)) {
+            cerr << "Error: " << perr << "\nUsage: " << argv[0] << " "
+                 << nsmode::usage_tail(false) << endl;
+            return 1;
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
 
     // Parse command-line parameters
     NX = atoi(argv[1]); NY = atoi(argv[2]); NZ = atoi(argv[3]);
@@ -563,10 +629,13 @@ int main(int argc, char** argv) {
     cout << "GPU: " << prop.name << endl;
     printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
     cout << "Domain: [0, 2π]³" << endl;
+    cout << "Run mode: " << nsmode::mode_name(mode)
+         << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
 
-    // Memory estimate
-    double mem_mb = (10.0 * NR * sizeof(GReal)
-                    + 27.0 * NC_TOT * sizeof(GCplx)) / (1024.0 * 1024.0);
+    // Memory estimate (bench: no work*_r / f*_c)
+    double n_real = g_with_force ? 10.0 : 7.0, n_cplx = g_with_force ? 27.0 : 24.0;
+    double mem_mb = (n_real * NR * sizeof(GReal)
+                    + n_cplx * NC_TOT * sizeof(GCplx)) / (1024.0 * 1024.0);
     cout << "GPU memory (arrays): " << fixed << setprecision(1) << mem_mb << " MB" << endl;
     cout << "============================================================" << endl;
 
@@ -581,13 +650,17 @@ int main(int argc, char** argv) {
     GPUArrays g;
     gmalloc(&g.V1_r,  NR);   gmalloc(&g.V2_r,  NR);   gmalloc(&g.V3_r,  NR);
     gmalloc(&g.rot1_r,NR);   gmalloc(&g.rot2_r,NR);   gmalloc(&g.rot3_r,NR);
-    gmalloc(&g.work1_r,NR);  gmalloc(&g.work2_r,NR);  gmalloc(&g.work3_r,NR);
+    if (g_with_force) {  // forcing-only buffers
+        gmalloc(&g.work1_r,NR);  gmalloc(&g.work2_r,NR);  gmalloc(&g.work3_r,NR);
+    }
     gmalloc(&g.d_scratch,NR);
 
     gmalloc(&g.V1_c,    NC_TOT); gmalloc(&g.V2_c,    NC_TOT); gmalloc(&g.V3_c,    NC_TOT);
     gmalloc(&g.rot1_c,  NC_TOT); gmalloc(&g.rot2_c,  NC_TOT); gmalloc(&g.rot3_c,  NC_TOT);
     gmalloc(&g.visc1_c, NC_TOT); gmalloc(&g.visc2_c, NC_TOT); gmalloc(&g.visc3_c, NC_TOT);
-    gmalloc(&g.f1_c,    NC_TOT); gmalloc(&g.f2_c,    NC_TOT); gmalloc(&g.f3_c,    NC_TOT);
+    if (g_with_force) {  // forcing-only buffers
+        gmalloc(&g.f1_c,    NC_TOT); gmalloc(&g.f2_c,    NC_TOT); gmalloc(&g.f3_c,    NC_TOT);
+    }
     gmalloc(&g.k1v1,    NC_TOT); gmalloc(&g.k1v2,    NC_TOT); gmalloc(&g.k1v3,    NC_TOT);
     gmalloc(&g.k2v1,    NC_TOT); gmalloc(&g.k2v2,    NC_TOT); gmalloc(&g.k2v3,    NC_TOT);
     gmalloc(&g.k3v1,    NC_TOT); gmalloc(&g.k3v2,    NC_TOT); gmalloc(&g.k3v3,    NC_TOT);
@@ -619,24 +692,37 @@ int main(int argc, char** argv) {
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
+    g_timer.init();
 
     for (int it = 0; it < NT_RUN; ++it) {
         double t_cur = it * TAU;
         CUDA_CHECK(cudaEventRecord(ev_start));
+        g_timer.start();
         rk4_step(plan_r2c, plan_c2r, g, t_cur);
         CUDA_CHECK(cudaEventRecord(ev_stop));
         CUDA_CHECK(cudaEventSynchronize(ev_stop));
+        g_timer.collect();
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
         t_wall_total += (double)ms * 1e-3;
     }
 
+    g_timer.destroy();
+
+    // Diagnostics (not timed)
     {
         double t_final = NT_RUN * TAU;
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, g, t_final, L2_err, max_div);
-        cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
-             << scientific << setprecision(4) << L2_err << endl;
+        double L2_or_E, max_div;
+        const bool verify = (mode == nsmode::MODE_VERIFY);
+        compute_diagnostics(plan_r2c, plan_c2r, g, t_final, verify, L2_or_E, max_div);
+        if (verify)
+            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << L2_or_E << endl;
+        else
+            cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(10) << L2_or_E << endl;
+        cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+             << scientific << setprecision(4) << max_div << endl;
     }
 
     cout << "============================================================" << endl;
@@ -645,6 +731,7 @@ int main(int argc, char** argv) {
     cout << "  Total steps:     " << NT_RUN << endl;
     cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s" << endl;
     cout << "  Avg per step:    " << t_wall_total / NT_RUN << " s" << endl;
+    nsmode::print_phase_summary(g_timer.acc, t_wall_total, NT_RUN, mode);
     cout << "============================================================" << endl;
 
     // Cleanup
@@ -655,7 +742,7 @@ int main(int argc, char** argv) {
 
     cudaFree(g.V1_r);      cudaFree(g.V2_r);      cudaFree(g.V3_r);
     cudaFree(g.rot1_r);    cudaFree(g.rot2_r);    cudaFree(g.rot3_r);
-    cudaFree(g.work1_r);   cudaFree(g.work2_r);   cudaFree(g.work3_r);
+    cudaFree(g.work1_r);   cudaFree(g.work2_r);   cudaFree(g.work3_r);   // cudaFree(nullptr) is a no-op
     cudaFree(g.d_scratch);
     cudaFree(g.V1_c);      cudaFree(g.V2_c);      cudaFree(g.V3_c);
     cudaFree(g.rot1_c);    cudaFree(g.rot2_c);    cudaFree(g.rot3_c);
