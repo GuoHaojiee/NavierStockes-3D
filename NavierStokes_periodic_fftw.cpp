@@ -9,8 +9,16 @@
 #include <string.h>
 #include <fftw3.h>
 #include <omp.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// 运行模式与分阶段计时（见 common_mode.h）
+//   g_with_force = true  (verify)：每次 RHS 计算解析外力 f（原始行为）
+//   g_with_force = false (bench) ：f = 0，跳过外力填充、3 次正向 FFT、归一化与相加
+static bool g_with_force = true;
+static nsmode::CpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 // ==============================================================================
 // 全周期性边界条件的Navier-Stokes求解器
@@ -239,6 +247,35 @@ void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
 }
 
 /**
+ * 诊断：max|div V| = max|ik·V|（频谱空间，与 make_div_free 相同的波数约定）
+ */
+double compute_div_max(const fftw_complex* V1_c, const fftw_complex* V2_c, const fftw_complex* V3_c,
+                       ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
+                       ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+    ptrdiff_t nz_c = nz/2 + 1;
+    double local_max = 0.0;
+    #pragma omp parallel for collapse(3) reduction(max:local_max)
+    for(ptrdiff_t i = 0; i < local_n0; ++i) {
+        for(ptrdiff_t j = 0; j < ny; ++j) {
+            for(ptrdiff_t k = 0; k < nz_c; ++k) {
+                ptrdiff_t idx = (i * ny + j) * nz_c + k;
+                ptrdiff_t ig = local_0_start + i;
+                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
+                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                double kz = (double)k;
+                double dr = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
+                double di =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
+                double val = sqrt(dr*dr + di*di);
+                if (val > local_max) local_max = val;
+            }
+        }
+    }
+    double global_max = 0.0;
+    MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    return global_max;
+}
+
+/**
  * 计算粘性项：visc = -k² * V（频谱空间）
  */
 void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
@@ -291,6 +328,7 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
     // 1. 频谱空间计算旋度（不涉及 FFT）
     compute_rot(V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c,
                 nx, ny, nz, local_n0, local_0_start);
+    g_timer.mark(PH_SPEC);
 
     // 2. 速度逆变换：V_c → V_r（plan_c2r，out-of-place，V_c 不被修改）
     fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
@@ -301,6 +339,7 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
     fftw_mpi_execute_dft_c2r(plan_c2r, rot1_c, rot1_r);
     fftw_mpi_execute_dft_c2r(plan_c2r, rot2_c, rot2_r);
     fftw_mpi_execute_dft_c2r(plan_c2r, rot3_c, rot3_r);
+    g_timer.mark(PH_FFT);
 
     // 4. 实空间叉乘 v × rot(v)，结果覆盖 rot_r（后续用于正变换）
     //    FFTW R2C 实空间数组 padding：行步长 = 2*(nz/2+1)
@@ -317,11 +356,13 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
             }
         }
     }
+    g_timer.mark(PH_PHYS);
 
     // 5. 正变换：rot_r（叉乘结果）→ nl_c（专用 plan，不触碰 V_c）
     fftw_mpi_execute_dft_r2c(plan_r2c, rot1_r, nl1_c);
     fftw_mpi_execute_dft_r2c(plan_r2c, rot2_r, nl2_c);
     fftw_mpi_execute_dft_r2c(plan_r2c, rot3_r, nl3_c);
+    g_timer.mark(PH_FFT);
 
     // 归一化（FFTW 正变换不归一化，除以 N 得到归一化频谱系数）
     #pragma omp parallel for
@@ -330,6 +371,7 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
         nl2_c[i][0] /= norm;  nl2_c[i][1] /= norm;
         nl3_c[i][0] /= norm;  nl3_c[i][1] /= norm;
     }
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -366,45 +408,61 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
     compute_viscous_term(V1_c, visc1_c, nx, ny, nz, local_n0, local_0_start);
     compute_viscous_term(V2_c, visc2_c, nx, ny, nz, local_n0, local_0_start);
     compute_viscous_term(V3_c, visc3_c, nx, ny, nz, local_n0, local_0_start);
+    g_timer.mark(PH_SPEC);
 
-    // 3. 外力项 f（实空间填充 → plan_r2c 正变换到 f_c，不触碰 V_c）
-    #pragma omp parallel for collapse(3)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
-            for(ptrdiff_t k = 0; k < nz; ++k) {
-                ptrdiff_t ig  = local_0_start + i;
-                double x = ig * dx, y = j * dy, z = k * dz;
-                ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
-                work_r1[idx] = func_f1(x, y, z, t);
-                work_r2[idx] = func_f2(x, y, z, t);
-                work_r3[idx] = func_f3(x, y, z, t);
+    if (g_with_force) {
+        // 3. 外力项 f（实空间填充 → plan_r2c 正变换到 f_c，不触碰 V_c）[仅 verify]
+        #pragma omp parallel for collapse(3)
+        for(ptrdiff_t i = 0; i < local_n0; ++i) {
+            for(ptrdiff_t j = 0; j < ny; ++j) {
+                for(ptrdiff_t k = 0; k < nz; ++k) {
+                    ptrdiff_t ig  = local_0_start + i;
+                    double x = ig * dx, y = j * dy, z = k * dz;
+                    ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
+                    work_r1[idx] = func_f1(x, y, z, t);
+                    work_r2[idx] = func_f2(x, y, z, t);
+                    work_r3[idx] = func_f3(x, y, z, t);
+                }
             }
         }
-    }
-    fftw_mpi_execute_dft_r2c(plan_r2c, work_r1, f1_c);
-    fftw_mpi_execute_dft_r2c(plan_r2c, work_r2, f2_c);
-    fftw_mpi_execute_dft_r2c(plan_r2c, work_r3, f3_c);
-    #pragma omp parallel for
-    for(ptrdiff_t i = 0; i < total_c; ++i) {
-        f1_c[i][0] /= norm;  f1_c[i][1] /= norm;
-        f2_c[i][0] /= norm;  f2_c[i][1] /= norm;
-        f3_c[i][0] /= norm;  f3_c[i][1] /= norm;
-    }
+        fftw_mpi_execute_dft_r2c(plan_r2c, work_r1, f1_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, work_r2, f2_c);
+        fftw_mpi_execute_dft_r2c(plan_r2c, work_r3, f3_c);
+        #pragma omp parallel for
+        for(ptrdiff_t i = 0; i < total_c; ++i) {
+            f1_c[i][0] /= norm;  f1_c[i][1] /= norm;
+            f2_c[i][0] /= norm;  f2_c[i][1] /= norm;
+            f3_c[i][0] /= norm;  f3_c[i][1] /= norm;
+        }
+        g_timer.mark(PH_FORCE);
 
-    // 4. 组合：RHS = nl + visc + f
-    #pragma omp parallel for
-    for(ptrdiff_t i = 0; i < total_c; ++i) {
-        rhs1_c[i][0] = nl1_c[i][0] + visc1_c[i][0] + f1_c[i][0];
-        rhs1_c[i][1] = nl1_c[i][1] + visc1_c[i][1] + f1_c[i][1];
-        rhs2_c[i][0] = nl2_c[i][0] + visc2_c[i][0] + f2_c[i][0];
-        rhs2_c[i][1] = nl2_c[i][1] + visc2_c[i][1] + f2_c[i][1];
-        rhs3_c[i][0] = nl3_c[i][0] + visc3_c[i][0] + f3_c[i][0];
-        rhs3_c[i][1] = nl3_c[i][1] + visc3_c[i][1] + f3_c[i][1];
+        // 4. 组合：RHS = nl + visc + f
+        #pragma omp parallel for
+        for(ptrdiff_t i = 0; i < total_c; ++i) {
+            rhs1_c[i][0] = nl1_c[i][0] + visc1_c[i][0] + f1_c[i][0];
+            rhs1_c[i][1] = nl1_c[i][1] + visc1_c[i][1] + f1_c[i][1];
+            rhs2_c[i][0] = nl2_c[i][0] + visc2_c[i][0] + f2_c[i][0];
+            rhs2_c[i][1] = nl2_c[i][1] + visc2_c[i][1] + f2_c[i][1];
+            rhs3_c[i][0] = nl3_c[i][0] + visc3_c[i][0] + f3_c[i][0];
+            rhs3_c[i][1] = nl3_c[i][1] + visc3_c[i][1] + f3_c[i][1];
+        }
+    } else {
+        // 4'. bench 模式（f = 0）：RHS = nl + visc
+        #pragma omp parallel for
+        for(ptrdiff_t i = 0; i < total_c; ++i) {
+            rhs1_c[i][0] = nl1_c[i][0] + visc1_c[i][0];
+            rhs1_c[i][1] = nl1_c[i][1] + visc1_c[i][1];
+            rhs2_c[i][0] = nl2_c[i][0] + visc2_c[i][0];
+            rhs2_c[i][1] = nl2_c[i][1] + visc2_c[i][1];
+            rhs3_c[i][0] = nl3_c[i][0] + visc3_c[i][0];
+            rhs3_c[i][1] = nl3_c[i][1] + visc3_c[i][1];
+        }
     }
 
     // 5. 投影：使 RHS 无散（div_c/phi_c 作为工作数组，在 main() 中预分配）
     make_div_free(rhs1_c, rhs2_c, rhs3_c, div_c, phi_c,
                   nx, ny, nz, local_n0, local_0_start);
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -440,6 +498,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
     memcpy(V1_c_orig, V1_c, alloc_local * sizeof(fftw_complex));
     memcpy(V2_c_orig, V2_c, alloc_local * sizeof(fftw_complex));
     memcpy(V3_c_orig, V3_c, alloc_local * sizeof(fftw_complex));
+    g_timer.mark(PH_SPEC);
 
     // k1 = RHS(V^n, t)
     compute_rhs(V1_c, V2_c, V3_c, k1_v1, k1_v2, k1_v3,
@@ -460,6 +519,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
         V3_c[i][0] = V3_c_orig[i][0] + 0.5*tau*k1_v3[i][0];
         V3_c[i][1] = V3_c_orig[i][1] + 0.5*tau*k1_v3[i][1];
     }
+    g_timer.mark(PH_SPEC);
 
     // k2 = RHS(V^n + τ/2*k1, t + τ/2)
     compute_rhs(V1_c, V2_c, V3_c, k2_v1, k2_v2, k2_v3,
@@ -479,6 +539,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
         V3_c[i][0] = V3_c_orig[i][0] + 0.5*tau*k2_v3[i][0];
         V3_c[i][1] = V3_c_orig[i][1] + 0.5*tau*k2_v3[i][1];
     }
+    g_timer.mark(PH_SPEC);
 
     // k3 = RHS(V^n + τ/2*k2, t + τ/2)
     compute_rhs(V1_c, V2_c, V3_c, k3_v1, k3_v2, k3_v3,
@@ -498,6 +559,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
         V3_c[i][0] = V3_c_orig[i][0] + tau*k3_v3[i][0];
         V3_c[i][1] = V3_c_orig[i][1] + tau*k3_v3[i][1];
     }
+    g_timer.mark(PH_SPEC);
 
     // k4 = RHS(V^n + τ*k3, t + τ)
     compute_rhs(V1_c, V2_c, V3_c, k4_v1, k4_v2, k4_v3,
@@ -518,6 +580,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
         V3_c[i][0] = V3_c_orig[i][0] + (tau/6.0)*(k1_v3[i][0] + 2*k2_v3[i][0] + 2*k3_v3[i][0] + k4_v3[i][0]);
         V3_c[i][1] = V3_c_orig[i][1] + (tau/6.0)*(k1_v3[i][1] + 2*k2_v3[i][1] + 2*k3_v3[i][1] + k4_v3[i][1]);
     }
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -533,16 +596,27 @@ int main(int argc, char **argv) {
 
     if (argc < 6) {
         if (rank == 0) {
-            cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS [OMP_threads]" << endl;
-            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100" << endl;
+            cerr << "Usage: " << argv[0] << " " << nsmode::usage_tail(true) << endl;
+            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100 4 bench" << endl;
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    nsmode::RunArgs rargs;
+    {
+        string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/true, rargs, perr)) {
+            if (rank == 0) cerr << "Error: " << perr << "\nUsage: " << argv[0] << " "
+                                << nsmode::usage_tail(true) << endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
 
     ptrdiff_t nx = atoi(argv[1]), ny = atoi(argv[2]), nz = atoi(argv[3]);
     double tau = atof(argv[4]);
     ptrdiff_t nt_run = atoi(argv[5]);
-    int nthreads = (argc > 6) ? atoi(argv[6]) : omp_get_max_threads();
+    int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
     int max_threads = nthreads;
 
@@ -562,6 +636,8 @@ int main(int argc, char **argv) {
         cout << "Domain: [0, 2π]³" << endl;
         cout << "MPI processes: " << size << endl;
         cout << "OpenMP threads/process: " << max_threads << endl;
+        cout << "Run mode: " << nsmode::mode_name(mode)
+             << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
         cout << "============================================================" << endl;
     }
 
@@ -601,14 +677,13 @@ int main(int argc, char **argv) {
     fftw_complex *visc1_c = fftw_alloc_complex(alloc_local);
     fftw_complex *visc2_c = fftw_alloc_complex(alloc_local);
     fftw_complex *visc3_c = fftw_alloc_complex(alloc_local);
-    fftw_complex *f1_c    = fftw_alloc_complex(alloc_local);
-    fftw_complex *f2_c    = fftw_alloc_complex(alloc_local);
-    fftw_complex *f3_c    = fftw_alloc_complex(alloc_local);
-
-    // 外力实空间工作数组
-    double *work_r1 = fftw_alloc_real(2 * alloc_local);
-    double *work_r2 = fftw_alloc_real(2 * alloc_local);
-    double *work_r3 = fftw_alloc_real(2 * alloc_local);
+    // 外力（f_c 频谱 + work_r 实空间）仅 verify 模式分配；只在 compute_rhs 的外力分支中使用
+    fftw_complex *f1_c    = g_with_force ? fftw_alloc_complex(alloc_local) : nullptr;
+    fftw_complex *f2_c    = g_with_force ? fftw_alloc_complex(alloc_local) : nullptr;
+    fftw_complex *f3_c    = g_with_force ? fftw_alloc_complex(alloc_local) : nullptr;
+    double *work_r1 = g_with_force ? fftw_alloc_real(2 * alloc_local) : nullptr;
+    double *work_r2 = g_with_force ? fftw_alloc_real(2 * alloc_local) : nullptr;
+    double *work_r3 = g_with_force ? fftw_alloc_real(2 * alloc_local) : nullptr;
 
     // RK4 工作数组
     fftw_complex *k1_v1 = fftw_alloc_complex(alloc_local);
@@ -693,6 +768,7 @@ int main(int argc, char **argv) {
         double t_cur = it * tau;
         {
             double t0 = MPI_Wtime();
+            g_timer.start();
             rk4_step(V1_c, V2_c, V3_c,
                      V1_r, V2_r, V3_r,
                      work_r1, work_r2, work_r3,
@@ -717,32 +793,58 @@ int main(int argc, char **argv) {
         }
     }
 
-    // 计算最终 L2 误差
+    double phase_max[nsmode::PH_COUNT];
+    nsmode::reduce_phases_max(g_timer.acc, phase_max);
+
+    // 最终诊断（不计入计时）：verify → L2 误差；bench → 总动能；两者都输出 max|div V|
     {
         double t_final = nt_run * tau;
+        // 散度须在 c2r 之前计算（多维 c2r 可能破坏输入 V_c）
+        double max_div = compute_div_max(V1_c, V2_c, V3_c, nx, ny, nz, local_n0, local_0_start);
         fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
         fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
         fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
-        double local_err = 0.0;
-        #pragma omp parallel for collapse(3) reduction(+:local_err)
-        for(ptrdiff_t i = 0; i < local_n0; ++i) {
-            for(ptrdiff_t j = 0; j < ny; ++j) {
-                for(ptrdiff_t k = 0; k < nz; ++k) {
-                    ptrdiff_t ig  = local_0_start + i;
-                    double x = ig * dx, y = j * dy, z = k * dz;
-                    ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
-                    double d1 = V1_r[idx] - func_V1(x, y, z, t_final);
-                    double d2 = V2_r[idx] - func_V2(x, y, z, t_final);
-                    double d3 = V3_r[idx] - func_V3(x, y, z, t_final);
-                    local_err += d1*d1 + d2*d2 + d3*d3;
+        double local_err = 0.0, local_e = 0.0;
+        if (mode == nsmode::MODE_VERIFY) {
+            #pragma omp parallel for collapse(3) reduction(+:local_err)
+            for(ptrdiff_t i = 0; i < local_n0; ++i) {
+                for(ptrdiff_t j = 0; j < ny; ++j) {
+                    for(ptrdiff_t k = 0; k < nz; ++k) {
+                        ptrdiff_t ig  = local_0_start + i;
+                        double x = ig * dx, y = j * dy, z = k * dz;
+                        ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
+                        double d1 = V1_r[idx] - func_V1(x, y, z, t_final);
+                        double d2 = V2_r[idx] - func_V2(x, y, z, t_final);
+                        double d3 = V3_r[idx] - func_V3(x, y, z, t_final);
+                        local_err += d1*d1 + d2*d2 + d3*d3;
+                    }
+                }
+            }
+        } else {
+            // 总动能 0.5·Σ|v|²（物理空间逐点求和）
+            #pragma omp parallel for collapse(3) reduction(+:local_e)
+            for(ptrdiff_t i = 0; i < local_n0; ++i) {
+                for(ptrdiff_t j = 0; j < ny; ++j) {
+                    for(ptrdiff_t k = 0; k < nz; ++k) {
+                        ptrdiff_t idx = (i * ny + j) * (2*(nz/2+1)) + k;
+                        local_e += V1_r[idx]*V1_r[idx] + V2_r[idx]*V2_r[idx] + V3_r[idx]*V3_r[idx];
+                    }
                 }
             }
         }
-        double global_err = 0.0;
+        double global_err = 0.0, global_e = 0.0;
         MPI_Reduce(&local_err, &global_err, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-        if (rank == 0)
-            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
-                 << scientific << setprecision(4) << sqrt(global_err * dx * dy * dz) << endl;
+        MPI_Reduce(&local_e,   &global_e,   1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            if (mode == nsmode::MODE_VERIFY)
+                cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(4) << sqrt(global_err * dx * dy * dz) << endl;
+            else
+                cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(10) << 0.5 * global_e << endl;
+            cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << max_div << endl;
+        }
     }
 
     if (rank == 0) {
@@ -752,6 +854,7 @@ int main(int argc, char **argv) {
         cout << "  Total steps:     " << nt_run << endl;
         cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s" << endl;
         cout << "  Avg per step:    " << t_wall_total / nt_run << " s" << endl;
+        nsmode::print_phase_summary(phase_max, t_wall_total, nt_run, mode);
         cout << "============================================================" << endl;
     }
 
@@ -767,8 +870,10 @@ int main(int argc, char **argv) {
     fftw_free(div_c);    fftw_free(phi_c);
     fftw_free(nl1_c);    fftw_free(nl2_c);    fftw_free(nl3_c);
     fftw_free(visc1_c);  fftw_free(visc2_c);  fftw_free(visc3_c);
-    fftw_free(f1_c);     fftw_free(f2_c);     fftw_free(f3_c);
-    fftw_free(work_r1);  fftw_free(work_r2);  fftw_free(work_r3);
+    if (g_with_force) {
+        fftw_free(f1_c);     fftw_free(f2_c);     fftw_free(f3_c);
+        fftw_free(work_r1);  fftw_free(work_r2);  fftw_free(work_r3);
+    }
     fftw_free(k1_v1);    fftw_free(k1_v2);    fftw_free(k1_v3);
     fftw_free(k2_v1);    fftw_free(k2_v2);    fftw_free(k2_v3);
     fftw_free(k3_v1);    fftw_free(k3_v2);    fftw_free(k3_v3);
