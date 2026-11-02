@@ -48,8 +48,17 @@
 #include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// Run mode / phase timing (see common_mode.h).
+//   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
+//   g_with_force = false (bench) : f = 0; forcing fill, its 3 FFTs, copies and
+//                                  scaling are skipped; work*_buf / f*_c not allocated.
+static bool g_with_force = true;
+static nsmode::GpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 
 typedef double             GReal;
 typedef cufftDoubleComplex GCplx;
@@ -169,6 +178,20 @@ __global__ void kernel_error_sq(const double* V1, const double* V2, const double
     scratch[idx] = d1*d1 + d2*d2 + d3*d3;
 }
 
+// |v|^2 per point (bench-mode kinetic-energy diagnostic; X-slab real, padded stride)
+__global__ void kernel_energy_sq(const double* V1, const double* V2, const double* V3,
+                                  double* scratch, int nx_local) {
+    long long nr_local = (long long)nx_local * d_NY * d_NZ;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nr_local) return;
+    int k  = (int)(idx % d_NZ);
+    int j  = (int)((idx / d_NZ) % d_NY);
+    int lx = (int)(idx / ((long long)d_NY * d_NZ));
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
+    scratch[idx] = v1*v1 + v2*v2 + v3*v3;
+}
+
 // ============================================================
 // 频谱空间 kernel (Y-slab, subFormat=3)
 // ============================================================
@@ -285,6 +308,17 @@ __global__ void kernel_add_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
     rhs3[idx].x += visc3[idx].x + f3[idx].x; rhs3[idx].y += visc3[idx].y + f3[idx].y;
 }
 
+// bench mode (f = 0): rhs += visc
+__global__ void kernel_add_visc_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
+                                        const GCplx* visc1, const GCplx* visc2, const GCplx* visc3,
+                                        long long nc_local) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nc_local) return;
+    rhs1[idx].x += visc1[idx].x; rhs1[idx].y += visc1[idx].y;
+    rhs2[idx].x += visc2[idx].x; rhs2[idx].y += visc2[idx].y;
+    rhs3[idx].x += visc3[idx].x; rhs3[idx].y += visc3[idx].y;
+}
+
 __global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
                                   const GCplx* o1, const GCplx* o2, const GCplx* o3,
                                   const GCplx* k1, const GCplx* k2, const GCplx* k3,
@@ -332,10 +366,10 @@ struct State {
 
     cudaLibXtDesc *V1_buf, *V2_buf, *V3_buf;
     cudaLibXtDesc *rot1_buf, *rot2_buf, *rot3_buf;
-    cudaLibXtDesc *work1_buf, *work2_buf, *work3_buf;
+    cudaLibXtDesc *work1_buf = nullptr, *work2_buf = nullptr, *work3_buf = nullptr;  // verify only
 
     GCplx *visc1_c, *visc2_c, *visc3_c;
-    GCplx *f1_c,    *f2_c,    *f3_c;
+    GCplx *f1_c = nullptr, *f2_c = nullptr, *f3_c = nullptr;                         // verify only
     GCplx *rhs1_c,  *rhs2_c,  *rhs3_c;
     GCplx *k1v1, *k2v1, *k3v1, *k4v1;
     GCplx *k1v2, *k2v2, *k3v2, *k4v2;
@@ -351,13 +385,16 @@ static void alloc_state(State& s, cufftHandle plan_r2c) {
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot1_buf,  CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot2_buf,  CUFFT_XT_FORMAT_INPLACE));
     CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.rot3_buf,  CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE));
-    CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE));
+    // Forcing-only buffers (used solely by the forcing block of compute_rhs).
+    if (g_with_force) {
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work1_buf, CUFFT_XT_FORMAT_INPLACE));
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work2_buf, CUFFT_XT_FORMAT_INPLACE));
+        CUFFT_CHECK(cufftXtMalloc(plan_r2c, &s.work3_buf, CUFFT_XT_FORMAT_INPLACE));
+    }
 
     auto C = [&](GCplx** p){ CUDA_CHECK(cudaMalloc(p, s.nc_local*sizeof(GCplx))); };
     C(&s.visc1_c); C(&s.visc2_c); C(&s.visc3_c);
-    C(&s.f1_c);    C(&s.f2_c);    C(&s.f3_c);
+    if (g_with_force) { C(&s.f1_c); C(&s.f2_c); C(&s.f3_c); }
     C(&s.rhs1_c);  C(&s.rhs2_c);  C(&s.rhs3_c);
     C(&s.k1v1); C(&s.k2v1); C(&s.k3v1); C(&s.k4v1);
     C(&s.k1v2); C(&s.k2v2); C(&s.k3v2); C(&s.k4v2);
@@ -371,9 +408,11 @@ static void alloc_state(State& s, cufftHandle plan_r2c) {
 static void free_state(State& s) {
     CUFFT_CHECK(cufftXtFree(s.V1_buf));    CUFFT_CHECK(cufftXtFree(s.V2_buf));    CUFFT_CHECK(cufftXtFree(s.V3_buf));
     CUFFT_CHECK(cufftXtFree(s.rot1_buf));  CUFFT_CHECK(cufftXtFree(s.rot2_buf));  CUFFT_CHECK(cufftXtFree(s.rot3_buf));
-    CUFFT_CHECK(cufftXtFree(s.work1_buf)); CUFFT_CHECK(cufftXtFree(s.work2_buf)); CUFFT_CHECK(cufftXtFree(s.work3_buf));
+    if (s.work1_buf) {
+        CUFFT_CHECK(cufftXtFree(s.work1_buf)); CUFFT_CHECK(cufftXtFree(s.work2_buf)); CUFFT_CHECK(cufftXtFree(s.work3_buf));
+    }
     cudaFree(s.visc1_c); cudaFree(s.visc2_c); cudaFree(s.visc3_c);
-    cudaFree(s.f1_c);    cudaFree(s.f2_c);    cudaFree(s.f3_c);
+    if (s.f1_c) { cudaFree(s.f1_c); cudaFree(s.f2_c); cudaFree(s.f3_c); }
     cudaFree(s.rhs1_c);  cudaFree(s.rhs2_c);  cudaFree(s.rhs3_c);
     cudaFree(s.k1v1); cudaFree(s.k2v1); cudaFree(s.k3v1); cudaFree(s.k4v1);
     cudaFree(s.k1v2); cudaFree(s.k2v2); cudaFree(s.k3v2); cudaFree(s.k4v2);
@@ -398,6 +437,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
         s.ny_local, s.y_offset);
     force_z2d_format(s.rot1_buf); force_z2d_format(s.rot2_buf); force_z2d_format(s.rot3_buf);
     CUDA_CHECK(cudaDeviceSynchronize());
+    g_timer.mark(PH_SPEC);
 
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
@@ -406,17 +446,20 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+    g_timer.mark(PH_FFT);
 
     kernel_cross_product<<<gr, BLOCK>>>(
         (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
         (double*)gpu_ptr(s.rot1_buf), (double*)gpu_ptr(s.rot2_buf), (double*)gpu_ptr(s.rot3_buf),
         s.nx_local);
     CUDA_CHECK(cudaDeviceSynchronize());
+    g_timer.mark(PH_PHYS);
 
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot1_buf, s.rot1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot2_buf, s.rot2_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
+    g_timer.mark(PH_FFT);
 
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot1_buf), s.rhs1_c, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot2_buf), s.rhs2_c, nc);
@@ -424,6 +467,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs1_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs2_c, nc, inv_N);
     kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs3_c, nc, inv_N);
+    g_timer.mark(PH_SPEC);
 }
 
 static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
@@ -436,33 +480,43 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.visc2_c, s.ny_local, s.y_offset);
     kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.visc3_c, s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
+    g_timer.mark(PH_SPEC);
 
     compute_nonlinear(plan_r2c, plan_c2r, s);
 
-    force_d2z_format(s.work1_buf); force_d2z_format(s.work2_buf); force_d2z_format(s.work3_buf);
-    kernel_fill_forcing<<<gr, BLOCK>>>(
-        (double*)gpu_ptr(s.work1_buf), (double*)gpu_ptr(s.work2_buf), (double*)gpu_ptr(s.work3_buf),
-        s.nx_local, s.x_offset, t);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (g_with_force) {
+        force_d2z_format(s.work1_buf); force_d2z_format(s.work2_buf); force_d2z_format(s.work3_buf);
+        kernel_fill_forcing<<<gr, BLOCK>>>(
+            (double*)gpu_ptr(s.work1_buf), (double*)gpu_ptr(s.work2_buf), (double*)gpu_ptr(s.work3_buf),
+            s.nx_local, s.x_offset, t);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
+        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf), s.f1_c, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf), s.f2_c, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work3_buf), s.f3_c, nc);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.f1_c, nc, inv_N);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.f2_c, nc, inv_N);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.f3_c, nc, inv_N);
+        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf), s.f1_c, nc);
+        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf), s.f2_c, nc);
+        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work3_buf), s.f3_c, nc);
+        kernel_scale_cplx<<<gc, BLOCK>>>(s.f1_c, nc, inv_N);
+        kernel_scale_cplx<<<gc, BLOCK>>>(s.f2_c, nc, inv_N);
+        kernel_scale_cplx<<<gc, BLOCK>>>(s.f3_c, nc, inv_N);
+        g_timer.mark(PH_FORCE);
 
-    kernel_add_to_rhs<<<gc, BLOCK>>>(
-        s.rhs1_c, s.rhs2_c, s.rhs3_c,
-        s.visc1_c, s.visc2_c, s.visc3_c,
-        s.f1_c, s.f2_c, s.f3_c, nc);
+        kernel_add_to_rhs<<<gc, BLOCK>>>(
+            s.rhs1_c, s.rhs2_c, s.rhs3_c,
+            s.visc1_c, s.visc2_c, s.visc3_c,
+            s.f1_c, s.f2_c, s.f3_c, nc);
+    } else {
+        // bench mode: f = 0  ->  RHS = nonlinear + viscous (36 FFT/step)
+        kernel_add_visc_to_rhs<<<gc, BLOCK>>>(
+            s.rhs1_c, s.rhs2_c, s.rhs3_c,
+            s.visc1_c, s.visc2_c, s.visc3_c, nc);
+    }
 
     kernel_make_div_free<<<gc, BLOCK>>>(
         s.rhs1_c, s.rhs2_c, s.rhs3_c, s.ny_local, s.y_offset);
+    g_timer.mark(PH_SPEC);
 }
 
 static void save_v_orig(State& s) {
@@ -485,6 +539,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
 
     save_v_orig(s);
+    g_timer.mark(PH_SPEC);
 
     compute_rhs(plan_r2c, plan_c2r, s, t);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k1v1, nc);
@@ -496,6 +551,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k1v1, s.k1v2, s.k1v3, 0.5*TAU, nc);
+    g_timer.mark(PH_SPEC);
 
     compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k2v1, nc);
@@ -507,6 +563,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k2v1, s.k2v2, s.k2v3, 0.5*TAU, nc);
+    g_timer.mark(PH_SPEC);
 
     compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k3v1, nc);
@@ -518,6 +575,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
         s.k3v1, s.k3v2, s.k3v3, TAU, nc);
+    g_timer.mark(PH_SPEC);
 
     compute_rhs(plan_r2c, plan_c2r, s, t + TAU);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k4v1, nc);
@@ -532,10 +590,14 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
         s.k1v2, s.k2v2, s.k3v2, s.k4v2,
         s.k1v3, s.k2v3, s.k3v3, s.k4v3,
         TAU/6.0, nc);
+    g_timer.mark(PH_SPEC);
 }
 
+// verify: L2_or_energy = L2 error vs analytic V(t)
+// bench : L2_or_energy = kinetic energy 0.5*sum|v|^2 (no analytic solution for f = 0)
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
-                                 State& s, double t, double& L2_err, double& max_div) {
+                                 State& s, double t, bool verify,
+                                 double& L2_or_energy, double& max_div) {
     const double inv_N = 1.0/(double)(NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
@@ -554,14 +616,19 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    kernel_error_sq<<<gr, BLOCK>>>(
-        (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
-        s.scratch, s.nx_local, s.x_offset, t);
+    if (verify)
+        kernel_error_sq<<<gr, BLOCK>>>(
+            (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
+            s.scratch, s.nx_local, s.x_offset, t);
+    else
+        kernel_energy_sq<<<gr, BLOCK>>>(
+            (double*)gpu_ptr(s.V1_buf), (double*)gpu_ptr(s.V2_buf), (double*)gpu_ptr(s.V3_buf),
+            s.scratch, s.nx_local);
     CUDA_CHECK(cudaDeviceSynchronize());
     double local_sq = thrust::reduce(thrust::device, sp, sp + nr, 0.0);
     double global_sq = 0.0;
     MPI_Allreduce(&local_sq, &global_sq, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    L2_err = sqrt(global_sq * DX * DY * DZ);
+    L2_or_energy = verify ? sqrt(global_sq * DX * DY * DZ) : 0.5 * global_sq;
 
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
@@ -585,9 +652,21 @@ int main(int argc, char** argv) {
 
     if (argc < 6) {
         if (s.rank == 0)
-            fprintf(stderr, "Usage: mpirun -np <NP> %s NX NY NZ dt NSTEPS\n", argv[0]);
+            fprintf(stderr, "Usage: mpirun -np <NP> %s %s\n", argv[0], nsmode::usage_tail(false));
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    nsmode::RunArgs rargs;
+    {
+        std::string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/false, rargs, perr)) {
+            if (s.rank == 0)
+                fprintf(stderr, "Error: %s\nUsage: mpirun -np <NP> %s %s\n",
+                        perr.c_str(), argv[0], nsmode::usage_tail(false));
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
     NX = atoi(argv[1]); NY = atoi(argv[2]); NZ = atoi(argv[3]);
     TAU = atof(argv[4]); NT_RUN = atoi(argv[5]);
     NZC = NZ/2 + 1; NT_TOTAL = NT_RUN;
@@ -600,7 +679,9 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(d_DY,  &DY,  sizeof(double));
     cudaMemcpyToSymbol(d_DZ,  &DZ,  sizeof(double));
     if (s.rank == 0)
-        printf("Grid: %d x %d x %d, dt=%.2e, steps=%d\n", NX, NY, NZ, TAU, NT_RUN);
+        printf("Grid: %d x %d x %d, dt=%.2e, steps=%d, mode=%s%s\n", NX, NY, NZ, TAU, NT_RUN,
+               nsmode::mode_name(mode),
+               mode == nsmode::MODE_BENCH ? " (f = 0, 36 FFT/step)" : " (analytic f, 48 FFT/step)");
 
     int num_gpus = 0;
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
@@ -670,32 +751,49 @@ int main(int argc, char** argv) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    g_timer.init();
     double t_wall = 0.0;
     for (int it = 0; it < NT_RUN; ++it) {
         double t_cur = it * TAU;
         MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
+        g_timer.start();
         rk4_step(plan_r2c, plan_c2r, s, t_cur);
         CUDA_CHECK(cudaDeviceSynchronize());
+        g_timer.collect();
         MPI_Barrier(MPI_COMM_WORLD);
         double dt_step = MPI_Wtime() - t0, dt_max = 0.0;
         MPI_Allreduce(&dt_step, &dt_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
         t_wall += dt_max;
     }
+    double phase_max[nsmode::PH_COUNT];
+    nsmode::reduce_phases_max(g_timer.acc, phase_max);
+    g_timer.destroy();
+
+    // Diagnostics (not timed).
     {
         double t_final = NT_RUN * TAU;
-        double L2_err, max_div;
-        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, L2_err, max_div);
-        if (s.rank == 0)
-            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
-                 << scientific << setprecision(4) << L2_err << "\n";
+        double L2_or_E, max_div;
+        const bool verify = (mode == nsmode::MODE_VERIFY);
+        compute_diagnostics(plan_r2c, plan_c2r, s, t_final, verify, L2_or_E, max_div);
+        if (s.rank == 0) {
+            if (verify)
+                cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(4) << L2_or_E << "\n";
+            else
+                cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(10) << L2_or_E << "\n";
+            cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << max_div << "\n";
+        }
     }
 
     if (s.rank == 0) {
         cout << "============================================================\n";
         cout << "  Total steps:     " << NT_RUN << "\n";
         cout << "  Total wall time: " << fixed << setprecision(4) << t_wall << " s\n";
-        cout << "  Avg per step:    " << t_wall / NT_RUN << " s\n";
+        cout << "  Avg per step:    " << t_wall / NT_RUN << " s\n" << flush;
+        nsmode::print_phase_summary(phase_max, t_wall, NT_RUN, mode);
         cout << "============================================================\n" << flush;
     }
 
