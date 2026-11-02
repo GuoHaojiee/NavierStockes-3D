@@ -206,6 +206,7 @@ $$p = (t^2+1) \cos x \cos y \cos z$$
 ├── NavierStokes_periodic_heffte_multigpu.cu # 多节点多 GPU（heFFTe+cuFFT）
 ├── NavierStokes_periodic_cufftmp_mgpu.cu    # 单节点多 GPU（cuFFTMp）
 ├── NavierStokes_periodic_cufftmp_multinode.cu # 多节点多 GPU（cuFFTMp）
+├── common_mode.h                            # 公共：verify/bench 模式解析、分阶段计时
 ├── test_spectral_derivative*.cpp            # 各库谱导数验证
 ├── Makefile_*                               # 对应编译文件
 └── pic/                                     # 实验结果图片
@@ -243,9 +244,15 @@ make -f Makefile_accfft
 
 ### 运行
 
-统一格式：`mpirun -np <NP> ./<executable> NX NY NZ dt NSTEPS [OMP_THREADS]`
+统一格式：
+
+```
+mpirun -np <NP> ./<CPU 版> NX NY NZ dt NSTEPS [OMP_THREADS] [verify|bench]
+mpirun -np <NP> ./<GPU 版> NX NY NZ dt NSTEPS [verify|bench]
+```
 
 - `OMP_THREADS`（可选）仅 CPU 版支持，默认使用系统最大线程数
+- 运行模式（可选，默认 `verify`），详见下方「运行模式」
 
 #### CPU 版
 
@@ -290,6 +297,58 @@ mpirun -np 4 ./navier_stokes_cufftmp_mgpu 128 128 128 1e-4 100
 mpirun -np 8 ./navier_stokes_heffte_multigpu 256 256 256 1e-4 100
 mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100
 ```
+
+### 运行模式（verify / bench）
+
+所有 11 个求解器都支持两种模式，由 NSTEPS 之后的可选参数选择：
+
+| 模式 | 外力 f | 每步 FFT 次数 | 计时结束后输出 | 用途 |
+|------|--------|---------------|----------------|------|
+| `verify`（默认） | 解析外力，每次 RHS 逐点计算并做 3 次正向 FFT | 48 | L2 误差 + max\|div V\| | 正确性验证，行为与原程序一致 |
+| `bench` | f = 0，跳过外力填充 / 3 次 FFT / 复制与缩放，且不分配外力缓冲 | 36 | 总动能 0.5·Σ\|v\|² + max\|div V\| | 性能测试（外力是已知条件，不应计入求解器耗时） |
+
+- 两种模式的初始条件相同（解析 V(t=0)，投影到无散空间）。
+- bench 没有解析解，因此不输出 L2；动能和散度用于确认结果有限、无 NaN。
+  各库在相同网格/步数下的动能应一致（本机 64³、dt=1e-4、10 步，4 个 CPU 版均为 3.2040343055e+05），可作交叉检查。
+- 诊断（L2 / 动能 / 散度）都在计时循环之后计算，不计入耗时。
+- max|div V| 按各版本自身的谱系数约定计算：FFTW / cuFFT / cuFFTXt / cuFFTMp 存储归一化系数，
+  heFFTe / p3dfft / AccFFT 存储非归一化 DFT 系数（数值大 N 倍），因此不同库之间该值不可直接比较，只用于判断是否接近 0。
+
+**参数解析规则（CPU 版 OMP_THREADS 与 mode 共存，无歧义）：**
+NSTEPS 之后的每个参数按类型识别——纯数字为 `OMP_THREADS`，`verify` / `bench`（也接受 `mode=bench`、`--mode=bench`）为模式，
+其他任何内容报错退出；每类最多出现一次，顺序不限。GPU 版不接受数字参数。
+
+```bash
+mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 10            # verify，默认线程数
+mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 10 4          # verify，4 线程（与旧用法完全兼容）
+mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 10 bench      # bench，默认线程数
+mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 10 4 bench    # bench，4 线程
+mpirun -np 4 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 10 bench
+```
+
+### 分阶段计时
+
+两种模式都在原有的 `Avg per step:` 行（格式不变，批处理脚本依赖它）之后输出每步平均的分阶段时间：
+
+```
+  Avg per step:    0.0253 s
+  Phase breakdown (avg per step, max over ranks):
+    FFT (incl. transpose/comm): 0.018910 s
+    Spectral pointwise:         0.005548 s
+    Physical pointwise:         0.001225 s
+    Forcing f (fill+3 FFT):     0.000000 s
+    Sum of phases:              0.025684 s
+    Total (wall, per step):     0.025306 s
+    FFTs per step:              36
+```
+
+- **FFT**：所有求解器内的正/逆变换（含库内转置通信）；AccFFT / p3dfft 在逆变换前为保护输入所做的复制也计入此项。
+- **Spectral pointwise**：旋度、粘性项、投影、RHS 合并、归一化缩放、RK4 组合与复制等。
+- **Physical pointwise**：实空间归一化与叉乘 v×rot(v)。
+- **Forcing**：外力填充 + 其 3 次 FFT + 复制/缩放（bench 下为 0）。外力的 FFT 不计入 FFT 项，因此两种模式的 FFT 项可直接比较。
+- 多进程时每一项分别对各进程取最大值，因此 Sum of phases 可能略大于 Total。
+- CPU 版用主机墙钟；单 GPU / 每进程一 GPU 的版本（cuFFT、cuFFTMp、heFFTe GPU）用默认流上的 cudaEvent，不额外同步；
+  cuFFTXt（单进程多 GPU）在每个计时点前同步全部 GPU（复用已有的 SYNC 点，bench 模式不增加同步）。
 
 ---
 
