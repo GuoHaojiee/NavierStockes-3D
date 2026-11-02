@@ -25,8 +25,16 @@
 #include <mpi.h>
 #include <omp.h>
 #include <heffte.h>
+#include "common_mode.h"
 
 using namespace std;
+
+// 运行模式与分阶段计时（见 common_mode.h）
+//   g_with_force = true  (verify)：每次 RHS 计算解析外力 f（原始行为）
+//   g_with_force = false (bench) ：f = 0，跳过外力填充、3 次正向 FFT 与相加
+static bool g_with_force = true;
+static nsmode::CpuPhaseTimer g_timer;
+using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
 using Cvec = vector<complex<double>>;
 using Rvec = vector<double>;
 
@@ -263,6 +271,7 @@ void compute_nonlinear(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
 
     // 1. 频谱空间计算旋度（rot_c = ik × V_c，与 V_c 同 N 因子）
     compute_rot(V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c, nx, ny, nz, outbox_c);
+    g_timer.mark(PH_SPEC);
 
     // 2. 逆变换到实空间（scale::full 自动除以 N，得到物理值）
     //    heFFTe backward 不破坏输入，无需复制
@@ -272,6 +281,7 @@ void compute_nonlinear(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
     fft.backward(rot1_c.data(), rot1_r.data(), heffte::scale::full);
     fft.backward(rot2_c.data(), rot2_r.data(), heffte::scale::full);
     fft.backward(rot3_c.data(), rot3_r.data(), heffte::scale::full);
+    g_timer.mark(PH_FFT);
 
     // 3. 实空间计算 v × rot(v)，结果覆盖 rot_r（复用为工作数组）
     size_t nr = inbox_r.count();
@@ -283,11 +293,13 @@ void compute_nonlinear(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
         rot2_r[idx] = v3 * w1 - v1 * w3;  // (v×rot)_y
         rot3_r[idx] = v1 * w2 - v2 * w1;  // (v×rot)_z
     }
+    g_timer.mark(PH_PHYS);
 
     // 4. 正变换回频谱空间（scale::none，得到 DFT = N × FFT_norm，与 V_c 一致）
     fft.forward(rot1_r.data(), nl1_c.data(), heffte::scale::none);
     fft.forward(rot2_r.data(), nl2_c.data(), heffte::scale::none);
     fft.forward(rot3_r.data(), nl3_c.data(), heffte::scale::none);
+    g_timer.mark(PH_FFT);
 }
 
 // ==============================================================================
@@ -321,35 +333,48 @@ void compute_rhs(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
     compute_viscous(V1_c, visc1_c, nx, ny, nz, outbox_c);
     compute_viscous(V2_c, visc2_c, nx, ny, nz, outbox_c);
     compute_viscous(V3_c, visc3_c, nx, ny, nz, outbox_c);
+    g_timer.mark(PH_SPEC);
 
-    // 3. 外力项 f（实空间 → 频谱空间）
-    for (int i = inbox_r.low[0]; i <= inbox_r.high[0]; ++i) {
-        for (int j = inbox_r.low[1]; j <= inbox_r.high[1]; ++j) {
-            for (int k = inbox_r.low[2]; k <= inbox_r.high[2]; ++k) {
-                size_t idx = box_idx(inbox_r, i, j, k);
-                double x = i * dx, y = j * dy, z = k * dz;
-                work_r1[idx] = func_f1(x, y, z, t);
-                work_r2[idx] = func_f2(x, y, z, t);
-                work_r3[idx] = func_f3(x, y, z, t);
+    size_t nc = outbox_c.count();
+    if (g_with_force) {
+        // 3. 外力项 f（实空间 → 频谱空间）[仅 verify]
+        for (int i = inbox_r.low[0]; i <= inbox_r.high[0]; ++i) {
+            for (int j = inbox_r.low[1]; j <= inbox_r.high[1]; ++j) {
+                for (int k = inbox_r.low[2]; k <= inbox_r.high[2]; ++k) {
+                    size_t idx = box_idx(inbox_r, i, j, k);
+                    double x = i * dx, y = j * dy, z = k * dz;
+                    work_r1[idx] = func_f1(x, y, z, t);
+                    work_r2[idx] = func_f2(x, y, z, t);
+                    work_r3[idx] = func_f3(x, y, z, t);
+                }
             }
         }
-    }
-    // scale::none：f_c = DFT(f) = N * FFT_norm(f)，与 V_c 约定一致
-    fft.forward(work_r1.data(), f1_c.data(), heffte::scale::none);
-    fft.forward(work_r2.data(), f2_c.data(), heffte::scale::none);
-    fft.forward(work_r3.data(), f3_c.data(), heffte::scale::none);
+        // scale::none：f_c = DFT(f) = N * FFT_norm(f)，与 V_c 约定一致
+        fft.forward(work_r1.data(), f1_c.data(), heffte::scale::none);
+        fft.forward(work_r2.data(), f2_c.data(), heffte::scale::none);
+        fft.forward(work_r3.data(), f3_c.data(), heffte::scale::none);
+        g_timer.mark(PH_FORCE);
 
-    // 4. 组合各项：RHS = v×rot(v) + P∆V + f
-    size_t nc = outbox_c.count();
-    #pragma omp parallel for
-    for (size_t i = 0; i < nc; ++i) {
-        rhs1_c[i] = nl1_c[i] + visc1_c[i] + f1_c[i];
-        rhs2_c[i] = nl2_c[i] + visc2_c[i] + f2_c[i];
-        rhs3_c[i] = nl3_c[i] + visc3_c[i] + f3_c[i];
+        // 4. 组合各项：RHS = v×rot(v) + P∆V + f
+        #pragma omp parallel for
+        for (size_t i = 0; i < nc; ++i) {
+            rhs1_c[i] = nl1_c[i] + visc1_c[i] + f1_c[i];
+            rhs2_c[i] = nl2_c[i] + visc2_c[i] + f2_c[i];
+            rhs3_c[i] = nl3_c[i] + visc3_c[i] + f3_c[i];
+        }
+    } else {
+        // 4'. bench 模式（f = 0）：RHS = v×rot(v) + P∆V
+        #pragma omp parallel for
+        for (size_t i = 0; i < nc; ++i) {
+            rhs1_c[i] = nl1_c[i] + visc1_c[i];
+            rhs2_c[i] = nl2_c[i] + visc2_c[i];
+            rhs3_c[i] = nl3_c[i] + visc3_c[i];
+        }
     }
 
     // 5. 投影：使 RHS 无散（P 算子）
     make_div_free(rhs1_c, rhs2_c, rhs3_c, div_c, phi_c, nx, ny, nz, outbox_c);
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -393,6 +418,7 @@ void rk4_step(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
         tmp_v2[i] = V2_c[i] + 0.5 * dt * k1_v2[i];
         tmp_v3[i] = V3_c[i] + 0.5 * dt * k1_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k2 = RHS(V^n + dt/2 * k1, t + dt/2)
     compute_rhs(fft, tmp_v1, tmp_v2, tmp_v3, k2_v1, k2_v2, k2_v3,
@@ -408,6 +434,7 @@ void rk4_step(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
         tmp_v2[i] = V2_c[i] + 0.5 * dt * k2_v2[i];
         tmp_v3[i] = V3_c[i] + 0.5 * dt * k2_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k3 = RHS(V^n + dt/2 * k2, t + dt/2)
     compute_rhs(fft, tmp_v1, tmp_v2, tmp_v3, k3_v1, k3_v2, k3_v3,
@@ -423,6 +450,7 @@ void rk4_step(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
         tmp_v2[i] = V2_c[i] + dt * k3_v2[i];
         tmp_v3[i] = V3_c[i] + dt * k3_v3[i];
     }
+    g_timer.mark(PH_SPEC);
 
     // k4 = RHS(V^n + dt * k3, t + dt)
     compute_rhs(fft, tmp_v1, tmp_v2, tmp_v3, k4_v1, k4_v2, k4_v3,
@@ -439,6 +467,7 @@ void rk4_step(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
         V2_c[i] += (dt / 6.0) * (k1_v2[i] + 2.0 * k2_v2[i] + 2.0 * k3_v2[i] + k4_v2[i]);
         V3_c[i] += (dt / 6.0) * (k1_v3[i] + 2.0 * k2_v3[i] + 2.0 * k3_v3[i] + k4_v3[i]);
     }
+    g_timer.mark(PH_SPEC);
 }
 
 // ==============================================================================
@@ -453,16 +482,27 @@ int main(int argc, char** argv) {
 
     if (argc < 6) {
         if (rank == 0) {
-            cerr << "Usage: " << argv[0] << " NX NY NZ dt NSTEPS [OMP_threads]\n";
-            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100\n";
+            cerr << "Usage: " << argv[0] << " " << nsmode::usage_tail(true) << "\n";
+            cerr << "  Example: mpirun -np 4 " << argv[0] << " 64 64 64 0.00001 100 4 bench\n";
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    nsmode::RunArgs rargs;
+    {
+        string perr;
+        if (!nsmode::parse_tail_args(argc, argv, 6, /*allow_threads=*/true, rargs, perr)) {
+            if (rank == 0) cerr << "Error: " << perr << "\nUsage: " << argv[0] << " "
+                                << nsmode::usage_tail(true) << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    const nsmode::RunMode mode = rargs.mode;
+    g_with_force = (mode == nsmode::MODE_VERIFY);
 
     int nx = atoi(argv[1]), ny = atoi(argv[2]), nz = atoi(argv[3]);
     double dt = atof(argv[4]);
     int nt_run = atoi(argv[5]);
-    int nthreads = (argc > 6) ? atoi(argv[6]) : omp_get_max_threads();
+    int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
     int max_threads = nthreads;
 
@@ -478,6 +518,8 @@ int main(int argc, char** argv) {
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs << "\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
+        cout << "Run mode: " << nsmode::mode_name(mode)
+             << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
     }
 
@@ -514,13 +556,15 @@ int main(int argc, char** argv) {
     Rvec V1_r(nr), V2_r(nr), V3_r(nr);
     Cvec V1_c(nc), V2_c(nc), V3_c(nc);
 
-    Rvec work_r1(nr), work_r2(nr), work_r3(nr);
+    // 外力缓冲（work_r 实空间 + f_c 频谱）仅 verify 模式分配；只在 compute_rhs 的外力分支中使用
+    const size_t nr_f = g_with_force ? nr : 0, nc_f = g_with_force ? nc : 0;
+    Rvec work_r1(nr_f), work_r2(nr_f), work_r3(nr_f);
     Rvec rot1_r(nr), rot2_r(nr), rot3_r(nr);
 
     Cvec rot1_c(nc), rot2_c(nc), rot3_c(nc);
     Cvec nl1_c(nc),  nl2_c(nc),  nl3_c(nc);
     Cvec visc1_c(nc), visc2_c(nc), visc3_c(nc);
-    Cvec f1_c(nc),   f2_c(nc),   f3_c(nc);
+    Cvec f1_c(nc_f), f2_c(nc_f), f3_c(nc_f);
     Cvec div_c(nc),  phi_c(nc);
 
     Cvec k1_v1(nc), k1_v2(nc), k1_v3(nc);
@@ -557,11 +601,15 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 误差计算辅助函数
     // ------------------------------------------------------------------
-    auto compute_error = [&](double time) -> pair<double, double> {
-        // backward(scale::full) 自动除以 N，得到物理值
+    // V_c → V_r：backward(scale::full) 自动除以 N，得到物理值（不破坏 V_c）
+    auto to_physical = [&]() {
         fft.backward(V1_c.data(), V1_r.data(), heffte::scale::full);
         fft.backward(V2_c.data(), V2_r.data(), heffte::scale::full);
         fft.backward(V3_c.data(), V3_r.data(), heffte::scale::full);
+    };
+
+    auto compute_error = [&](double time) -> pair<double, double> {
+        to_physical();
 
         double local_err = 0.0, local_max = 0.0;
         for (int i = inbox_r.low[0]; i <= inbox_r.high[0]; ++i) {
@@ -584,6 +632,18 @@ int main(int argc, char** argv) {
         return {sqrt(global_err * dx * dy * dz), global_max};
     };
 
+    // 总动能 0.5·Σ|v|²（物理空间逐点求和，bench 模式下的结果合理性检查）
+    auto compute_energy = [&]() -> double {
+        to_physical();
+        double local_e = 0.0;
+        #pragma omp parallel for reduction(+:local_e)
+        for (size_t idx = 0; idx < nr; ++idx)
+            local_e += V1_r[idx]*V1_r[idx] + V2_r[idx]*V2_r[idx] + V3_r[idx]*V3_r[idx];
+        double global_e = 0.0;
+        MPI_Reduce(&local_e, &global_e, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        return 0.5 * global_e;
+    };
+
     // ------------------------------------------------------------------
     // 时间推进（RK4）
     // ------------------------------------------------------------------
@@ -592,6 +652,7 @@ int main(int argc, char** argv) {
     for (ptrdiff_t it = 0; it < nt_run; ++it) {
         double t_cur = it * dt;
         double t0 = MPI_Wtime();
+        g_timer.start();
         rk4_step(fft, V1_c, V2_c, V3_c,
                  V1_r, V2_r, V3_r,
                  work_r1, work_r2, work_r3,
@@ -614,12 +675,28 @@ int main(int argc, char** argv) {
         t_wall_total += global_step;
     }
 
+    double phase_max[nsmode::PH_COUNT];
+    nsmode::reduce_phases_max(g_timer.acc, phase_max);
+
+    // 以下诊断均不计入计时
     {
         double t_final = nt_run * dt;
-        auto [errL2, errLinf] = compute_error(t_final);
+        double max_div = compute_div_max(V1_c, V2_c, V3_c, div_c, nx, ny, nz, outbox_c);
+        if (mode == nsmode::MODE_VERIFY) {
+            auto [errL2, errLinf] = compute_error(t_final);
+            (void)errLinf;
+            if (rank == 0)
+                cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(4) << errL2 << "\n";
+        } else {
+            double ekin = compute_energy();
+            if (rank == 0)
+                cout << "  Kinetic energy 0.5*sum|v|^2 (t=" << fixed << setprecision(6) << t_final << "): "
+                     << scientific << setprecision(10) << ekin << "\n";
+        }
         if (rank == 0)
-            cout << "  L2 error (t=" << fixed << setprecision(6) << t_final << "): "
-                 << scientific << setprecision(4) << errL2 << "\n";
+            cout << "  max|div V| (t=" << fixed << setprecision(6) << t_final << "): "
+                 << scientific << setprecision(4) << max_div << "\n";
     }
 
     if (rank == 0) {
@@ -629,6 +706,8 @@ int main(int argc, char** argv) {
         cout << "  Total steps:     " << nt_run << "\n";
         cout << "  Total wall time: " << fixed << setprecision(4) << t_wall_total << " s\n";
         cout << "  Avg per step:    " << t_wall_total / nt_run << " s\n";
+        cout << flush;
+        nsmode::print_phase_summary(phase_max, t_wall_total, nt_run, mode);
         cout << "============================================================\n";
     }
     }  // heFFTe fft 对象在此析构（MPI_Finalize 之前）
