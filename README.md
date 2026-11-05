@@ -242,7 +242,7 @@ make -f Makefile_p3dfft
 make -f Makefile_accfft
 ```
 
-在 MSU-270 上，编译命令以超算上的 `build/compile_all.sh` 为准。P3DFFT 版必须用 nvc++ 编译
+在 MSU-270 上，编译命令以 `scripts/compile_all.sh` 为准。P3DFFT 版必须用 nvc++ 编译
 （`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++。
 
 ### 运行
@@ -314,8 +314,7 @@ mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100
 - bench 没有解析解，因此不输出 L2；动能和散度用于确认结果有限、无 NaN。
   各库在相同网格/步数下的动能应一致（本机 64³、dt=1e-4、10 步，4 个 CPU 版均为 3.2040343055e+05），可作交叉检查。
 - 诊断（L2 / 动能 / 散度）都在计时循环之后计算，不计入耗时。
-- max|div V| 按各版本自身的谱系数约定计算：FFTW / cuFFT / cuFFTXt / cuFFTMp 存储归一化系数，
-  heFFTe / p3dfft / AccFFT 存储非归一化 DFT 系数（数值大 N 倍），因此不同库之间该值不可直接比较，只用于判断是否接近 0。
+- max|div V| 在所有版本中都按归一化谱系数输出（heFFTe / p3dfft / AccFFT 内部存非归一化 DFT 系数，输出前除以 N），各版本之间可以直接比较。
 
 **参数解析规则（CPU 版 OMP_THREADS 与 mode 共存，无歧义）：**
 NSTEPS 之后的每个参数按类型识别——纯数字为 `OMP_THREADS`，`verify` / `bench`（也接受 `mode=bench`、`--mode=bench`）为模式，

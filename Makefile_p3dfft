@@ -1,7 +1,7 @@
 # Makefile for p3dfft版本Navier-Stokes求解器
 # 仅适用于 libp3dfft 由 gfortran 构建的本地环境。
 # MSU-270 上 libp3dfft 由 nvfortran/nvc 构建，必须用 nvc++ 编译（OMPI_CXX=nvc++ mpicxx ... -mp），
-# 否则会混用两套 OpenMP 运行库导致崩溃；命令以超算上的 build/compile_all.sh 为准。
+# 否则会混用两套 OpenMP 运行库导致崩溃；命令以 scripts/compile_all.sh 为准。
 
 CXX = mpicxx
 CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp -fno-math-errno
