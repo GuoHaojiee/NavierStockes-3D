@@ -122,7 +122,7 @@ __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
     int lx = (int)(idx / ((long long)d_NY * d_NZ));
     int gi = x_offset + lx;
     double x = gi * d_DX, y = j * d_DY, z = k * d_DZ;
-    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + (long long)j * 2*d_NZC + k;
     V1[pidx] = func_V1(x, y, z, t);
     V2[pidx] = func_V2(x, y, z, t);
     V3[pidx] = func_V3(x, y, z, t);
@@ -138,7 +138,7 @@ __global__ void kernel_fill_forcing(double* W1, double* W2, double* W3,
     int lx = (int)(idx / ((long long)d_NY * d_NZ));
     int gi = x_offset + lx;
     double x = gi * d_DX, y = j * d_DY, z = k * d_DZ;
-    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + (long long)j * 2*d_NZC + k;
     W1[pidx] = func_f1(x, y, z, t);
     W2[pidx] = func_f2(x, y, z, t);
     W3[pidx] = func_f3(x, y, z, t);
@@ -153,7 +153,7 @@ __global__ void kernel_cross_product(const double* V1, const double* V2, const d
     int k  = (int)(idx % d_NZ);
     int j  = (int)((idx / d_NZ) % d_NY);
     int lx = (int)(idx / ((long long)d_NY * d_NZ));
-    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + (long long)j * 2*d_NZC + k;
     double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
     double w1 = rot1[pidx], w2 = rot2[pidx], w3 = rot3[pidx];
     rot1[pidx] = v2*w3 - v3*w2;
@@ -171,7 +171,7 @@ __global__ void kernel_error_sq(const double* V1, const double* V2, const double
     int lx = (int)(idx / ((long long)d_NY * d_NZ));
     int gi = x_offset + lx;
     double x = gi * d_DX, y = j * d_DY, z = k * d_DZ;
-    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + (long long)j * 2*d_NZC + k;
     double d1 = V1[pidx] - func_V1(x, y, z, t);
     double d2 = V2[pidx] - func_V2(x, y, z, t);
     double d3 = V3[pidx] - func_V3(x, y, z, t);
@@ -187,7 +187,7 @@ __global__ void kernel_energy_sq(const double* V1, const double* V2, const doubl
     int k  = (int)(idx % d_NZ);
     int j  = (int)((idx / d_NZ) % d_NY);
     int lx = (int)(idx / ((long long)d_NY * d_NZ));
-    long long pidx = (long long)lx * d_NY * 2*d_NZC + j * 2*d_NZC + k;
+    long long pidx = (long long)lx * d_NY * 2*d_NZC + (long long)j * 2*d_NZC + k;
     double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
     scratch[idx] = v1*v1 + v2*v2 + v3*v3;
 }
@@ -426,7 +426,7 @@ static void free_state(State& s) {
 // ============================================================
 
 static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s) {
-    const double inv_N = 1.0/(double)(NX*NY*NZ);
+    const double inv_N = 1.0/((double)NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
@@ -471,7 +471,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
 }
 
 static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
-    const double inv_N = 1.0/(double)(NX*NY*NZ);
+    const double inv_N = 1.0/((double)NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
@@ -598,7 +598,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                  State& s, double t, bool verify,
                                  double& L2_or_energy, double& max_div) {
-    const double inv_N = 1.0/(double)(NX*NY*NZ);
+    const double inv_N = 1.0/((double)NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
@@ -739,7 +739,7 @@ int main(int argc, char** argv) {
     CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    const double inv_N = 1.0/(double)(NX*NY*NZ);
+    const double inv_N = 1.0/((double)NX*NY*NZ);
     {
         int gc = (int)((s.nc_local + BLOCK - 1) / BLOCK);
         kernel_scale_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.nc_local, inv_N);
