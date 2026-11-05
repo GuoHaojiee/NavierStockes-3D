@@ -204,7 +204,7 @@ $$p = (t^2+1) \cos x \cos y \cos z$$
 ├── NavierStokes_periodic_heffte_gpu1.cu     # 单节点多 GPU（heFFTe+cuFFT）
 ├── NavierStokes_periodic_heffte_mgpu.cu     # 单节点多 GPU（heFFTe+cuFFT）
 ├── NavierStokes_periodic_heffte_multigpu.cu # 多节点多 GPU（heFFTe+cuFFT）
-├── NavierStokes_periodic_cufftmp_mgpu.cu    # 单节点多 GPU（cuFFTMp）
+├── NavierStokes_periodic_cufftmp_mgpu.cu    # [deprecated] 单节点多 GPU（cuFFTMp），≥2 GPU 时结果为 NaN，请用 multinode 版
 ├── NavierStokes_periodic_cufftmp_multinode.cu # 多节点多 GPU（cuFFTMp）
 ├── common_mode.h                            # 公共：verify/bench 模式解析、分阶段计时
 ├── test_spectral_derivative*.cpp            # 各库谱导数验证
@@ -241,6 +241,9 @@ make -f Makefile_p3dfft
 # AccFFT 版
 make -f Makefile_accfft
 ```
+
+在 MSU-270 上，编译命令以超算上的 `build/compile_all.sh` 为准。P3DFFT 版必须用 nvc++ 编译
+（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++。
 
 ### 运行
 
@@ -286,8 +289,8 @@ mpirun -np 4 ./navier_stokes_accfft 64 64 64 1e-4 100 4
 mpirun -np 4 ./navier_stokes_heffte_gpu1 128 128 128 1e-4 100
 mpirun -np 4 ./navier_stokes_heffte_mgpu 128 128 128 1e-4 100
 
-# cuFFTMp
-mpirun -np 4 ./navier_stokes_cufftmp_mgpu 128 128 128 1e-4 100
+# cuFFTMp：cufftmp_mgpu 已 deprecated（≥2 GPU 时结果为 NaN，不再维护），单节点也请用 multinode 版
+mpirun -np 4 ./navier_stokes_cufftmp_multinode 128 128 128 1e-4 100
 ```
 
 #### 多 GPU（多节点）
@@ -366,6 +369,13 @@ mpirun -np 4 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 10 bench
 | AccFFT | $\sim 2.5\times10^{-14}$ |
 
 所有版本均达到机器精度量级，验证了实现的正确性。
+
+verify 模式的参考值（$dt=5\times10^{-5}$，10 步）：
+
+| 网格 | L2 误差 | 说明 |
+|------|---------|------|
+| $64^3$ | $6.0041\times10^{-10}$ | 各版本应一致 |
+| $128^3$ | $\approx 3.8\times10^{-14}$ | 已接近舍入误差，随 FFT 库和运行而变化（约 3.81–3.93e-14），只能比较量级 |
 
 ### 可扩展性
 

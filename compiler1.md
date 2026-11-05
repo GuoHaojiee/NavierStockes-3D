@@ -94,6 +94,11 @@ export PATH=$_NVHPC_ARCH/compilers/bin:$MPI_HOME/bin:/opt/ucx-1.17/bin:$PATH
 
 ## 三、编译命令
 
+> **以超算上的 `build/compile_all.sh` 为准。** 本文档的命令仅供参考，如有出入请以该脚本为准。
+>
+> **P3DFFT 版必须用 nvc++ 编译**（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++。
+> P3DFFT 行未加 `-fno-math-errno`：尚未确认 nvc++ 是否接受该选项，确认后再补上。
+
 所有编译在容器内、代码目录下执行。
 
 ### CPU 版本
@@ -122,7 +127,7 @@ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
 
 # P3DFFT v2（MPI 多进程）
 NVHPC_COMPLIB=$NVHPC/Linux_x86_64/$NVHPC_VERSION/compilers/lib
-$MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
+OMPI_CXX=nvc++ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -mp \
     NavierStokes_periodic_p3dfft.cpp \
     -I$P3DFFT_HOME/include -I/opt/fftw3/include \
     -L$P3DFFT_HOME/lib -L/opt/fftw3/lib -L$NVHPC_COMPLIB \

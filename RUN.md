@@ -75,8 +75,8 @@ mpirun -np 4 ./navier_stokes_accfft     64 64 64 1e-4 100 bench   # 默认线程
 mpirun -np 4 ./navier_stokes_heffte_gpu1  128 128 128 1e-4 100 bench
 mpirun -np 4 ./navier_stokes_heffte_mgpu  128 128 128 1e-4 100 bench
 
-# cuFFTMp
-mpirun -np 4 ./navier_stokes_cufftmp_mgpu 128 128 128 1e-4 100 bench
+# cuFFTMp：cufftmp_mgpu 已 deprecated（≥2 GPU 时结果为 NaN，不再维护），单节点也请用 multinode 版
+mpirun -np 4 ./navier_stokes_cufftmp_multinode 128 128 128 1e-4 100 bench
 ```
 
 ### 多节点多 GPU
