@@ -408,7 +408,7 @@ __global__ void kernel_div_abs(const GCplx* V1_c, const GCplx* V2_c, const GCplx
 static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                GPUArrays& g,
                                GCplx* rhs1_c, GCplx* rhs2_c, GCplx* rhs3_c) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / ((double)NX * NY * NZ);
 
     // 1. Spectral vorticity (reads V_c)
     kernel_compute_rot<<<GRID_C, BLOCK>>>(g.V1_c, g.V2_c, g.V3_c,
@@ -447,7 +447,7 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
                          GPUArrays& g,
                          GCplx* rhs1_c, GCplx* rhs2_c, GCplx* rhs3_c,
                          double t) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / ((double)NX * NY * NZ);
 
     // 1. Viscous: visc_c = -k² V_c  (MUST run before compute_nonlinear which destroys V_c)
     kernel_compute_viscous<<<GRID_C, BLOCK>>>(g.V1_c, g.visc1_c);
@@ -546,7 +546,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                  GPUArrays& g, double t, bool verify,
                                  double& L2_or_energy, double& max_div) {
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / ((double)NX * NY * NZ);
 
     // 1. V_c → V_r (Z2D, may destroy V_c)
     CUFFT_CHECK(cufftExecZ2D(plan_c2r, g.V1_c, g.V1_r));
@@ -672,7 +672,7 @@ int main(int argc, char** argv) {
     kernel_fill_velocity<<<GRID_R, BLOCK>>>(g.V1_r, g.V2_r, g.V3_r, 0.0);
 
     // Forward FFT: V_r → V_c, normalize  (V_c = DFT(V_r)/N)
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / ((double)NX * NY * NZ);
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.V1_r, g.V1_c));
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.V2_r, g.V2_c));
     CUFFT_CHECK(cufftExecD2Z(plan_r2c, g.V3_r, g.V3_c));
