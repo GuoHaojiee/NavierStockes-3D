@@ -243,7 +243,7 @@ make -f Makefile_accfft
 ```
 
 在 MSU-270 上，编译命令以 `scripts/compile_all.sh` 为准。P3DFFT 版必须用 nvc++ 编译
-（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++。
+（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++，并加 `-fno-math-errno`；nvc++ 不接受 `-fno-math-errno`，因此 P3DFFT 的编译行不加该选项。
 
 ### 运行
 

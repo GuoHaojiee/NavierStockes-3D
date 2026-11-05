@@ -28,6 +28,7 @@ c ns_cufftmp_$v nvcc -O3 -std=c++17 -arch=sm_80 NavierStokes_periodic_cufftmp_$v
              -Xlinker -rpath,$CUFFTMP_HOME/lib -Xlinker -rpath,$NVSHMEM_HOME/lib
 done
 # P3DFFT：与论文一致，用 nvc++（HPC-X 默认），避免 OpenMP 运行库混用
+# nvc++ 不接受 -fno-math-errno，因此这一行不加
 c ns_p3dfft env OMPI_CXX=nvc++ mpicxx -O3 -std=c++17 -mp NavierStokes_periodic_p3dfft.cpp -I$P3DFFT_HOME/include \
              -L$P3DFFT_HOME/lib -lp3dfft -lfftw3_mpi -lfftw3_threads -lfftw3 -lfftw3f -lnvf -lmpi_mpifh -lm \
              -Wl,-rpath,/opt/fftw3/lib

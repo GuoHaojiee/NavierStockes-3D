@@ -47,7 +47,7 @@ cd /home/user/guo/NavierStockes-3D
 > **以 `scripts/compile_all.sh` 为准。** 本文档的命令仅供参考，如有出入请以该脚本为准。
 >
 > **P3DFFT 版必须用 nvc++ 编译**（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++。
-> P3DFFT 行未加 `-fno-math-errno`：尚未确认 nvc++ 是否接受该选项，确认后再补上。
+> nvc++ 不接受 `-fno-math-errno`，因此 P3DFFT 的编译行不加该选项。
 
 ### CPU 版本
 
