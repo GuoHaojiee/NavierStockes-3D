@@ -52,12 +52,12 @@ struct AccCtx {
 
 // 实空间线性索引（0-based 本地，z 步长为全局 nz）
 inline long idx_r(const AccCtx& ctx, int i, int j, int k) {
-    return (long)i * ctx.isize[1] * ctx.nz + j * ctx.nz + k;
+    return (long)i * ctx.isize[1] * ctx.nz + (long)j * ctx.nz + k;
 }
 
 // 频谱空间线性索引（0-based 本地）
 inline long idx_c(const AccCtx& ctx, int i, int j, int k) {
-    return (long)i * ctx.osize[1] * ctx.osize[2] + j * ctx.osize[2] + k;
+    return (long)i * ctx.osize[1] * ctx.osize[2] + (long)j * ctx.osize[2] + k;
 }
 
 // 物理坐标
@@ -600,7 +600,7 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     AccCtx ctx;
     ctx.nx = nx;  ctx.ny = ny;  ctx.nz = nz;
-    ctx.norm_inv = 1.0 / static_cast<double>(nx * ny * nz);
+    ctx.norm_inv = 1.0 / (static_cast<double>(nx) * ny * nz);
 
     int c_dims[2] = {0, 0};   // {0,0} 让 AccFFT 自动选择最优进程网格
     MPI_Comm c_comm;
@@ -612,6 +612,22 @@ int main(int argc, char** argv) {
 
     ctx.local_size_r = (long)ctx.isize[0] * ctx.isize[1] * nz;
     ctx.local_size_c = (long)ctx.osize[0] * ctx.osize[1] * ctx.osize[2];
+
+    // AccFFT 内部用 int 保存缓冲区字节数（alloc_max / alloc_local），单进程超过 2 GB 就会溢出，
+    // 属于库的限制。这里提前报错，避免分配错误大小后内存越界或得到错误结果。
+    {
+        const long avg_bytes = (long)nx * ny * (nz / 2 + 1) * (long)sizeof(Complex) / nprocs;
+        const long local_bytes = ctx.local_size_c * (long)sizeof(Complex);
+        int bad_local = (avg_bytes >= 2147483647L || (long)alloc_max < local_bytes) ? 1 : 0, bad = 0;
+        MPI_Allreduce(&bad_local, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (bad) {
+            if (rank == 0)
+                cerr << "Error: AccFFT stores buffer sizes in int; this grid needs about "
+                     << avg_bytes / 1048576L << " MB of FFT buffer per rank (limit 2048 MB). "
+                     << "Use more MPI ranks.\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
 
     accfft_init(max_threads);
 
