@@ -248,7 +248,8 @@ double compute_div_max(const Cvec& V1, const Cvec& V2, const Cvec& V3,
     }
     double global_max = 0.0;
     MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    return global_max;
+    // 谱系数为非归一化 DFT（= N × 归一化系数），除以 N 后才是物理量，与其他版本可比
+    return global_max / ((double)nx * ny * nz);
 }
 
 // ==============================================================================
