@@ -9,11 +9,11 @@ RPC="-Wl,-rpath,/opt/fftw3/lib -Wl,-rpath,$HEFFTE_DIR/lib -Wl,-rpath,$NVLIB -Wl,
 RPN="-Xlinker -rpath,/opt/fftw3/lib -Xlinker -rpath,$HEFFTE_DIR/lib -Xlinker -rpath,$MATH/lib"        # for nvcc
 c(){ name=$1; shift; if "$@" -o $OUT/$name > $OUT/$name.log 2>&1; then echo "OK   $name"; else echo "FAIL $name (see bin_gcc/$name.log)"; fi; }
 
-c ns_fftw    mpicxx -O3 -std=c++17 -fopenmp NavierStokes_periodic_fftw.cpp \
+c ns_fftw    mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno NavierStokes_periodic_fftw.cpp \
              -lfftw3_mpi -lfftw3_threads -lfftw3 -lpthread -lm $RPC
-c ns_accfft  mpicxx -O3 -std=c++17 -fopenmp NavierStokes_periodic_accfft.cpp -I$ACCFFT_DIR/include -L$ACCFFT_DIR/lib \
+c ns_accfft  mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno NavierStokes_periodic_accfft.cpp -I$ACCFFT_DIR/include -L$ACCFFT_DIR/lib \
              -laccfft -laccfft_utils -lfftw3_mpi -lfftw3_threads -lfftw3 -lfftw3f_threads -lfftw3f -lpthread -lm $RPC
-c ns_heffte_v2 nvcc -O3 -std=c++17 -arch=sm_80 -ccbin mpicxx -Xcompiler -fopenmp NavierStokes_periodic_heffte_v2.cpp \
+c ns_heffte_v2 nvcc -O3 -std=c++17 -arch=sm_80 -ccbin mpicxx -Xcompiler -fopenmp -Xcompiler -fno-math-errno NavierStokes_periodic_heffte_v2.cpp \
              -lheffte -lfftw3 -lfftw3f -lm $RPN
 c ns_cufft   nvcc -O3 -std=c++17 -arch=sm_80 NavierStokes_periodic_cufft.cu -lcufft -lm $RPN
 c ns_cufftxt nvcc -O3 -std=c++17 -arch=sm_80 -ccbin mpicxx NavierStokes_periodic_cufftxt.cu -lcufft -lm $RPN
