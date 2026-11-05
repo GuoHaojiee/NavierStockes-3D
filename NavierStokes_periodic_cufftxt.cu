@@ -218,7 +218,7 @@ __global__ void kernel_fill_velocity(double* V1, double* V2, double* V3,
     int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
     double x = gi * DX_, y = j * DY_, z = k * DZ_;
-    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + (long long)j * 2*NZC_ + k;
     V1[pidx] = func_V1(x, y, z, t);
     V2[pidx] = func_V2(x, y, z, t);
     V3[pidx] = func_V3(x, y, z, t);
@@ -236,7 +236,7 @@ __global__ void kernel_fill_forcing(double* W1, double* W2, double* W3,
     int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
     double x = gi * DX_, y = j * DY_, z = k * DZ_;
-    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + (long long)j * 2*NZC_ + k;
     W1[pidx] = func_f1(x, y, z, t);
     W2[pidx] = func_f2(x, y, z, t);
     W3[pidx] = func_f3(x, y, z, t);
@@ -252,7 +252,7 @@ __global__ void kernel_cross_product(const double* V1, const double* V2, const d
     int k  = (int)(idx % NZ_);
     int j  = (int)((idx / NZ_) % NY_);
     int lx = (int)(idx / ((long long)NY_ * NZ_));
-    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + (long long)j * 2*NZC_ + k;
     double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
     double w1 = rot1[pidx], w2 = rot2[pidx], w3 = rot3[pidx];
     rot1[pidx] = v2*w3 - v3*w2;
@@ -272,7 +272,7 @@ __global__ void kernel_error_sq(const double* V1, const double* V2, const double
     int lx = (int)(idx / ((long long)NY_ * NZ_));
     int gi = x_offset + lx;
     double x = gi * DX_, y = j * DY_, z = k * DZ_;
-    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + (long long)j * 2*NZC_ + k;
     double d1 = V1[pidx] - func_V1(x, y, z, t);
     double d2 = V2[pidx] - func_V2(x, y, z, t);
     double d3 = V3[pidx] - func_V3(x, y, z, t);
@@ -288,7 +288,7 @@ __global__ void kernel_energy_sq(const double* V1, const double* V2, const doubl
     int k  = (int)(idx % NZ_);
     int j  = (int)((idx / NZ_) % NY_);
     int lx = (int)(idx / ((long long)NY_ * NZ_));
-    long long pidx = (long long)lx * NY_ * 2*NZC_ + j * 2*NZC_ + k;
+    long long pidx = (long long)lx * NY_ * 2*NZC_ + (long long)j * 2*NZC_ + k;
     double v1 = V1[pidx], v2 = V2[pidx], v3 = V3[pidx];
     scratch[idx] = v1*v1 + v2*v2 + v3*v3;
 }
@@ -592,7 +592,7 @@ static void mark_sync(const MGPUState& s, nsmode::Phase p) {
 // ============================================================
 static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                MGPUState& s) {
-    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
+    const double inv_N = 1.0 / ((double)s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
@@ -673,7 +673,7 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r,
 // ============================================================
 static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r,
                         MGPUState& s, double t) {
-    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
+    const double inv_N = 1.0 / ((double)s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
@@ -921,7 +921,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r,
 static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
                                  MGPUState& s, double t, bool verify,
                                  double& L2_or_energy, double& max_div) {
-    const double inv_N = 1.0 / (double)(s.h_NX * s.h_NY * s.h_NZ);
+    const double inv_N = 1.0 / ((double)s.h_NX * s.h_NY * s.h_NZ);
     const int nGPUs = s.nGPUs;
     const long long nc_local = s.nc_local;
     const long long nr_local = s.nr_local;
@@ -1112,7 +1112,7 @@ int main(int argc, char** argv) {
     sync_all_gpus(s);
 
     // Normalize
-    const double inv_N = 1.0 / (double)(NX * NY * NZ);
+    const double inv_N = 1.0 / ((double)NX * NY * NZ);
     #pragma omp parallel for num_threads(s.nGPUs)
     for (int g = 0; g < s.nGPUs; g++) {
         CUDA_CHECK(cudaSetDevice(s.gpu_ids[g]));
