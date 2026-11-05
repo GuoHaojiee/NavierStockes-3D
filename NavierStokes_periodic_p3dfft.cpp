@@ -660,7 +660,7 @@ int main(int argc, char** argv) {
     ctx.idx_offset = (ctx.istart[0] == 0) ? 0 : 1;
 
     // 归一化因子（逆变换后除以 N）
-    ctx.norm_inv = 1.0 / static_cast<double>(nx * ny * nz);
+    ctx.norm_inv = 1.0 / (static_cast<double>(nx) * ny * nz);
 
     if (rank == 0) {
         cout << "idx_offset = " << ctx.idx_offset << "\n";
