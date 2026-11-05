@@ -458,7 +458,8 @@ static pair<double,double> compute_diagnostics(FFT& fft, GPUArrays& g,
         bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
     double ld=thrust::reduce(thrust::device,sp,sp+bc.n(),0.,thrust::maximum<double>()), gd;
     MPI_Reduce(&ld,&gd,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-    return {verify ? sqrt(ge*DX*DY*DZ) : 0.5*ge, gd};
+    // V_c is a non-normalised DFT (= N x normalised coefficient): divide by N so max|div V| is comparable
+    return {verify ? sqrt(ge*DX*DY*DZ) : 0.5*ge, gd/((double)NX*NY*NZ)};
 }
 
 // ============================================================
