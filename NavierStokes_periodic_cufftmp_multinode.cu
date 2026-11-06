@@ -22,6 +22,7 @@
 #include <mpi.h>
 #include <cuda_runtime.h>
 #include <cufft.h>
+#include <nvshmem.h>
 #include <cufftMp.h>
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
@@ -713,9 +714,39 @@ int main(int argc, char** argv) {
         CUFFT_XT_FORMAT_INPLACE_SHUFFLED,
         CUFFT_XT_FORMAT_INPLACE));
 
+    // The two plans never execute at the same time, so they can share one cuFFT
+    // work area instead of auto-allocating one each. Sequence as in NVIDIA's
+    // cuFFTMp sample r2c_c2r_shared_scratch. Set NS_SHARE_WORK_AREA=0 to disable.
+    int share_ws = 1;
+    if (s.rank == 0) {
+        const char* env = getenv("NS_SHARE_WORK_AREA");
+        if (env && strcmp(env, "0") == 0) share_ws = 0;
+    }
+    MPI_Bcast(&share_ws, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (share_ws) {
+        CUFFT_CHECK(cufftSetAutoAllocation(plan_r2c, 0));
+        CUFFT_CHECK(cufftSetAutoAllocation(plan_c2r, 0));
+    }
+
     size_t ws_r2c = 0, ws_c2r = 0;
     CUFFT_CHECK(cufftMakePlan3d(plan_r2c, NX, NY, NZ, CUFFT_D2Z, &ws_r2c));
     CUFFT_CHECK(cufftMakePlan3d(plan_c2r, NX, NY, NZ, CUFFT_Z2D, &ws_c2r));
+
+    // nvshmem_malloc needs the same size on every rank: max over plans and ranks.
+    long long ws_shared = (long long)std::max(ws_r2c, ws_c2r);
+    MPI_Allreduce(MPI_IN_PLACE, &ws_shared, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+    void* shared_work_area = nullptr;
+    if (share_ws && ws_shared > 0) {
+        shared_work_area = nvshmem_malloc((size_t)ws_shared);
+        if (!shared_work_area) {
+            fprintf(stderr, "Rank %d: nvshmem_malloc(%lld bytes) failed for the shared work area\n",
+                    s.rank, ws_shared);
+            fflush(stderr);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        CUFFT_CHECK(cufftSetWorkArea(plan_r2c, shared_work_area));
+        CUFFT_CHECK(cufftSetWorkArea(plan_c2r, shared_work_area));
+    }
 
     alloc_state(s, plan_r2c);
 
@@ -796,6 +827,8 @@ int main(int argc, char** argv) {
     }
 
     free_state(s);
+    // Must precede cufftDestroy, which may finalize NVSHMEM.
+    if (shared_work_area) nvshmem_free(shared_work_area);
     CUFFT_CHECK(cufftDestroy(plan_r2c));
     CUFFT_CHECK(cufftDestroy(plan_c2r));
     MPI_Finalize();
