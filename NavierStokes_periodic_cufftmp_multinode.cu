@@ -372,7 +372,7 @@ struct State {
     GCplx *rhs1_c, *rhs2_c, *rhs3_c;        // holds -k^2 V between kernel A and kernel B
     GCplx *V1_orig, *V2_orig, *V3_orig;     // V^n
     GCplx *acc1_c, *acc2_c, *acc3_c;        // RK4 accumulator
-    double *scratch;
+    double *scratch;                        // diagnostics only: shares rhs1_c's memory
 };
 
 // cufftXtMalloc + immediate memset to zero.
@@ -404,9 +404,16 @@ static void alloc_state(State& s, cufftHandle plan_r2c) {
     C(&s.V1_orig); C(&s.V2_orig); C(&s.V3_orig);
     C(&s.acc1_c);  C(&s.acc2_c);  C(&s.acc3_c);
 
-    long long sc_size = std::max(s.nc_local, s.nr_local);
-    CUDA_CHECK(cudaMalloc(&s.scratch, sc_size * sizeof(double)));
-    CUDA_CHECK(cudaMemset(s.scratch,  0, sc_size * sizeof(double)));
+    // Diagnostics run only after the timed loop, when rhs is no longer needed,
+    // so they reuse rhs1's memory as scratch (one double per mode or grid point).
+    const long long sc_size = std::max(s.nc_local, s.nr_local);
+    if ((long long)(s.nc_local * sizeof(GCplx)) < sc_size * (long long)sizeof(double)) {
+        fprintf(stderr, "Rank %d: rhs1 (%lld complex) too small for scratch (%lld double)\n",
+                s.rank, s.nc_local, sc_size);
+        fflush(stderr);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    s.scratch = (double*)s.rhs1_c;
 }
 
 static void free_state(State& s) {
@@ -418,7 +425,6 @@ static void free_state(State& s) {
     cudaFree(s.rhs1_c);  cudaFree(s.rhs2_c);  cudaFree(s.rhs3_c);
     cudaFree(s.V1_orig); cudaFree(s.V2_orig); cudaFree(s.V3_orig);
     cudaFree(s.acc1_c);  cudaFree(s.acc2_c);  cudaFree(s.acc3_c);
-    cudaFree(s.scratch);
 }
 
 // =============================================================================
