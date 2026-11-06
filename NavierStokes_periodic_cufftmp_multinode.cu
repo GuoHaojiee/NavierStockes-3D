@@ -753,6 +753,28 @@ int main(int argc, char** argv) {
     // Warm up all FFT buffers before setting initial conditions.
     warmup_buffers(plan_r2c, plan_c2r, s);
 
+    // Memory report. Taken after the warm-up, so that anything cuFFTMp allocates
+    // lazily on the first transforms is included.
+    {
+        const double GB = 1024.0*1024.0*1024.0;
+        size_t mem_free = 0, mem_total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&mem_free, &mem_total));
+        double in[3] = { (double)ws_r2c, (double)ws_c2r, (double)(mem_total - mem_free) }, mx[3];
+        MPI_Allreduce(in, mx, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        const int n_buf = g_with_force ? 9 : 6, n_plain = 9;
+        if (s.rank == 0) {
+            printf("Memory report (per GPU):\n");
+            printf("  cuFFT work area: ws_r2c = %.3f GB, ws_c2r = %.3f GB (%s)\n", mx[0]/GB, mx[1]/GB,
+                   share_ws ? "shared by both plans" : "one per plan");
+            printf("  Full-size complex arrays: %d (%d cuFFT buffers of %.3f GB, %d cudaMalloc of %.3f GB)\n",
+                   n_buf + n_plain, n_buf, gpu_size_bytes(s.V1_buf)/GB,
+                   n_plain, s.nc_local*sizeof(GCplx)/GB);
+            printf("  GPU memory in use (max over ranks, cudaMemGetInfo): %.3f GB of %.3f GB\n",
+                   mx[2]/GB, mem_total/GB);
+            fflush(stdout);
+        }
+    }
+
     if (s.rank == 0) cout << "Setting initial conditions...\n" << flush;
     {
         int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
