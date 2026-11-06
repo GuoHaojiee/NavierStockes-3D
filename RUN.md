@@ -89,6 +89,14 @@ mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100 bench
 
 ---
 
+## 环境变量
+
+| 变量 | 含义 |
+|------|------|
+| `NS_SHARE_WORK_AREA=0` | 仅 cuFFTMp 多节点版：不共用 cuFFT 工作区，改回每个计划各自分配。默认共用，以节省显存 |
+
+---
+
 ## 批处理脚本兼容性
 
 `Bench/files/*.sbatch` 通过 `grep "Avg per step:" | awk '{print $(NF-1)}'` 取耗时，该行格式未变。

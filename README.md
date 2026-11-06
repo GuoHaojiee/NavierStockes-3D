@@ -352,6 +352,33 @@ mpirun -np 4 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 10 bench
 - CPU 版用主机墙钟；单 GPU / 每进程一 GPU 的版本（cuFFT、cuFFTMp、heFFTe GPU）用默认流上的 cudaEvent，不额外同步；
   cuFFTXt（单进程多 GPU）在每个计时点前同步全部 GPU（复用已有的 SYNC 点，bench 模式不增加同步）。
 
+### cuFFTMp 多节点版的显存
+
+`NavierStokes_periodic_cufftmp_multinode.cu` 为了减少显存，改用累加形式存储 RK4。它仍是同一个经典 RK4，系数不变：
+
+```
+k    = P[ inv_N·rot + rhs (+ inv_N·work，仅 verify) ]    # k 不写回显存
+阶段1: acc  = V_orig + τ/6·k;   V = V_orig + τ/2·k
+阶段2: acc += τ/3·k;            V = V_orig + τ/2·k
+阶段3: acc += τ/3·k;            V = V_orig + τ·k
+阶段4:                          V = acc + τ/6·k
+```
+
+每个 GPU 上的全尺寸复数数组：
+
+| | bench | verify |
+|---|---|---|
+| 修改前 | 27 + scratch 0.5 | 33 + scratch 0.5 |
+| 修改后 | 15（V×3、rot×3、rhs×3、V_orig×3、acc×3） | 18（另加 work×3） |
+
+- 诊断用的 scratch 复用 rhs1 的内存。
+- 与修改前相比，结果只有舍入级的差异。
+- 程序启动时打印 `Memory report`：`ws_r2c`、`ws_c2r`、数组个数和大小、每卡已用显存。
+
+**共享工作区：** R2C 和 C2R 两个计划从不同时执行，默认共用一块 cuFFT 工作区（用 `nvshmem_malloc` 分配）。
+做法见 NVIDIA 示例 [r2c_c2r_shared_scratch](https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuFFTMp/samples/r2c_c2r_shared_scratch)。
+设置 `NS_SHARE_WORK_AREA=0` 可以改回每个计划各自分配，不需要重新编译。
+
 ---
 
 ## 验证与结果
