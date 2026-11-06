@@ -565,17 +565,14 @@ static void save_v_orig(State& s) {
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.V3_orig, s.nc_local);
 }
 
-// V_buf data is X-slab real (INPLACE) after compute_nonlinear.
-// Overwrite with V_orig (Y-slab complex, spectral) and mark subFormat = SHUFFLED
-// so the next compute_rhs call correctly interprets the layout.
-static void restore_v_buf(State& s) {
-    int gc = (int)((s.nc_local + BLOCK - 1) / BLOCK);
+// V_buf data is X-slab real (INPLACE) after compute_nonlinear, and is about to be
+// completely overwritten with Y-slab complex data by kernel_rk4_axpy/_update.
+// Only the descriptor needs updating: mark subFormat = SHUFFLED so the next
+// compute_rhs call correctly interprets the layout.
+static void mark_v_buf_spectral(State& s) {
     force_z2d_format(s.V1_buf);
     force_z2d_format(s.V2_buf);
     force_z2d_format(s.V3_buf);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.V1_orig, (GCplx*)gpu_ptr(s.V1_buf), s.nc_local);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.V2_orig, (GCplx*)gpu_ptr(s.V2_buf), s.nc_local);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.V3_orig, (GCplx*)gpu_ptr(s.V3_buf), s.nc_local);
 }
 
 static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
@@ -591,7 +588,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k1v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k1v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k1v3, nc);
-    restore_v_buf(s);
+    mark_v_buf_spectral(s);
     CUDA_CHECK(cudaDeviceSynchronize());
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
@@ -605,7 +602,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k2v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k2v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k2v3, nc);
-    restore_v_buf(s);
+    mark_v_buf_spectral(s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
@@ -617,7 +614,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k3v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k3v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k3v3, nc);
-    restore_v_buf(s);
+    mark_v_buf_spectral(s);
     kernel_rk4_axpy<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         s.V1_orig, s.V2_orig, s.V3_orig,
@@ -629,7 +626,7 @@ static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, doubl
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k4v1, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k4v2, nc);
     kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k4v3, nc);
-    restore_v_buf(s);
+    mark_v_buf_spectral(s);
 
     kernel_rk4_update<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
