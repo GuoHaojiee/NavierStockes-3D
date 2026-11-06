@@ -34,8 +34,8 @@ typedef cufftDoubleComplex GCplx;
 
 // Run mode / phase timing (see common_mode.h).
 //   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
-//   g_with_force = false (bench) : f = 0; forcing fill, its 3 FFTs, copies and
-//                                  scaling are skipped; work*_buf / f*_c not allocated.
+//   g_with_force = false (bench) : f = 0; forcing fill and its 3 FFTs are skipped;
+//                                  work*_buf are not allocated.
 static bool g_with_force = true;
 static nsmode::GpuPhaseTimer g_timer;
 using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode::PH_FORCE;
@@ -200,30 +200,12 @@ __global__ void kernel_scale_cplx(GCplx* A, long long nc_local, double scale) {
     A[idx].x *= scale; A[idx].y *= scale;
 }
 
+// Kernel A -- spectral, start of every RHS evaluation (merges curl and viscous term).
+// Reads V; writes rot = i k x V and rhs = -k^2 V.
 // Layout: [gx][local_y][kz]  (Y-slab, INPLACE_SHUFFLED)
-__global__ void kernel_compute_rot(const GCplx* V1, const GCplx* V2, const GCplx* V3,
-                                    GCplx* rot1, GCplx* rot2, GCplx* rot3,
-                                    int ny_local, int y_offset) {
-    long long nc_local = (long long)d_NX * ny_local * d_NZC;
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nc_local) return;
-    int kz      = (int)(idx % d_NZC);
-    int local_y = (int)((idx / d_NZC) % ny_local);
-    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
-    int gy = y_offset + local_y;
-    double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
-    double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
-    double kzd = (double)kz;
-    rot1[idx].x = -(ky * V3[idx].y - kzd * V2[idx].y);
-    rot1[idx].y =   ky * V3[idx].x - kzd * V2[idx].x;
-    rot2[idx].x = -(kzd * V1[idx].y - kx * V3[idx].y);
-    rot2[idx].y =   kzd * V1[idx].x - kx * V3[idx].x;
-    rot3[idx].x = -(kx * V2[idx].y - ky * V1[idx].y);
-    rot3[idx].y =   kx * V2[idx].x - ky * V1[idx].x;
-}
-
-// Layout: [gx][local_y][kz]  (Y-slab, INPLACE_SHUFFLED)
-__global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
+__global__ void kernel_rot_and_viscous(const GCplx* V1, const GCplx* V2, const GCplx* V3,
+                                        GCplx* rot1, GCplx* rot2, GCplx* rot3,
+                                        GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
                                         int ny_local, int y_offset) {
     long long nc_local = (long long)d_NX * ny_local * d_NZC;
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -236,8 +218,88 @@ __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
     double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
     double kzd = (double)kz;
     double k2 = kx*kx + ky*ky + kzd*kzd;
-    visc[idx].x = -k2 * V[idx].x;
-    visc[idx].y = -k2 * V[idx].y;
+    GCplx v1 = V1[idx], v2 = V2[idx], v3 = V3[idx];
+    rot1[idx].x = -(ky * v3.y - kzd * v2.y);
+    rot1[idx].y =   ky * v3.x - kzd * v2.x;
+    rot2[idx].x = -(kzd * v1.y - kx * v3.y);
+    rot2[idx].y =   kzd * v1.x - kx * v3.x;
+    rot3[idx].x = -(kx * v2.y - ky * v1.y);
+    rot3[idx].y =   kx * v2.x - ky * v1.x;
+    rhs1[idx].x = -k2 * v1.x;  rhs1[idx].y = -k2 * v1.y;
+    rhs2[idx].x = -k2 * v2.x;  rhs2[idx].y = -k2 * v2.y;
+    rhs3[idx].x = -k2 * v3.x;  rhs3[idx].y = -k2 * v3.y;
+}
+
+// What kernel_rk4_stage does with the accumulator acc.
+enum { ACC_INIT = 0, ACC_ADD = 1, ACC_KEEP = 2 };
+
+// Kernel B -- spectral, end of every RK4 stage (classic RK4, accumulated form).
+//   k = P[ inv_N*rot + rhs (+ inv_N*work, verify only) ]    held in registers only
+//   ACC_INIT: acc  = base + a_acc*k
+//   ACC_ADD : acc += a_acc*k
+//   ACC_KEEP: acc unchanged
+//   V = base + a_v*k
+// Stage 1: base = V_orig, ACC_INIT, a_acc = tau/6, a_v = tau/2
+// Stage 2: base = V_orig, ACC_ADD,  a_acc = tau/3, a_v = tau/2
+// Stage 3: base = V_orig, ACC_ADD,  a_acc = tau/3, a_v = tau
+// Stage 4: base = acc,    ACC_KEEP,                a_v = tau/6
+// The k^2 = 0 mode is left unprojected. Sum order nl + (visc + f) as before.
+// Layout: [gx][local_y][kz]  (Y-slab, INPLACE_SHUFFLED)
+__global__ void kernel_rk4_stage(GCplx* V1, GCplx* V2, GCplx* V3,
+                                  const GCplx* base1, const GCplx* base2, const GCplx* base3,
+                                  GCplx* acc1, GCplx* acc2, GCplx* acc3,
+                                  const GCplx* rot1, const GCplx* rot2, const GCplx* rot3,
+                                  const GCplx* rhs1, const GCplx* rhs2, const GCplx* rhs3,
+                                  const GCplx* work1, const GCplx* work2, const GCplx* work3,
+                                  double inv_N, double a_acc, double a_v, int acc_mode,
+                                  int ny_local, int y_offset) {
+    long long nc_local = (long long)d_NX * ny_local * d_NZC;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nc_local) return;
+    int kz      = (int)(idx % d_NZC);
+    int local_y = (int)((idx / d_NZC) % ny_local);
+    int gx      = (int)(idx / ((long long)ny_local * d_NZC));
+    int gy = y_offset + local_y;
+    double kx = (gx <= d_NX/2) ? (double)gx : (double)(gx - d_NX);
+    double ky = (gy <= d_NY/2) ? (double)gy : (double)(gy - d_NY);
+    double kzd = (double)kz;
+    double k2 = kx*kx + ky*ky + kzd*kzd;
+
+    double s1x = rhs1[idx].x, s1y = rhs1[idx].y;
+    double s2x = rhs2[idx].x, s2y = rhs2[idx].y;
+    double s3x = rhs3[idx].x, s3y = rhs3[idx].y;
+    if (work1) {
+        s1x += work1[idx].x * inv_N;  s1y += work1[idx].y * inv_N;
+        s2x += work2[idx].x * inv_N;  s2y += work2[idx].y * inv_N;
+        s3x += work3[idx].x * inv_N;  s3y += work3[idx].y * inv_N;
+    }
+    double k1x = rot1[idx].x * inv_N + s1x, k1y = rot1[idx].y * inv_N + s1y;
+    double k2x = rot2[idx].x * inv_N + s2x, k2y = rot2[idx].y * inv_N + s2y;
+    double k3x = rot3[idx].x * inv_N + s3x, k3y = rot3[idx].y * inv_N + s3y;
+
+    if (k2 >= 1e-10) {
+        double div_r = -(kx*k1y + ky*k2y + kzd*k3y);
+        double div_i =   kx*k1x + ky*k2x + kzd*k3x;
+        double phi_r = div_r / (-k2);
+        double phi_i = div_i / (-k2);
+        k1x -= -kx  * phi_i;  k1y -=  kx  * phi_r;
+        k2x -= -ky  * phi_i;  k2y -=  ky  * phi_r;
+        k3x -= -kzd * phi_i;  k3y -=  kzd * phi_r;
+    }
+
+    GCplx b1 = base1[idx], b2 = base2[idx], b3 = base3[idx];
+    if (acc_mode == ACC_INIT) {
+        acc1[idx].x = b1.x + a_acc*k1x;  acc1[idx].y = b1.y + a_acc*k1y;
+        acc2[idx].x = b2.x + a_acc*k2x;  acc2[idx].y = b2.y + a_acc*k2y;
+        acc3[idx].x = b3.x + a_acc*k3x;  acc3[idx].y = b3.y + a_acc*k3y;
+    } else if (acc_mode == ACC_ADD) {
+        acc1[idx].x += a_acc*k1x;  acc1[idx].y += a_acc*k1y;
+        acc2[idx].x += a_acc*k2x;  acc2[idx].y += a_acc*k2y;
+        acc3[idx].x += a_acc*k3x;  acc3[idx].y += a_acc*k3y;
+    }
+    V1[idx].x = b1.x + a_v*k1x;  V1[idx].y = b1.y + a_v*k1y;
+    V2[idx].x = b2.x + a_v*k2x;  V2[idx].y = b2.y + a_v*k2y;
+    V3[idx].x = b3.x + a_v*k3x;  V3[idx].y = b3.y + a_v*k3y;
 }
 
 __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
@@ -282,55 +344,6 @@ __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3
     scratch[idx] = sqrt(dr*dr + di*di);
 }
 
-__global__ void kernel_add_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
-                                   const GCplx* visc1, const GCplx* visc2, const GCplx* visc3,
-                                   const GCplx* f1, const GCplx* f2, const GCplx* f3,
-                                   long long nc_local) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nc_local) return;
-    rhs1[idx].x += visc1[idx].x + f1[idx].x; rhs1[idx].y += visc1[idx].y + f1[idx].y;
-    rhs2[idx].x += visc2[idx].x + f2[idx].x; rhs2[idx].y += visc2[idx].y + f2[idx].y;
-    rhs3[idx].x += visc3[idx].x + f3[idx].x; rhs3[idx].y += visc3[idx].y + f3[idx].y;
-}
-
-// bench mode (f = 0): rhs += visc
-__global__ void kernel_add_visc_to_rhs(GCplx* rhs1, GCplx* rhs2, GCplx* rhs3,
-                                        const GCplx* visc1, const GCplx* visc2, const GCplx* visc3,
-                                        long long nc_local) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nc_local) return;
-    rhs1[idx].x += visc1[idx].x; rhs1[idx].y += visc1[idx].y;
-    rhs2[idx].x += visc2[idx].x; rhs2[idx].y += visc2[idx].y;
-    rhs3[idx].x += visc3[idx].x; rhs3[idx].y += visc3[idx].y;
-}
-
-__global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
-                                  const GCplx* o1, const GCplx* o2, const GCplx* o3,
-                                  const GCplx* k1, const GCplx* k2, const GCplx* k3,
-                                  double alpha, long long nc_local) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nc_local) return;
-    V1[idx].x = o1[idx].x + alpha * k1[idx].x; V1[idx].y = o1[idx].y + alpha * k1[idx].y;
-    V2[idx].x = o2[idx].x + alpha * k2[idx].x; V2[idx].y = o2[idx].y + alpha * k2[idx].y;
-    V3[idx].x = o3[idx].x + alpha * k3[idx].x; V3[idx].y = o3[idx].y + alpha * k3[idx].y;
-}
-
-__global__ void kernel_rk4_update(GCplx* V1, GCplx* V2, GCplx* V3,
-                                   const GCplx* o1, const GCplx* o2, const GCplx* o3,
-                                   const GCplx* k1v1, const GCplx* k2v1, const GCplx* k3v1, const GCplx* k4v1,
-                                   const GCplx* k1v2, const GCplx* k2v2, const GCplx* k3v2, const GCplx* k4v2,
-                                   const GCplx* k1v3, const GCplx* k2v3, const GCplx* k3v3, const GCplx* k4v3,
-                                   double dtd6, long long nc_local) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nc_local) return;
-    V1[idx].x = o1[idx].x + dtd6*(k1v1[idx].x + 2.*k2v1[idx].x + 2.*k3v1[idx].x + k4v1[idx].x);
-    V1[idx].y = o1[idx].y + dtd6*(k1v1[idx].y + 2.*k2v1[idx].y + 2.*k3v1[idx].y + k4v1[idx].y);
-    V2[idx].x = o2[idx].x + dtd6*(k1v2[idx].x + 2.*k2v2[idx].x + 2.*k3v2[idx].x + k4v2[idx].x);
-    V2[idx].y = o2[idx].y + dtd6*(k1v2[idx].y + 2.*k2v2[idx].y + 2.*k3v2[idx].y + k4v2[idx].y);
-    V3[idx].x = o3[idx].x + dtd6*(k1v3[idx].x + 2.*k2v3[idx].x + 2.*k3v3[idx].x + k4v3[idx].x);
-    V3[idx].y = o3[idx].y + dtd6*(k1v3[idx].y + 2.*k2v3[idx].y + 2.*k3v3[idx].y + k4v3[idx].y);
-}
-
 __global__ void kernel_copy_cplx(const GCplx* src, GCplx* dst, long long nc_local) {
     long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nc_local) return;
@@ -355,14 +368,10 @@ struct State {
     cudaLibXtDesc *rot1_buf, *rot2_buf, *rot3_buf;
     cudaLibXtDesc *work1_buf = nullptr, *work2_buf = nullptr, *work3_buf = nullptr;  // verify only
 
-    // Plain cudaMalloc'd complex scratch
-    GCplx *visc1_c, *visc2_c, *visc3_c;
-    GCplx *f1_c = nullptr, *f2_c = nullptr, *f3_c = nullptr;                         // verify only
-    GCplx *rhs1_c, *rhs2_c, *rhs3_c;
-    GCplx *k1v1, *k2v1, *k3v1, *k4v1;
-    GCplx *k1v2, *k2v2, *k3v2, *k4v2;
-    GCplx *k1v3, *k2v3, *k3v3, *k4v3;
-    GCplx *V1_orig, *V2_orig, *V3_orig;
+    // Plain cudaMalloc'd complex arrays
+    GCplx *rhs1_c, *rhs2_c, *rhs3_c;        // holds -k^2 V between kernel A and kernel B
+    GCplx *V1_orig, *V2_orig, *V3_orig;     // V^n
+    GCplx *acc1_c, *acc2_c, *acc3_c;        // RK4 accumulator
     double *scratch;
 };
 
@@ -391,13 +400,9 @@ static void alloc_state(State& s, cufftHandle plan_r2c) {
         CUDA_CHECK(cudaMalloc(p, s.nc_local*sizeof(GCplx)));
         CUDA_CHECK(cudaMemset(*p, 0, s.nc_local*sizeof(GCplx)));
     };
-    C(&s.visc1_c); C(&s.visc2_c); C(&s.visc3_c);
-    if (g_with_force) { C(&s.f1_c); C(&s.f2_c); C(&s.f3_c); }
     C(&s.rhs1_c);  C(&s.rhs2_c);  C(&s.rhs3_c);
-    C(&s.k1v1); C(&s.k2v1); C(&s.k3v1); C(&s.k4v1);
-    C(&s.k1v2); C(&s.k2v2); C(&s.k3v2); C(&s.k4v2);
-    C(&s.k1v3); C(&s.k2v3); C(&s.k3v3); C(&s.k4v3);
     C(&s.V1_orig); C(&s.V2_orig); C(&s.V3_orig);
+    C(&s.acc1_c);  C(&s.acc2_c);  C(&s.acc3_c);
 
     long long sc_size = std::max(s.nc_local, s.nr_local);
     CUDA_CHECK(cudaMalloc(&s.scratch, sc_size * sizeof(double)));
@@ -410,13 +415,9 @@ static void free_state(State& s) {
     if (s.work1_buf) {
         CUFFT_CHECK(cufftXtFree(s.work1_buf)); CUFFT_CHECK(cufftXtFree(s.work2_buf)); CUFFT_CHECK(cufftXtFree(s.work3_buf));
     }
-    cudaFree(s.visc1_c); cudaFree(s.visc2_c); cudaFree(s.visc3_c);
-    if (s.f1_c) { cudaFree(s.f1_c); cudaFree(s.f2_c); cudaFree(s.f3_c); }
     cudaFree(s.rhs1_c);  cudaFree(s.rhs2_c);  cudaFree(s.rhs3_c);
-    cudaFree(s.k1v1); cudaFree(s.k2v1); cudaFree(s.k3v1); cudaFree(s.k4v1);
-    cudaFree(s.k1v2); cudaFree(s.k2v2); cudaFree(s.k3v2); cudaFree(s.k4v2);
-    cudaFree(s.k1v3); cudaFree(s.k2v3); cudaFree(s.k3v3); cudaFree(s.k4v3);
     cudaFree(s.V1_orig); cudaFree(s.V2_orig); cudaFree(s.V3_orig);
+    cudaFree(s.acc1_c);  cudaFree(s.acc2_c);  cudaFree(s.acc3_c);
     cudaFree(s.scratch);
 }
 
@@ -441,31 +442,35 @@ static void warmup_buffers(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s)
 }
 
 // =============================================================================
-// Physics: nonlinear convective term V x (curl V), forcing, viscous, div-free
+// Physics: classic RK4 with nonlinear term V x (curl V), viscous term, forcing, projection
 // =============================================================================
 //
-// ENTRY: V_buf data is Y-slab complex (spectral).
-// EXIT:  V_buf data is X-slab real; rot_buf data is Y-slab complex.
-static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s) {
+// One RK4 stage: evaluates the RHS at V_buf and advances V_buf (see kernel_rk4_stage).
+// ENTRY: V_buf data is Y-slab complex (spectral), holding the stage value.
+// EXIT:  V_buf data is Y-slab complex (spectral), holding the next stage value
+//        (after stage 4: V^{n+1}).
+static void rk4_stage(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t, int stage) {
     const double inv_N = 1.0/((double)NX*NY*NZ);
     const long long nc = s.nc_local, nr = s.nr_local;
     int gc = (int)((nc + BLOCK - 1) / BLOCK);
     int gr = (int)((nr + BLOCK - 1) / BLOCK);
 
-    // rot_buf receives Y-slab complex data from kernel_compute_rot.
+    // rot_buf receives Y-slab complex data from kernel A.
     // Mark subFormat = SHUFFLED so the subsequent FFT_INVERSE interprets
     // the layout correctly.
     force_z2d_format(s.rot1_buf);
     force_z2d_format(s.rot2_buf);
     force_z2d_format(s.rot3_buf);
 
-    kernel_compute_rot<<<gc, BLOCK>>>(
+    kernel_rot_and_viscous<<<gc, BLOCK>>>(
         (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
         (GCplx*)gpu_ptr(s.rot1_buf), (GCplx*)gpu_ptr(s.rot2_buf), (GCplx*)gpu_ptr(s.rot3_buf),
+        s.rhs1_c, s.rhs2_c, s.rhs3_c,
         s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
     g_timer.mark(PH_SPEC);
 
+    // Nonlinear term. After this: V_buf is X-slab real, rot_buf is Y-slab complex.
     FFT_INVERSE(plan_c2r, s.V1_buf);
     FFT_INVERSE(plan_c2r, s.V2_buf);
     FFT_INVERSE(plan_c2r, s.V3_buf);
@@ -488,34 +493,6 @@ static void compute_nonlinear(cufftHandle plan_r2c, cufftHandle plan_c2r, State&
     CUDA_CHECK(cudaDeviceSynchronize());
     g_timer.mark(PH_FFT);
 
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot1_buf), s.rhs1_c, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot2_buf), s.rhs2_c, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.rot3_buf), s.rhs3_c, nc);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs1_c, nc, inv_N);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs2_c, nc, inv_N);
-    kernel_scale_cplx<<<gc, BLOCK>>>(s.rhs3_c, nc, inv_N);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    g_timer.mark(PH_SPEC);
-}
-
-// ENTRY: V_buf data is Y-slab complex (spectral).
-// EXIT:  V_buf data is X-slab real (left over from compute_nonlinear).
-//        rhs_*_c contain projected, scaled, summed RHS.
-static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
-    const double inv_N = 1.0/((double)NX*NY*NZ);
-    const long long nc = s.nc_local;
-    int gc = (int)((nc + BLOCK - 1) / BLOCK);
-    int gr = (int)((s.nr_local + BLOCK - 1) / BLOCK);
-
-    kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V1_buf), s.visc1_c, s.ny_local, s.y_offset);
-    kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V2_buf), s.visc2_c, s.ny_local, s.y_offset);
-    kernel_compute_viscous<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.visc3_c, s.ny_local, s.y_offset);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    g_timer.mark(PH_SPEC);
-
-    // Nonlinear term. After this: V_buf is X-slab real, rot_buf is Y-slab complex.
-    compute_nonlinear(plan_r2c, plan_c2r, s);
-
     if (g_with_force) {
         // Forcing: write real X-slab data directly into work_buf.
         force_d2z_format(s.work1_buf);
@@ -530,30 +507,35 @@ static void compute_rhs(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, do
         FFT_FORWARD(plan_r2c, s.work2_buf);
         FFT_FORWARD(plan_r2c, s.work3_buf);
         CUDA_CHECK(cudaDeviceSynchronize());
-
-        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work1_buf), s.f1_c, nc);
-        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work2_buf), s.f2_c, nc);
-        kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.work3_buf), s.f3_c, nc);
-        kernel_scale_cplx<<<gc, BLOCK>>>(s.f1_c, nc, inv_N);
-        kernel_scale_cplx<<<gc, BLOCK>>>(s.f2_c, nc, inv_N);
-        kernel_scale_cplx<<<gc, BLOCK>>>(s.f3_c, nc, inv_N);
-        CUDA_CHECK(cudaDeviceSynchronize());
         g_timer.mark(PH_FORCE);
-
-        kernel_add_to_rhs<<<gc, BLOCK>>>(
-            s.rhs1_c, s.rhs2_c, s.rhs3_c,
-            s.visc1_c, s.visc2_c, s.visc3_c,
-            s.f1_c, s.f2_c, s.f3_c, nc);
-    } else {
-        // bench mode: f = 0  ->  RHS = nonlinear + viscous (36 FFT/step)
-        kernel_add_visc_to_rhs<<<gc, BLOCK>>>(
-            s.rhs1_c, s.rhs2_c, s.rhs3_c,
-            s.visc1_c, s.visc2_c, s.visc3_c, nc);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    kernel_make_div_free<<<gc, BLOCK>>>(
-        s.rhs1_c, s.rhs2_c, s.rhs3_c, s.ny_local, s.y_offset);
+    // Classic RK4 coefficients, in accumulated form (see kernel_rk4_stage).
+    const GCplx *b1 = s.V1_orig, *b2 = s.V2_orig, *b3 = s.V3_orig;
+    double a_acc = 0.0, a_v = 0.0;
+    int acc_mode = ACC_ADD;
+    switch (stage) {
+        case 1:  acc_mode = ACC_INIT; a_acc = TAU/6.0; a_v = 0.5*TAU; break;
+        case 2:                       a_acc = TAU/3.0; a_v = 0.5*TAU; break;
+        case 3:                       a_acc = TAU/3.0; a_v = TAU;     break;
+        default: acc_mode = ACC_KEEP;                  a_v = TAU/6.0;
+                 b1 = s.acc1_c; b2 = s.acc2_c; b3 = s.acc3_c;         break;
+    }
+
+    // V_buf held X-slab real data; kernel B overwrites it with Y-slab complex data.
+    force_z2d_format(s.V1_buf);
+    force_z2d_format(s.V2_buf);
+    force_z2d_format(s.V3_buf);
+    kernel_rk4_stage<<<gc, BLOCK>>>(
+        (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
+        b1, b2, b3,
+        s.acc1_c, s.acc2_c, s.acc3_c,
+        (const GCplx*)gpu_ptr(s.rot1_buf), (const GCplx*)gpu_ptr(s.rot2_buf), (const GCplx*)gpu_ptr(s.rot3_buf),
+        s.rhs1_c, s.rhs2_c, s.rhs3_c,
+        g_with_force ? (const GCplx*)gpu_ptr(s.work1_buf) : nullptr,
+        g_with_force ? (const GCplx*)gpu_ptr(s.work2_buf) : nullptr,
+        g_with_force ? (const GCplx*)gpu_ptr(s.work3_buf) : nullptr,
+        inv_N, a_acc, a_v, acc_mode, s.ny_local, s.y_offset);
     CUDA_CHECK(cudaDeviceSynchronize());
     g_timer.mark(PH_SPEC);
 }
@@ -565,77 +547,15 @@ static void save_v_orig(State& s) {
     kernel_copy_cplx<<<gc, BLOCK>>>((GCplx*)gpu_ptr(s.V3_buf), s.V3_orig, s.nc_local);
 }
 
-// V_buf data is X-slab real (INPLACE) after compute_nonlinear, and is about to be
-// completely overwritten with Y-slab complex data by kernel_rk4_axpy/_update.
-// Only the descriptor needs updating: mark subFormat = SHUFFLED so the next
-// compute_rhs call correctly interprets the layout.
-static void mark_v_buf_spectral(State& s) {
-    force_z2d_format(s.V1_buf);
-    force_z2d_format(s.V2_buf);
-    force_z2d_format(s.V3_buf);
-}
-
 static void rk4_step(cufftHandle plan_r2c, cufftHandle plan_c2r, State& s, double t) {
-    const long long nc = s.nc_local;
-    int gc = (int)((nc + BLOCK - 1) / BLOCK);
-
     save_v_orig(s);
     CUDA_CHECK(cudaDeviceSynchronize());
     g_timer.mark(PH_SPEC);
 
-    // --- STAGE 1 ---
-    compute_rhs(plan_r2c, plan_c2r, s, t);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k1v1, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k1v2, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k1v3, nc);
-    mark_v_buf_spectral(s);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    kernel_rk4_axpy<<<gc, BLOCK>>>(
-        (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-        s.V1_orig, s.V2_orig, s.V3_orig,
-        s.k1v1, s.k1v2, s.k1v3, 0.5*TAU, nc);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    g_timer.mark(PH_SPEC);
-
-    // --- STAGE 2 ---
-    compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k2v1, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k2v2, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k2v3, nc);
-    mark_v_buf_spectral(s);
-    kernel_rk4_axpy<<<gc, BLOCK>>>(
-        (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-        s.V1_orig, s.V2_orig, s.V3_orig,
-        s.k2v1, s.k2v2, s.k2v3, 0.5*TAU, nc);
-    g_timer.mark(PH_SPEC);
-
-    // --- STAGE 3 ---
-    compute_rhs(plan_r2c, plan_c2r, s, t + 0.5*TAU);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k3v1, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k3v2, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k3v3, nc);
-    mark_v_buf_spectral(s);
-    kernel_rk4_axpy<<<gc, BLOCK>>>(
-        (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-        s.V1_orig, s.V2_orig, s.V3_orig,
-        s.k3v1, s.k3v2, s.k3v3, TAU, nc);
-    g_timer.mark(PH_SPEC);
-
-    // --- STAGE 4 ---
-    compute_rhs(plan_r2c, plan_c2r, s, t + TAU);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs1_c, s.k4v1, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs2_c, s.k4v2, nc);
-    kernel_copy_cplx<<<gc, BLOCK>>>(s.rhs3_c, s.k4v3, nc);
-    mark_v_buf_spectral(s);
-
-    kernel_rk4_update<<<gc, BLOCK>>>(
-        (GCplx*)gpu_ptr(s.V1_buf), (GCplx*)gpu_ptr(s.V2_buf), (GCplx*)gpu_ptr(s.V3_buf),
-        s.V1_orig, s.V2_orig, s.V3_orig,
-        s.k1v1, s.k2v1, s.k3v1, s.k4v1,
-        s.k1v2, s.k2v2, s.k3v2, s.k4v2,
-        s.k1v3, s.k2v3, s.k3v3, s.k4v3,
-        TAU/6.0, nc);
-    g_timer.mark(PH_SPEC);
+    rk4_stage(plan_r2c, plan_c2r, s, t,           1);
+    rk4_stage(plan_r2c, plan_c2r, s, t + 0.5*TAU, 2);
+    rk4_stage(plan_r2c, plan_c2r, s, t + 0.5*TAU, 3);
+    rk4_stage(plan_r2c, plan_c2r, s, t + TAU,     4);
 }
 
 // verify: L2_or_energy = L2 error vs analytic V(t)
