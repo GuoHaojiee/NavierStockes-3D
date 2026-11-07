@@ -312,7 +312,7 @@ void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
 //   5. 正变换 rot_r → nl_c（plan_r2c），归一化             （3 FFTs）
 // 合计：9 次 FFT，零动态内存分配
 //
-// 注意：V_c 在此函数中只读（plan_c2r 为 out-of-place，不破坏 V_c）
+// 注意：多维 c2r 默认允许破坏输入，本函数返回后 V_c 的内容不再可靠（调用方已先算完粘性项）
 // ==============================================================================
 void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                             fftw_complex* nl1_c,  fftw_complex* nl2_c,  fftw_complex* nl3_c,
@@ -401,17 +401,19 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
     ptrdiff_t total_c = local_n1 * nx * nz_c;   // 谱空间（转置布局）本地元素数
     double norm = (double)(nx * ny * nz);
 
-    // 1. 非线性项 v×rot(v)（伪谱，plan_c2r out-of-place 不破坏 V_c）
-    compute_nonlinear_term(V1_c, V2_c, V3_c, nl1_c, nl2_c, nl3_c,
-                           V1_r, V2_r, V3_r, rot1_r, rot2_r, rot3_r,
-                           rot1_c, rot2_c, rot3_c,
-                           nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start);
-
-    // 2. 粘性项 P∆V = -k² V（频谱空间，V_c 在整个 compute_rhs 中只读）
+    // 1. 粘性项 P∆V = -k² V（频谱空间）
+    //    必须在非线性项之前：多维 c2r 默认允许破坏输入（FFTW_DESTROY_INPUT），
+    //    非线性项中的逆变换之后不能再依赖 V_c 的内容
     compute_viscous_term(V1_c, visc1_c, nx, ny, nz, local_n1, local_1_start);
     compute_viscous_term(V2_c, visc2_c, nx, ny, nz, local_n1, local_1_start);
     compute_viscous_term(V3_c, visc3_c, nx, ny, nz, local_n1, local_1_start);
     g_timer.mark(PH_SPEC);
+
+    // 2. 非线性项 v×rot(v)（伪谱；其中的 c2r 可能破坏 V_c）
+    compute_nonlinear_term(V1_c, V2_c, V3_c, nl1_c, nl2_c, nl3_c,
+                           V1_r, V2_r, V3_r, rot1_r, rot2_r, rot3_r,
+                           rot1_c, rot2_c, rot3_c,
+                           nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start);
 
     if (g_with_force) {
         // 3. 外力项 f（实空间填充 → plan_r2c 正变换到 f_c，不触碰 V_c）[仅 verify]
