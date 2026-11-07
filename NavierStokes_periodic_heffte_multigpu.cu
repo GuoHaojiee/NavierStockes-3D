@@ -335,13 +335,20 @@ int main(int argc, char** argv) {
     {
     heffte::box3d<> world_r={{0,0,0},{NX-1,NY-1,NZ-1}};
     heffte::box3d<> world_c={{0,0,0},{NX-1,NY-1,NZ/2}};
-    // Slab decomposition along X (Nx1x1) — 1 transpose per FFT instead of 3.
-    // Matches the single-node mgpu version; aligns with cuFFTMp's X-slab layout.
-    std::array<int,3> pg = {nprocs, 1, 1};
+    // Real space: slabs along X (Nx1x1). Spectral space: slabs along Y (1xNx1), the
+    // same layout as cuFFTMp. heFFTe then needs one reshape per transform instead of
+    // two (checked with heffte::plan_operations). The spectral kernels take their
+    // ranges from outbox_c (BoxGPU bc), so they do not depend on the split.
+    if (NX < nprocs || NY < nprocs) {
+        if (rank==0) fprintf(stderr,"Error: slab decomposition needs NX (%d) and NY (%d) >= number of ranks (%d)\n",NX,NY,nprocs);
+        MPI_Abort(MPI_COMM_WORLD,1);
+    }
+    std::array<int,3> pg = {nprocs, 1, 1}, pg_c = {1, nprocs, 1};
     auto inboxes=heffte::split_world(world_r,pg);
-    auto outboxes=heffte::split_world(world_c,pg);
+    auto outboxes=heffte::split_world(world_c,pg_c);
     heffte::box3d<> inbox_r=inboxes[rank],outbox_c=outboxes[rank];
-    if(rank==0) cout<<"heFFTe slab grid: "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]<<"\n";
+    if(rank==0) cout<<"heFFTe slab grid: real "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]
+                    <<", spectral "<<pg_c[0]<<"x"<<pg_c[1]<<"x"<<pg_c[2]<<"\n";
 
     // Force GPU-aware MPI path; skip data reordering; use alltoallv collective.
     auto options = heffte::default_options<heffte::backend::cufft>();
