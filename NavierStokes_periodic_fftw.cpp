@@ -136,10 +136,11 @@ double func_f3(double x, double y, double z, double t) {
  */
 void initialize_fftw_3d(ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
                         double *any_r, fftw_complex *any_c) {
+    // 谱空间保持转置布局 [y][x][z]（y 分布），省去正变换末尾和逆变换开头的全局转置
     plan_r2c = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, any_r, any_c,
-                                         MPI_COMM_WORLD, FFTW_MEASURE);
+                                         MPI_COMM_WORLD, FFTW_MEASURE | FFTW_MPI_TRANSPOSED_OUT);
     plan_c2r = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, any_c, any_r,
-                                         MPI_COMM_WORLD, FFTW_MEASURE);
+                                         MPI_COMM_WORLD, FFTW_MEASURE | FFTW_MPI_TRANSPOSED_IN);
 }
 
 void finalize_fft_plans() {
@@ -160,17 +161,17 @@ void finalize_fft_plans() {
 void compute_rot(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                  fftw_complex* rot1_c, fftw_complex* rot2_c, fftw_complex* rot3_c,
                  ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                 ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+                 ptrdiff_t local_n1, ptrdiff_t local_1_start) {
 
     ptrdiff_t nz_c = nz/2 + 1;
     #pragma omp parallel for collapse(3)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
+    for(ptrdiff_t j = 0; j < local_n1; ++j) {          // 转置布局 [y_local][x][z]
+        for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                ptrdiff_t ig = local_0_start + i;
-                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                ptrdiff_t jg = local_1_start + j;
+                double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
+                double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
 
                 rot1_c[idx][0] = -(ky*V3_c[idx][1] - kz*V2_c[idx][1]);
@@ -193,19 +194,19 @@ void compute_rot(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
 void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
                    fftw_complex* div_c, fftw_complex* phi_c,
                    ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                   ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+                   ptrdiff_t local_n1, ptrdiff_t local_1_start) {
 
     ptrdiff_t nz_c = nz/2 + 1;
 
     // 步骤 1：计算散度 div = ik·V
     #pragma omp parallel for collapse(3)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
+    for(ptrdiff_t j = 0; j < local_n1; ++j) {          // 转置布局 [y_local][x][z]
+        for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                ptrdiff_t ig = local_0_start + i;
-                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                ptrdiff_t jg = local_1_start + j;
+                double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
+                double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
 
                 div_c[idx][0] = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
@@ -216,13 +217,13 @@ void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
 
     // 步骤 2：求解泊松方程 phi = div/(-k²)，然后 V -= ik*phi
     #pragma omp parallel for collapse(3)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
+    for(ptrdiff_t j = 0; j < local_n1; ++j) {          // 转置布局 [y_local][x][z]
+        for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                ptrdiff_t ig = local_0_start + i;
-                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                ptrdiff_t jg = local_1_start + j;
+                double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
+                double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
                 double k2 = kx*kx + ky*ky + kz*kz;
 
@@ -251,17 +252,17 @@ void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c,
  */
 double compute_div_max(const fftw_complex* V1_c, const fftw_complex* V2_c, const fftw_complex* V3_c,
                        ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                       ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+                       ptrdiff_t local_n1, ptrdiff_t local_1_start) {
     ptrdiff_t nz_c = nz/2 + 1;
     double local_max = 0.0;
     #pragma omp parallel for collapse(3) reduction(max:local_max)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
+    for(ptrdiff_t j = 0; j < local_n1; ++j) {          // 转置布局 [y_local][x][z]
+        for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                ptrdiff_t ig = local_0_start + i;
-                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                ptrdiff_t jg = local_1_start + j;
+                double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
+                double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
                 double dr = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
                 double di =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
@@ -280,17 +281,17 @@ double compute_div_max(const fftw_complex* V1_c, const fftw_complex* V2_c, const
  */
 void compute_viscous_term(fftw_complex* V_c, fftw_complex* viscous_c,
                           ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                          ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+                          ptrdiff_t local_n1, ptrdiff_t local_1_start) {
 
     ptrdiff_t nz_c = nz/2 + 1;
     #pragma omp parallel for collapse(3)
-    for(ptrdiff_t i = 0; i < local_n0; ++i) {
-        for(ptrdiff_t j = 0; j < ny; ++j) {
+    for(ptrdiff_t j = 0; j < local_n1; ++j) {          // 转置布局 [y_local][x][z]
+        for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
-                ptrdiff_t idx = (i * ny + j) * nz_c + k;
-                ptrdiff_t ig = local_0_start + i;
-                double kx = (ig <= nx/2) ? (double)ig : (double)(ig - nx);
-                double ky = (j  <= ny/2) ? (double)j  : (double)(j  - ny);
+                ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                ptrdiff_t jg = local_1_start + j;
+                double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
+                double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
                 double k2 = kx*kx + ky*ky + kz*kz;
                 viscous_c[idx][0] = -k2 * V_c[idx][0];
@@ -319,15 +320,16 @@ void compute_nonlinear_term(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_compl
                             double* rot1_r, double* rot2_r, double* rot3_r,
                             fftw_complex* rot1_c, fftw_complex* rot2_c, fftw_complex* rot3_c,
                             ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                            ptrdiff_t local_n0, ptrdiff_t local_0_start) {
+                            ptrdiff_t local_n0, ptrdiff_t local_0_start,
+                            ptrdiff_t local_n1, ptrdiff_t local_1_start) {
 
     ptrdiff_t nz_c = nz/2 + 1;
-    ptrdiff_t total_c = local_n0 * ny * nz_c;
+    ptrdiff_t total_c = local_n1 * nx * nz_c;   // 谱空间（转置布局）本地元素数
     double norm = (double)(nx * ny * nz);
 
     // 1. 频谱空间计算旋度（不涉及 FFT）
     compute_rot(V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c,
-                nx, ny, nz, local_n0, local_0_start);
+                nx, ny, nz, local_n1, local_1_start);
     g_timer.mark(PH_SPEC);
 
     // 2. 速度逆变换：V_c → V_r（plan_c2r，out-of-place，V_c 不被修改）
@@ -392,22 +394,23 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                  fftw_complex* div_c,  fftw_complex* phi_c,
                  ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
                  ptrdiff_t local_n0, ptrdiff_t local_0_start,
+                 ptrdiff_t local_n1, ptrdiff_t local_1_start,
                  double t, double dx, double dy, double dz) {
 
     ptrdiff_t nz_c = nz/2 + 1;
-    ptrdiff_t total_c = local_n0 * ny * nz_c;
+    ptrdiff_t total_c = local_n1 * nx * nz_c;   // 谱空间（转置布局）本地元素数
     double norm = (double)(nx * ny * nz);
 
     // 1. 非线性项 v×rot(v)（伪谱，plan_c2r out-of-place 不破坏 V_c）
     compute_nonlinear_term(V1_c, V2_c, V3_c, nl1_c, nl2_c, nl3_c,
                            V1_r, V2_r, V3_r, rot1_r, rot2_r, rot3_r,
                            rot1_c, rot2_c, rot3_c,
-                           nx, ny, nz, local_n0, local_0_start);
+                           nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start);
 
     // 2. 粘性项 P∆V = -k² V（频谱空间，V_c 在整个 compute_rhs 中只读）
-    compute_viscous_term(V1_c, visc1_c, nx, ny, nz, local_n0, local_0_start);
-    compute_viscous_term(V2_c, visc2_c, nx, ny, nz, local_n0, local_0_start);
-    compute_viscous_term(V3_c, visc3_c, nx, ny, nz, local_n0, local_0_start);
+    compute_viscous_term(V1_c, visc1_c, nx, ny, nz, local_n1, local_1_start);
+    compute_viscous_term(V2_c, visc2_c, nx, ny, nz, local_n1, local_1_start);
+    compute_viscous_term(V3_c, visc3_c, nx, ny, nz, local_n1, local_1_start);
     g_timer.mark(PH_SPEC);
 
     if (g_with_force) {
@@ -461,7 +464,7 @@ void compute_rhs(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
 
     // 5. 投影：使 RHS 无散（div_c/phi_c 作为工作数组，在 main() 中预分配）
     make_div_free(rhs1_c, rhs2_c, rhs3_c, div_c, phi_c,
-                  nx, ny, nz, local_n0, local_0_start);
+                  nx, ny, nz, local_n1, local_1_start);
     g_timer.mark(PH_SPEC);
 }
 
@@ -488,11 +491,12 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
               fftw_complex* div_c,  fftw_complex* phi_c,
               ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
               ptrdiff_t local_n0, ptrdiff_t local_0_start,
+              ptrdiff_t local_n1, ptrdiff_t local_1_start,
               ptrdiff_t alloc_local, double tau, double t,
               double dx, double dy, double dz) {
 
     ptrdiff_t nz_c = nz/2 + 1;
-    ptrdiff_t total_c = local_n0 * ny * nz_c;
+    ptrdiff_t total_c = local_n1 * nx * nz_c;   // 谱空间（转置布局）本地元素数
 
     // 保存 V^n（一次 memcpy，无动态分配）
     memcpy(V1_c_orig, V1_c, alloc_local * sizeof(fftw_complex));
@@ -507,7 +511,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 div_c, phi_c,
-                nx, ny, nz, local_n0, local_0_start, t, dx, dy, dz);
+                nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start, t, dx, dy, dz);
 
     // tmp = V^n + τ/2 * k1，写入 V_c 供 k2 使用
     #pragma omp parallel for
@@ -528,7 +532,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 div_c, phi_c,
-                nx, ny, nz, local_n0, local_0_start, t+0.5*tau, dx, dy, dz);
+                nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start, t+0.5*tau, dx, dy, dz);
 
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_c; ++i) {
@@ -548,7 +552,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 div_c, phi_c,
-                nx, ny, nz, local_n0, local_0_start, t+0.5*tau, dx, dy, dz);
+                nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start, t+0.5*tau, dx, dy, dz);
 
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_c; ++i) {
@@ -568,7 +572,7 @@ void rk4_step(fftw_complex* V1_c,  fftw_complex* V2_c,  fftw_complex* V3_c,
                 rot1_c, rot2_c, rot3_c, nl1_c, nl2_c, nl3_c,
                 visc1_c, visc2_c, visc3_c, f1_c, f2_c, f3_c,
                 div_c, phi_c,
-                nx, ny, nz, local_n0, local_0_start, t+tau, dx, dy, dz);
+                nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start, t+tau, dx, dy, dz);
 
     // V^{n+1} = V^n + τ/6 * (k1 + 2k2 + 2k3 + k4)
     #pragma omp parallel for
@@ -642,9 +646,11 @@ int main(int argc, char **argv) {
     }
 
     // 获取本地分配大小（FFTW MPI 1D slab 分解）
-    ptrdiff_t alloc_local, local_n0, local_0_start;
-    alloc_local = fftw_mpi_local_size_3d(nx, ny, nz/2+1, MPI_COMM_WORLD,
-                                         &local_n0, &local_0_start);
+    // 实空间：x 分布 [x_local][y][z]；谱空间（转置输出）：y 分布 [y_local][x][z]
+    ptrdiff_t alloc_local, local_n0, local_0_start, local_n1, local_1_start;
+    alloc_local = fftw_mpi_local_size_3d_transposed(nx, ny, nz/2+1, MPI_COMM_WORLD,
+                                                    &local_n0, &local_0_start,
+                                                    &local_n1, &local_1_start);
 
     // ------------------------------------------------------------------
     // 预分配所有内存（热循环中零动态分配）
@@ -747,7 +753,7 @@ int main(int argc, char **argv) {
 
     double norm_factor = (double)(nx * ny * nz);
     ptrdiff_t nz_c = nz/2+1;
-    ptrdiff_t total_c = local_n0 * ny * nz_c;
+    ptrdiff_t total_c = local_n1 * nx * nz_c;   // 谱空间（转置布局）本地元素数
     #pragma omp parallel for
     for(ptrdiff_t i = 0; i < total_c; ++i) {
         V1_c[i][0] /= norm_factor;  V1_c[i][1] /= norm_factor;
@@ -757,7 +763,7 @@ int main(int argc, char **argv) {
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space..." << endl;
-    make_div_free(V1_c, V2_c, V3_c, div_c, phi_c, nx, ny, nz, local_n0, local_0_start);
+    make_div_free(V1_c, V2_c, V3_c, div_c, phi_c, nx, ny, nz, local_n1, local_1_start);
 
     // ------------------------------------------------------------------
     // 时间推进（RK4）
@@ -784,7 +790,7 @@ int main(int argc, char **argv) {
                      visc1_c, visc2_c, visc3_c,
                      f1_c, f2_c, f3_c,
                      div_c, phi_c,
-                     nx, ny, nz, local_n0, local_0_start,
+                     nx, ny, nz, local_n0, local_0_start, local_n1, local_1_start,
                      alloc_local, tau, t_cur, dx, dy, dz);
             double step_time = MPI_Wtime() - t0;
             double global_step;
@@ -800,7 +806,7 @@ int main(int argc, char **argv) {
     {
         double t_final = nt_run * tau;
         // 散度须在 c2r 之前计算（多维 c2r 可能破坏输入 V_c）
-        double max_div = compute_div_max(V1_c, V2_c, V3_c, nx, ny, nz, local_n0, local_0_start);
+        double max_div = compute_div_max(V1_c, V2_c, V3_c, nx, ny, nz, local_n1, local_1_start);
         fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
         fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
         fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
