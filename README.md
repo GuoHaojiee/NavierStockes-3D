@@ -90,6 +90,9 @@ $$\nabla \cdot \mathbf{v} = 0$$
 
 ![消除逆转置优化对比](pic/MPI版本优化1取消装置结果对比.png)
 
+当前的 `NavierStokes_periodic_fftw.cpp` 同样这样做：正变换计划用 `FFTW_MPI_TRANSPOSED_OUT`，逆变换计划用 `FFTW_MPI_TRANSPOSED_IN`，
+谱空间布局为 `[y_local][x][z]`（按 y 分布），实空间仍为 `[x_local][y][z]`。
+
 **优化 2：FFTW 计划选择**
 
 对比 `FFTW_ESTIMATE`、`FFTW_MEASURE`、`FFTW_PATIENT` 三种计划，`FFTW_PATIENT` 预计算时间最长但执行性能最优（紫色柱）：
@@ -136,6 +139,7 @@ FFTW MPI 版本仅支持 **1D slab 分解**（沿单一维度切分），当进�
 
 - **文件：** `NavierStokes_periodic_heffte_v2.cpp`
 - **特性：** 支持 CPU/GPU 后端，2D pencil 分解，ORNL 开发
+- GPU 多节点版（`NavierStokes_periodic_heffte_multigpu.cu`）：实空间按 x 切片、谱空间按 y 切片，与 cuFFTMp 相同，每次变换只需 1 次 reshape
 - R2C 沿 z 方向，$k_z \in [0, N_z/2]$；$k_x, k_y$ 按标准折叠规则
 - 逆变换不破坏输入，无需复制缓冲区
 - `forward(scale::none)` + `backward(scale::full)`（自动 $/N$）
