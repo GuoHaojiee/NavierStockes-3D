@@ -94,6 +94,7 @@ mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100 bench
 | 变量 | 含义 |
 |------|------|
 | `NS_SHARE_WORK_AREA=0` | 仅 cuFFTMp 多节点版：不共用 cuFFT 工作区，改回每个计划各自分配。默认共用，以节省显存 |
+| `NS_XT_THREADS=1/3/6` | 仅 cuFFTXt 版：同一批 3 次或 6 次变换由几个线程同时发起，每个线程使用自己的一对 plan。默认 1，与原来相同（依次执行）。每个 plan 都有自己的 cuFFT 工作区，大小见 Memory report |
 
 ---
 

@@ -64,6 +64,8 @@
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
 #include <omp.h>
+#include <thread>
+#include <vector>
 #include "common_mode.h"
 
 using namespace std;
@@ -548,6 +550,59 @@ static void sync_all_gpus(const MGPUState& s) {
 }
 
 // ============================================================
+// Batches of 3 or 6 independent transforms (NS_XT_THREADS).
+//   NS_XT_THREADS = 1 (default): one plan pair, transforms issued one after another.
+//   NS_XT_THREADS = 3 or 6     : one plan pair per thread (all with cufftXtSetGPUs and
+//                                the same grid); the transforms of a batch are issued
+//                                concurrently from std::threads, thread t using plan t
+//                                for buffers t, t+T, ... Buffers are still allocated with
+//                                cufftXtMalloc(plan_r2c[0], ...). Any cuFFT error is
+//                                reported and the program exits; there is no fallback.
+// The callers keep their sync_all_gpus() calls and subFormat handling unchanged.
+// ============================================================
+constexpr int MAX_XT_THREADS = 6;
+struct XtPlans {
+    int n = 1;                                  // NS_XT_THREADS
+    cufftHandle r2c[MAX_XT_THREADS], c2r[MAX_XT_THREADS];
+    size_t ws_r2c[MAX_XT_THREADS][MAX_GPUS], ws_c2r[MAX_XT_THREADS][MAX_GPUS];
+};
+static XtPlans g_xt;
+
+static void xt_exec(bool forward, cudaLibXtDesc* const* bufs, int m) {
+    if (g_xt.n == 1) {
+        for (int i = 0; i < m; ++i) {
+            if (forward) CUFFT_CHECK(cufftXtExecDescriptorD2Z(g_xt.r2c[0], bufs[i], bufs[i]));
+            else         CUFFT_CHECK(cufftXtExecDescriptorZ2D(g_xt.c2r[0], bufs[i], bufs[i]));
+        }
+        return;
+    }
+    const int nt = std::min(g_xt.n, m);
+    cufftResult res[MAX_XT_THREADS * 2];
+    int bad_buf[MAX_XT_THREADS * 2];
+    std::vector<std::thread> th;
+    for (int t = 0; t < nt; ++t) {
+        res[t] = CUFFT_SUCCESS; bad_buf[t] = -1;
+        th.emplace_back([=, &res, &bad_buf]() {
+            for (int i = t; i < m; i += nt) {
+                cufftResult r = forward ? cufftXtExecDescriptorD2Z(g_xt.r2c[t], bufs[i], bufs[i])
+                                        : cufftXtExecDescriptorZ2D(g_xt.c2r[t], bufs[i], bufs[i]);
+                if (r != CUFFT_SUCCESS) { res[t] = r; bad_buf[t] = i; return; }
+            }
+        });
+    }
+    for (auto& x : th) x.join();
+    for (int t = 0; t < nt; ++t) {
+        if (res[t] != CUFFT_SUCCESS) {
+            fprintf(stderr, "cuFFT error %d in %s on plan %d (thread %d), buffer %d of %d "
+                            "(NS_XT_THREADS=%d; buffers come from cufftXtMalloc(plan_r2c[0]))\n",
+                    (int)res[t], forward ? "cufftXtExecDescriptorD2Z" : "cufftXtExecDescriptorZ2D",
+                    t, t, bad_buf[t], m, g_xt.n);
+            exit(1);
+        }
+    }
+}
+
+// ============================================================
 // One RK4 stage (9 FFTs, +3 for the forcing in verify mode).
 // On entry V_buf holds the stage value (Y-slab spectral); on exit the next one.
 // Phases are timed on the host after the existing SYNC points; kernel B is not
@@ -584,12 +639,7 @@ static void rk4_stage(cufftHandle plan_r2c, cufftHandle plan_c2r,
     g_timer.mark(PH_SPEC);   // also absorbs kernel B of the previous stage
 
     // 2. IFFT V_buf and rot_buf: Y-slab complex → X-slab real
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot1_buf, s.rot1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot2_buf, s.rot2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.rot3_buf, s.rot3_buf));
+    { cudaLibXtDesc* b[] = { s.V1_buf, s.V2_buf, s.V3_buf, s.rot1_buf, s.rot2_buf, s.rot3_buf }; xt_exec(false, b, 6); }
     // SYNC [B]
     sync_all_gpus(s);
     g_timer.mark(PH_FFT);
@@ -609,9 +659,7 @@ static void rk4_stage(cufftHandle plan_r2c, cufftHandle plan_c2r,
     g_timer.mark(PH_PHYS);
 
     // 4. FFT cross product rot_buf → Y-slab spectral (nl, not normalised)
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot1_buf, s.rot1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot2_buf, s.rot2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.rot3_buf, s.rot3_buf));
+    { cudaLibXtDesc* b[] = { s.rot1_buf, s.rot2_buf, s.rot3_buf }; xt_exec(true, b, 3); }
     // SYNC [D]
     sync_all_gpus(s);
     g_timer.mark(PH_FFT);
@@ -633,9 +681,7 @@ static void rk4_stage(cufftHandle plan_r2c, cufftHandle plan_c2r,
         }
         // SYNC [F]
         sync_all_gpus(s);
-        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work1_buf, s.work1_buf));
-        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work2_buf, s.work2_buf));
-        CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.work3_buf, s.work3_buf));
+        { cudaLibXtDesc* b[] = { s.work1_buf, s.work2_buf, s.work3_buf }; xt_exec(true, b, 3); }
         // SYNC [G]
         sync_all_gpus(s);
         g_timer.mark(PH_FORCE);
@@ -739,9 +785,7 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     }
 
     // IFFT V_buf → real space (X-slab) for L2 error
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V1_buf, s.V1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V2_buf, s.V2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorZ2D(plan_c2r, s.V3_buf, s.V3_buf));
+    { cudaLibXtDesc* b[] = { s.V1_buf, s.V2_buf, s.V3_buf }; xt_exec(false, b, 3); }
     // SYNC [H]
     sync_all_gpus(s);
 
@@ -771,9 +815,7 @@ static void compute_diagnostics(cufftHandle plan_r2c, cufftHandle plan_c2r,
     L2_or_energy = verify ? sqrt(err_sq * DX_ * DY_ * DZ_) : 0.5 * err_sq;
 
     // Re-FFT V_buf → restore spectral state (Y-slab, subFormat=3)
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
+    { cudaLibXtDesc* b[] = { s.V1_buf, s.V2_buf, s.V3_buf }; xt_exec(true, b, 3); }
     // SYNC [I]
     sync_all_gpus(s);
 
@@ -863,17 +905,28 @@ int main(int argc, char** argv) {
          << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
     cout << "============================================================" << endl;
 
-    // Create cuFFTXt plans
-    cout << "Creating cuFFTXt plans..." << endl;
-    cufftHandle plan_r2c, plan_c2r;
-    CUFFT_CHECK(cufftCreate(&plan_r2c));
-    CUFFT_CHECK(cufftCreate(&plan_c2r));
-    CUFFT_CHECK(cufftXtSetGPUs(plan_r2c, s.nGPUs, s.gpu_ids));
-    CUFFT_CHECK(cufftXtSetGPUs(plan_c2r, s.nGPUs, s.gpu_ids));
+    // Number of plan pairs / concurrent transform threads (NS_XT_THREADS = 1, 3 or 6)
+    if (const char* e = getenv("NS_XT_THREADS")) {
+        if      (!strcmp(e, "1")) g_xt.n = 1;
+        else if (!strcmp(e, "3")) g_xt.n = 3;
+        else if (!strcmp(e, "6")) g_xt.n = 6;
+        else { fprintf(stderr, "Error: NS_XT_THREADS=%s (expected 1, 3 or 6)\n", e); return 1; }
+    }
+    printf("NS_XT_THREADS = %d (%s)\n", g_xt.n,
+           g_xt.n == 1 ? "one plan pair, transforms one after another"
+                       : "one plan pair per thread, transforms of a batch issued concurrently");
 
-    size_t workSizes[MAX_GPUS];
-    CUFFT_CHECK(cufftMakePlan3d(plan_r2c, NX, NY, NZ, CUFFT_D2Z, workSizes));
-    CUFFT_CHECK(cufftMakePlan3d(plan_c2r, NX, NY, NZ, CUFFT_Z2D, workSizes));
+    // Create cuFFTXt plans (all on the same GPUs, same grid)
+    cout << "Creating cuFFTXt plans..." << endl;
+    for (int k = 0; k < g_xt.n; ++k) {
+        CUFFT_CHECK(cufftCreate(&g_xt.r2c[k]));
+        CUFFT_CHECK(cufftCreate(&g_xt.c2r[k]));
+        CUFFT_CHECK(cufftXtSetGPUs(g_xt.r2c[k], s.nGPUs, s.gpu_ids));
+        CUFFT_CHECK(cufftXtSetGPUs(g_xt.c2r[k], s.nGPUs, s.gpu_ids));
+        CUFFT_CHECK(cufftMakePlan3d(g_xt.r2c[k], NX, NY, NZ, CUFFT_D2Z, g_xt.ws_r2c[k]));
+        CUFFT_CHECK(cufftMakePlan3d(g_xt.c2r[k], NX, NY, NZ, CUFFT_Z2D, g_xt.ws_c2r[k]));
+    }
+    cufftHandle plan_r2c = g_xt.r2c[0], plan_c2r = g_xt.c2r[0];
 
     // Allocate all GPU arrays
     cout << "Allocating GPU memory..." << endl;
@@ -892,6 +945,11 @@ int main(int argc, char** argv) {
         printf("  Full-size complex arrays: %d (%d cuFFTXt buffers of %.3f GB, %d cudaMalloc of %.3f GB)\n",
                n_buf + n_plain, n_buf, s.V1_buf->descriptor->size[0] / GB,
                n_plain, s.nc_local * sizeof(GCplx) / GB);
+        for (int k = 0; k < g_xt.n; ++k) {
+            size_t wr = 0, wc = 0;
+            for (int g = 0; g < s.nGPUs; g++) { wr = std::max(wr, g_xt.ws_r2c[k][g]); wc = std::max(wc, g_xt.ws_c2r[k][g]); }
+            printf("  cuFFT work area, plan %d: ws_r2c = %.3f GB, ws_c2r = %.3f GB (max over GPUs)\n", k, wr / GB, wc / GB);
+        }
         printf("  GPU memory in use (max over GPUs, cudaMemGetInfo): %.3f GB of %.3f GB\n", used_max / GB, total / GB);
         fflush(stdout);
     }
@@ -912,9 +970,7 @@ int main(int argc, char** argv) {
     }
     sync_all_gpus(s);
 
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V1_buf, s.V1_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V2_buf, s.V2_buf));
-    CUFFT_CHECK(cufftXtExecDescriptorD2Z(plan_r2c, s.V3_buf, s.V3_buf));
+    { cudaLibXtDesc* b[] = { s.V1_buf, s.V2_buf, s.V3_buf }; xt_exec(true, b, 3); }
     sync_all_gpus(s);
 
     // Normalize
@@ -1017,8 +1073,10 @@ int main(int argc, char** argv) {
         cudaFree(s.acc1_c[g]);  cudaFree(s.acc2_c[g]);  cudaFree(s.acc3_c[g]);
     }
 
-    CUFFT_CHECK(cufftDestroy(plan_r2c));
-    CUFFT_CHECK(cufftDestroy(plan_c2r));
+    for (int k = 0; k < g_xt.n; ++k) {
+        CUFFT_CHECK(cufftDestroy(g_xt.r2c[k]));
+        CUFFT_CHECK(cufftDestroy(g_xt.c2r[k]));
+    }
 
     return 0;
 }
