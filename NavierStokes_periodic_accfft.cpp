@@ -11,7 +11,7 @@
  *   - 实空间索引步长用全局 nz：ptr = i*isize[1]*nz + j*nz + k
  *   - 频谱空间索引：ptr = i*osize[1]*osize[2] + j*osize[2] + k
  *   - 逆变换不自动归一化，需手动除以 N = nx*ny*nz
- *   - accfft_execute_c2r 调用前必须复制输入（保守处理，与 p3dfft 一致）
+ *   - accfft_execute_c2r 会破坏输入：时间推进中逆变换之后不再使用其谱空间内容；诊断时先复制
  *   - 所有频谱量均为 DFT（非归一化）：V_c = DFT(V_phys)
  *
  * 编译：参见 Makefile_accfft
@@ -172,62 +172,33 @@ double func_f3(double x, double y, double z, double t) {
 //
 // 归一化约定：
 //   V_c = DFT(V_phys)  [非归一化，= N * FFT_norm(V_phys)]
-//   所有频谱量（rot_c, visc_c, nl_c, f_c）均为非归一化表示
-//   逆变换后：V_phys = accfft_c2r(V_c_copy) / N
+//   所有频谱量（rot、-k²V、nl、f）均为非归一化表示
+//   逆变换后：V_phys = accfft_c2r(V_c) / N（c2r 会破坏输入）
+//
+// 时间格式：经典 RK4，按累加形式存储（不存 k1..k4，k 只在一次循环内使用）：
+//   k    = P[ nl + (-k^2 V) (+ f，仅 verify) ]
+//   阶段1: acc  = V_orig + dt/6*k;   V = V_orig + dt/2*k
+//   阶段2: acc += dt/3*k;            V = V_orig + dt/2*k
+//   阶段3: acc += dt/3*k;            V = V_orig + dt*k
+//   阶段4:                           V = acc + dt/6*k
 // ==============================================================================
 
-// 计算旋度 rot(V) = i·k × V（频谱空间）
-// rot_1 = i(ky*V3 - kz*V2)
-// rot_2 = i(kz*V1 - kx*V3)
-// rot_3 = i(kx*V2 - ky*V1)
-void compute_rot(const AccCtx& ctx,
-                 const Complex* V1_c, const Complex* V2_c, const Complex* V3_c,
-                 Complex* rot1_c, Complex* rot2_c, Complex* rot3_c) {
-    #pragma omp parallel for collapse(3)
-    for (int i = 0; i < ctx.osize[0]; ++i) {
-        for (int j = 0; j < ctx.osize[1]; ++j) {
-            for (int k = 0; k < ctx.osize[2]; ++k) {
-                long idx = idx_c(ctx, i, j, k);
-                double kx = wave_kx(ctx, i);
-                double ky = wave_ky(ctx, j);
-                double kz = wave_kz(ctx, k);
+// 所有全尺寸数组（main 中分配一次）
+struct Fields {
+    Complex *V[3];      // 阶段值（谱空间）；c2r 会破坏其内容，之后由阶段循环重写
+    Complex *rot[3];    // 旋度；r2c 之后存放非线性项 nl = DFT(v x rot v)
+    Complex *rhs[3];    // -k^2 V（粘性项，由旋度循环同时写入）
+    Complex *orig[3];   // V^n
+    Complex *acc[3];    // RK4 累加量
+    double  *Vr[3];     // 实空间速度；verify 时在叉乘之后用来存放外力 f
+    double  *rotr[3];   // 实空间旋度，叉乘结果覆盖于此
+};
 
-                // i*(a+ib) = -b+ia
-                rot1_c[idx][0] = -(ky * V3_c[idx][1] - kz * V2_c[idx][1]);
-                rot1_c[idx][1] =   ky * V3_c[idx][0] - kz * V2_c[idx][0];
-                rot2_c[idx][0] = -(kz * V1_c[idx][1] - kx * V3_c[idx][1]);
-                rot2_c[idx][1] =   kz * V1_c[idx][0] - kx * V3_c[idx][0];
-                rot3_c[idx][0] = -(kx * V2_c[idx][1] - ky * V1_c[idx][1]);
-                rot3_c[idx][1] =   kx * V2_c[idx][0] - ky * V1_c[idx][0];
-            }
-        }
-    }
-}
+enum { ACC_INIT = 0, ACC_ADD = 1, ACC_KEEP = 2 };
 
-// 计算粘性项：visc = -k² * V（频谱空间）
-void compute_viscous(const AccCtx& ctx,
-                     const Complex* V_c, Complex* visc_c) {
-    #pragma omp parallel for collapse(3)
-    for (int i = 0; i < ctx.osize[0]; ++i) {
-        for (int j = 0; j < ctx.osize[1]; ++j) {
-            for (int k = 0; k < ctx.osize[2]; ++k) {
-                long idx = idx_c(ctx, i, j, k);
-                double kx = wave_kx(ctx, i);
-                double ky = wave_ky(ctx, j);
-                double kz = wave_kz(ctx, k);
-                double k2 = kx*kx + ky*ky + kz*kz;
-                visc_c[idx][0] = -k2 * V_c[idx][0];
-                visc_c[idx][1] = -k2 * V_c[idx][1];
-            }
-        }
-    }
-}
-
-// 投影到无散空间：V -= ∇(∇⁻²·div V)（频谱空间，in-place）
+// 投影到无散空间：V -= ∇(∇⁻²·div V)（频谱空间，in-place；仅用于初始条件）
 // div = i·k·V，phi = div/(-k²)，V -= i·k·phi
-void make_div_free(const AccCtx& ctx,
-                   Complex* V1_c, Complex* V2_c, Complex* V3_c,
-                   Complex* div_c, Complex* phi_c) {
+void make_div_free(const AccCtx& ctx, Complex* V1_c, Complex* V2_c, Complex* V3_c) {
     #pragma omp parallel for collapse(3)
     for (int i = 0; i < ctx.osize[0]; ++i) {
         for (int j = 0; j < ctx.osize[1]; ++j) {
@@ -236,26 +207,15 @@ void make_div_free(const AccCtx& ctx,
                 double kx = wave_kx(ctx, i);
                 double ky = wave_ky(ctx, j);
                 double kz = wave_kz(ctx, k);
-
-                // div = i(kx*V1 + ky*V2 + kz*V3)
-                div_c[idx][0] = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
-                div_c[idx][1] =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
-
+                double div_r = -(kx*V1_c[idx][1] + ky*V2_c[idx][1] + kz*V3_c[idx][1]);
+                double div_i =   kx*V1_c[idx][0] + ky*V2_c[idx][0] + kz*V3_c[idx][0];
                 double k2 = kx*kx + ky*ky + kz*kz;
-                if (k2 > 1e-14) {
-                    phi_c[idx][0] = div_c[idx][0] / (-k2);
-                    phi_c[idx][1] = div_c[idx][1] / (-k2);
-                } else {
-                    phi_c[idx][0] = phi_c[idx][1] = 0.0;
-                }
-
+                double phi_r = 0.0, phi_i = 0.0;
+                if (k2 > 1e-14) { phi_r = div_r / (-k2); phi_i = div_i / (-k2); }
                 // V -= i*k*phi：i*kx*(a+ib) = -kx*b + i*kx*a
-                V1_c[idx][0] -= -kx * phi_c[idx][1];
-                V1_c[idx][1] -=  kx * phi_c[idx][0];
-                V2_c[idx][0] -= -ky * phi_c[idx][1];
-                V2_c[idx][1] -=  ky * phi_c[idx][0];
-                V3_c[idx][0] -= -kz * phi_c[idx][1];
-                V3_c[idx][1] -=  kz * phi_c[idx][0];
+                V1_c[idx][0] -= -kx * phi_i;  V1_c[idx][1] -=  kx * phi_r;
+                V2_c[idx][0] -= -ky * phi_i;  V2_c[idx][1] -=  ky * phi_r;
+                V3_c[idx][0] -= -kz * phi_i;  V3_c[idx][1] -=  kz * phi_r;
             }
         }
     }
@@ -286,122 +246,70 @@ double compute_div_max(const AccCtx& ctx,
     return global_max * ctx.norm_inv;
 }
 
-// ==============================================================================
-// 非线性对流项：v × rot(v)（伪谱方法）
-//
-// 算法（与 FFTW / heFFTe / p3dfft 版本完全相同）：
-//   1. 频谱空间计算旋度 rot_c = ik × V_c              （无 FFT）
-//   2. 逆变换 V_c → V_r                               （3 次 FFT）
-//   3. 逆变换 rot_c → rot_r                            （3 次 FFT）
-//   4. 实空间叉乘，覆盖 rot_r                           （无 FFT）
-//   5. 正变换 rot_r → nl_c                             （3 次 FFT）
-// 合计：9 次 FFT（与其他版本相同）
-//
-// preserve_V：
-//   true  - V_c 在调用后仍需使用（k1 阶段），用 tmp_c 复制保护（3 次 memcpy）
-//   false - V_c 调用后即被覆盖（k2/k3/k4 阶段），直接传入 c2r（0 次 memcpy）
-// rot_c 始终是临时量（每次由 compute_rot 重新生成），直接传入 c2r（0 次 memcpy）
-// ==============================================================================
-void compute_nonlinear(const AccCtx& ctx, accfft_plan* plan,
-                       Complex* V1_c, Complex* V2_c, Complex* V3_c,
-                       Complex* nl1_c, Complex* nl2_c, Complex* nl3_c,
-                       double* V1_r, double* V2_r, double* V3_r,
-                       Complex* rot1_c, Complex* rot2_c, Complex* rot3_c,
-                       double* rot1_r, double* rot2_r, double* rot3_r,
-                       Complex* tmp_c,
-                       bool preserve_V) {
+// 每个 RHS 的第一步（谱空间，一个循环）：rot = i·k × V，同时 rhs = -k² V
+void compute_rot_and_viscous(const AccCtx& ctx, Fields& F) {
+    Complex *V1 = F.V[0], *V2 = F.V[1], *V3 = F.V[2];
+    #pragma omp parallel for collapse(3)
+    for (int i = 0; i < ctx.osize[0]; ++i) {
+        for (int j = 0; j < ctx.osize[1]; ++j) {
+            for (int k = 0; k < ctx.osize[2]; ++k) {
+                long idx = idx_c(ctx, i, j, k);
+                double kx = wave_kx(ctx, i);
+                double ky = wave_ky(ctx, j);
+                double kz = wave_kz(ctx, k);
+                double k2 = kx*kx + ky*ky + kz*kz;
+                // i*(a+ib) = -b+ia
+                F.rot[0][idx][0] = -(ky * V3[idx][1] - kz * V2[idx][1]);
+                F.rot[0][idx][1] =   ky * V3[idx][0] - kz * V2[idx][0];
+                F.rot[1][idx][0] = -(kz * V1[idx][1] - kx * V3[idx][1]);
+                F.rot[1][idx][1] =   kz * V1[idx][0] - kx * V3[idx][0];
+                F.rot[2][idx][0] = -(kx * V2[idx][1] - ky * V1[idx][1]);
+                F.rot[2][idx][1] =   kx * V2[idx][0] - ky * V1[idx][0];
+                for (int c = 0; c < 3; ++c) {
+                    F.rhs[c][idx][0] = -k2 * F.V[c][idx][0];
+                    F.rhs[c][idx][1] = -k2 * F.V[c][idx][1];
+                }
+            }
+        }
+    }
+}
 
-    long csize = ctx.local_size_c;
-    double inv_n = ctx.norm_inv;
+// RK4 的一个阶段：在当前阶段值 V 处计算 RHS，并把 V 推进到下一阶段值（阶段 4 之后为 V^{n+1}）。
+// 每阶段 9 次 FFT（verify 另加 3 次外力 FFT）。c2r 前不再需要复制输入：之后不再使用 V 与 rot 的谱空间内容。
+void rk4_stage(const AccCtx& ctx, accfft_plan* plan, Fields& F,
+               double dt, double t, double dx, double dy, double dz, int stage) {
+    const double inv_n = ctx.norm_inv;
 
-    // 1. 频谱空间计算旋度（rot_c = ik × V_c，非归一化）
-    compute_rot(ctx, V1_c, V2_c, V3_c, rot1_c, rot2_c, rot3_c);
+    // 1. 旋度 + 粘性项（谱空间）
+    compute_rot_and_viscous(ctx, F);
     g_timer.mark(PH_SPEC);
 
-    // 2. 逆变换 V_c → V_r
-    //    preserve_V=true：先复制到 tmp_c 再 c2r（保护 V_c，供后续 RK4 阶段使用）
-    //    preserve_V=false：直接传 V_c（调用方在此后立即覆盖 tmp_v，无需保护）
-    if (preserve_V) {
-        memcpy(tmp_c, V1_c, csize * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V1_r);
-        memcpy(tmp_c, V2_c, csize * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V2_r);
-        memcpy(tmp_c, V3_c, csize * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V3_r);
-    } else {
-        accfft_execute_c2r(plan, V1_c, V1_r);
-        accfft_execute_c2r(plan, V2_c, V2_r);
-        accfft_execute_c2r(plan, V3_c, V3_r);
-    }
+    // 2. 逆变换 V、rot → 实空间
+    for (int c = 0; c < 3; ++c) accfft_execute_c2r(plan, F.V[c],   F.Vr[c]);
+    for (int c = 0; c < 3; ++c) accfft_execute_c2r(plan, F.rot[c], F.rotr[c]);
+    g_timer.mark(PH_FFT);
 
-    // 3. 逆变换 rot_c → rot_r
-    //    rot_c 由 compute_rot 临时生成，c2r 后不再使用，直接传入（0 次 memcpy）
-    accfft_execute_c2r(plan, rot1_c, rot1_r);
-    accfft_execute_c2r(plan, rot2_c, rot2_r);
-    accfft_execute_c2r(plan, rot3_c, rot3_r);
-    g_timer.mark(PH_FFT);   // 含 c2r 前保护输入的 memcpy（库会破坏输入）
-
-    // 4. 归一化（除以 N 得到物理值）
+    // 3. 归一化（除以 N 得到物理值）+ 实空间叉乘 v × rot(v)，覆盖 rotr
     #pragma omp parallel for
     for (long idx = 0; idx < ctx.local_size_r; ++idx) {
-        V1_r[idx] *= inv_n;    V2_r[idx] *= inv_n;    V3_r[idx] *= inv_n;
-        rot1_r[idx] *= inv_n;  rot2_r[idx] *= inv_n;  rot3_r[idx] *= inv_n;
+        for (int c = 0; c < 3; ++c) { F.Vr[c][idx] *= inv_n; F.rotr[c][idx] *= inv_n; }
     }
-
-    // 5. 实空间叉乘 v × rot(v)，覆盖 rot_r（用作正变换输入）
     #pragma omp parallel for
     for (long idx = 0; idx < ctx.local_size_r; ++idx) {
-        double v1 = V1_r[idx], v2 = V2_r[idx], v3 = V3_r[idx];
-        double w1 = rot1_r[idx], w2 = rot2_r[idx], w3 = rot3_r[idx];
-        rot1_r[idx] = v2*w3 - v3*w2;   // (v×rot)_x
-        rot2_r[idx] = v3*w1 - v1*w3;   // (v×rot)_y
-        rot3_r[idx] = v1*w2 - v2*w1;   // (v×rot)_z
+        double v1 = F.Vr[0][idx], v2 = F.Vr[1][idx], v3 = F.Vr[2][idx];
+        double w1 = F.rotr[0][idx], w2 = F.rotr[1][idx], w3 = F.rotr[2][idx];
+        F.rotr[0][idx] = v2*w3 - v3*w2;   // (v×rot)_x
+        F.rotr[1][idx] = v3*w1 - v1*w3;   // (v×rot)_y
+        F.rotr[2][idx] = v1*w2 - v2*w1;   // (v×rot)_z
     }
     g_timer.mark(PH_PHYS);
 
-    // 6. 正变换（不归一化：nl_c = DFT(cross)，与 V_c 约定一致）
-    accfft_execute_r2c(plan, rot1_r, nl1_c);
-    accfft_execute_r2c(plan, rot2_r, nl2_c);
-    accfft_execute_r2c(plan, rot3_r, nl3_c);
+    // 4. 正变换：叉乘 → rot（存放 nl，不归一化）
+    for (int c = 0; c < 3; ++c) accfft_execute_r2c(plan, F.rotr[c], F.rot[c]);
     g_timer.mark(PH_FFT);
-}
 
-// ==============================================================================
-// 完整右端项：RHS = v×rot(v) + P∆v + f，投影到无散空间
-// ==============================================================================
-
-void compute_rhs(const AccCtx& ctx, accfft_plan* plan,
-                 Complex* V1_c, Complex* V2_c, Complex* V3_c,
-                 Complex* rhs1_c, Complex* rhs2_c, Complex* rhs3_c,
-                 double* V1_r, double* V2_r, double* V3_r,
-                 double* work_r1, double* work_r2, double* work_r3,
-                 Complex* rot1_c, Complex* rot2_c, Complex* rot3_c,
-                 double* rot1_r, double* rot2_r, double* rot3_r,
-                 Complex* nl1_c, Complex* nl2_c, Complex* nl3_c,
-                 Complex* visc1_c, Complex* visc2_c, Complex* visc3_c,
-                 Complex* f1_c, Complex* f2_c, Complex* f3_c,
-                 Complex* div_c, Complex* phi_c,
-                 Complex* tmp_c,
-                 double t, double dx, double dy, double dz,
-                 bool preserve_V) {
-
-    // 1. 粘性项 P∆V = -k² V（纯频谱运算，必须在 compute_nonlinear 之前完成）
-    //    当 preserve_V=false 时，compute_nonlinear 会销毁 V_c，故先在此读取
-    compute_viscous(ctx, V1_c, visc1_c);
-    compute_viscous(ctx, V2_c, visc2_c);
-    compute_viscous(ctx, V3_c, visc3_c);
-    g_timer.mark(PH_SPEC);
-
-    // 2. 非线性项 v × rot(v)（伪谱方法；preserve_V 控制是否保护 V_c）
-    compute_nonlinear(ctx, plan, V1_c, V2_c, V3_c, nl1_c, nl2_c, nl3_c,
-                      V1_r, V2_r, V3_r,
-                      rot1_c, rot2_c, rot3_c,
-                      rot1_r, rot2_r, rot3_r,
-                      tmp_c, preserve_V);
-
-    long nc = ctx.local_size_c;
+    // 5. 外力 [仅 verify]：填入空闲的 Vr，正变换到 V（f_c = DFT(f)，不归一化）
     if (g_with_force) {
-        // 3. 外力项 f（实空间填充 → 正变换，不归一化：f_c = DFT(f)）[仅 verify]
         #pragma omp parallel for collapse(3)
         for (int i = 0; i < ctx.isize[0]; ++i) {
             for (int j = 0; j < ctx.isize[1]; ++j) {
@@ -410,150 +318,76 @@ void compute_rhs(const AccCtx& ctx, accfft_plan* plan,
                     double x = phys_x(ctx, i, dx);
                     double y = phys_y(ctx, j, dy);
                     double z = phys_z(k, dz);
-                    work_r1[ridx] = func_f1(x, y, z, t);
-                    work_r2[ridx] = func_f2(x, y, z, t);
-                    work_r3[ridx] = func_f3(x, y, z, t);
+                    F.Vr[0][ridx] = func_f1(x, y, z, t);
+                    F.Vr[1][ridx] = func_f2(x, y, z, t);
+                    F.Vr[2][ridx] = func_f3(x, y, z, t);
                 }
             }
         }
-        accfft_execute_r2c(plan, work_r1, f1_c);
-        accfft_execute_r2c(plan, work_r2, f2_c);
-        accfft_execute_r2c(plan, work_r3, f3_c);
+        for (int c = 0; c < 3; ++c) accfft_execute_r2c(plan, F.Vr[c], F.V[c]);
         g_timer.mark(PH_FORCE);
-
-        // 4. 组合各项：RHS = nl + visc + f（均为非归一化 DFT）
-        #pragma omp parallel for
-        for (long idx = 0; idx < nc; ++idx) {
-            rhs1_c[idx][0] = nl1_c[idx][0] + visc1_c[idx][0] + f1_c[idx][0];
-            rhs1_c[idx][1] = nl1_c[idx][1] + visc1_c[idx][1] + f1_c[idx][1];
-            rhs2_c[idx][0] = nl2_c[idx][0] + visc2_c[idx][0] + f2_c[idx][0];
-            rhs2_c[idx][1] = nl2_c[idx][1] + visc2_c[idx][1] + f2_c[idx][1];
-            rhs3_c[idx][0] = nl3_c[idx][0] + visc3_c[idx][0] + f3_c[idx][0];
-            rhs3_c[idx][1] = nl3_c[idx][1] + visc3_c[idx][1] + f3_c[idx][1];
-        }
-    } else {
-        // 4'. bench 模式（f = 0）：RHS = nl + visc
-        #pragma omp parallel for
-        for (long idx = 0; idx < nc; ++idx) {
-            rhs1_c[idx][0] = nl1_c[idx][0] + visc1_c[idx][0];
-            rhs1_c[idx][1] = nl1_c[idx][1] + visc1_c[idx][1];
-            rhs2_c[idx][0] = nl2_c[idx][0] + visc2_c[idx][0];
-            rhs2_c[idx][1] = nl2_c[idx][1] + visc2_c[idx][1];
-            rhs3_c[idx][0] = nl3_c[idx][0] + visc3_c[idx][0];
-            rhs3_c[idx][1] = nl3_c[idx][1] + visc3_c[idx][1];
-        }
     }
 
-    // 5. 投影：使 RHS 无散（P 算子）
-    make_div_free(ctx, rhs1_c, rhs2_c, rhs3_c, div_c, phi_c);
+    // 6. 求和 + 投影 + RK4 更新（一个循环，k 只存在于局部变量中）
+    Complex *const *base = F.orig;
+    double a_acc = 0.0, a_v = 0.0;
+    int acc_mode = ACC_ADD;
+    switch (stage) {
+        case 1:  acc_mode = ACC_INIT; a_acc = dt/6.0; a_v = 0.5*dt; break;
+        case 2:                       a_acc = dt/3.0; a_v = 0.5*dt; break;
+        case 3:                       a_acc = dt/3.0; a_v = dt;     break;
+        default: acc_mode = ACC_KEEP;                 a_v = dt/6.0; base = F.acc; break;
+    }
+    const bool force = g_with_force;
+    #pragma omp parallel for collapse(3)
+    for (int i = 0; i < ctx.osize[0]; ++i) {
+        for (int j = 0; j < ctx.osize[1]; ++j) {
+            for (int k = 0; k < ctx.osize[2]; ++k) {
+                long idx = idx_c(ctx, i, j, k);
+                double kx = wave_kx(ctx, i);
+                double ky = wave_ky(ctx, j);
+                double kz = wave_kz(ctx, k);
+                double k2 = kx*kx + ky*ky + kz*kz;
+                // RHS = nl + visc + f（与原代码相同的运算顺序）
+                double q[3][2];
+                for (int c = 0; c < 3; ++c)
+                    for (int r = 0; r < 2; ++r) {
+                        double v = F.rot[c][idx][r] + F.rhs[c][idx][r];
+                        if (force) v += F.V[c][idx][r];
+                        q[c][r] = v;
+                    }
+                // 投影
+                double div_r = -(kx*q[0][1] + ky*q[1][1] + kz*q[2][1]);
+                double div_i =   kx*q[0][0] + ky*q[1][0] + kz*q[2][0];
+                double phi_r = 0.0, phi_i = 0.0;
+                if (k2 > 1e-14) { phi_r = div_r / (-k2); phi_i = div_i / (-k2); }
+                q[0][0] -= -kx * phi_i;  q[0][1] -=  kx * phi_r;
+                q[1][0] -= -ky * phi_i;  q[1][1] -=  ky * phi_r;
+                q[2][0] -= -kz * phi_i;  q[2][1] -=  kz * phi_r;
+                // RK4
+                for (int c = 0; c < 3; ++c)
+                    for (int r = 0; r < 2; ++r) {
+                        double bv = base[c][idx][r];
+                        if      (acc_mode == ACC_INIT) F.acc[c][idx][r]  = bv + a_acc * q[c][r];
+                        else if (acc_mode == ACC_ADD)  F.acc[c][idx][r] += a_acc * q[c][r];
+                        F.V[c][idx][r] = bv + a_v * q[c][r];
+                    }
+            }
+        }
+    }
     g_timer.mark(PH_SPEC);
 }
 
-// ==============================================================================
-// RK4 时间积分（频谱空间）
-// ==============================================================================
-
-void rk4_step(const AccCtx& ctx, accfft_plan* plan,
-              Complex* V1_c, Complex* V2_c, Complex* V3_c,
-              double* V1_r, double* V2_r, double* V3_r,
-              double* work_r1, double* work_r2, double* work_r3,
-              Complex* k1_v1, Complex* k1_v2, Complex* k1_v3,
-              Complex* k2_v1, Complex* k2_v2, Complex* k2_v3,
-              Complex* k3_v1, Complex* k3_v2, Complex* k3_v3,
-              Complex* k4_v1, Complex* k4_v2, Complex* k4_v3,
-              Complex* tmp_v1, Complex* tmp_v2, Complex* tmp_v3,
-              Complex* rot1_c, Complex* rot2_c, Complex* rot3_c,
-              double* rot1_r, double* rot2_r, double* rot3_r,
-              Complex* nl1_c, Complex* nl2_c, Complex* nl3_c,
-              Complex* visc1_c, Complex* visc2_c, Complex* visc3_c,
-              Complex* f1_c, Complex* f2_c, Complex* f3_c,
-              Complex* div_c, Complex* phi_c,
-              Complex* tmp_c,
+void rk4_step(const AccCtx& ctx, accfft_plan* plan, Fields& F,
               double dt, double t, double dx, double dy, double dz) {
-
-    long nc = ctx.local_size_c;
-
-    // k1 = RHS(V^n, t)
-    // preserve_V=true：V_c 在 k1 后仍需使用（构建 tmp_v，以及 k2/k3/k4 中更新）
-    compute_rhs(ctx, plan, V1_c, V2_c, V3_c, k1_v1, k1_v2, k1_v3,
-                V1_r, V2_r, V3_r, work_r1, work_r2, work_r3,
-                rot1_c, rot2_c, rot3_c, rot1_r, rot2_r, rot3_r,
-                nl1_c, nl2_c, nl3_c, visc1_c, visc2_c, visc3_c,
-                f1_c, f2_c, f3_c, div_c, phi_c, tmp_c,
-                t, dx, dy, dz, /*preserve_V=*/true);
-
-    // tmp = V^n + dt/2 * k1
-    #pragma omp parallel for
-    for (long i = 0; i < nc; ++i) {
-        tmp_v1[i][0] = V1_c[i][0] + 0.5*dt*k1_v1[i][0];
-        tmp_v1[i][1] = V1_c[i][1] + 0.5*dt*k1_v1[i][1];
-        tmp_v2[i][0] = V2_c[i][0] + 0.5*dt*k1_v2[i][0];
-        tmp_v2[i][1] = V2_c[i][1] + 0.5*dt*k1_v2[i][1];
-        tmp_v3[i][0] = V3_c[i][0] + 0.5*dt*k1_v3[i][0];
-        tmp_v3[i][1] = V3_c[i][1] + 0.5*dt*k1_v3[i][1];
-    }
+    // 保存 V^n
+    for (int c = 0; c < 3; ++c) memcpy(F.orig[c], F.V[c], ctx.local_size_c * sizeof(Complex));
     g_timer.mark(PH_SPEC);
 
-    // k2 = RHS(V^n + dt/2*k1, t + dt/2)
-    // preserve_V=false：tmp_v 在此调用后立即被覆盖（tmp_v = V_c + dt/2*k2），无需保护
-    compute_rhs(ctx, plan, tmp_v1, tmp_v2, tmp_v3, k2_v1, k2_v2, k2_v3,
-                V1_r, V2_r, V3_r, work_r1, work_r2, work_r3,
-                rot1_c, rot2_c, rot3_c, rot1_r, rot2_r, rot3_r,
-                nl1_c, nl2_c, nl3_c, visc1_c, visc2_c, visc3_c,
-                f1_c, f2_c, f3_c, div_c, phi_c, tmp_c,
-                t + 0.5*dt, dx, dy, dz, /*preserve_V=*/false);
-
-    #pragma omp parallel for
-    for (long i = 0; i < nc; ++i) {
-        tmp_v1[i][0] = V1_c[i][0] + 0.5*dt*k2_v1[i][0];
-        tmp_v1[i][1] = V1_c[i][1] + 0.5*dt*k2_v1[i][1];
-        tmp_v2[i][0] = V2_c[i][0] + 0.5*dt*k2_v2[i][0];
-        tmp_v2[i][1] = V2_c[i][1] + 0.5*dt*k2_v2[i][1];
-        tmp_v3[i][0] = V3_c[i][0] + 0.5*dt*k2_v3[i][0];
-        tmp_v3[i][1] = V3_c[i][1] + 0.5*dt*k2_v3[i][1];
-    }
-    g_timer.mark(PH_SPEC);
-
-    // k3 = RHS(V^n + dt/2*k2, t + dt/2)
-    // preserve_V=false：tmp_v 在此调用后立即被覆盖（tmp_v = V_c + dt*k3），无需保护
-    compute_rhs(ctx, plan, tmp_v1, tmp_v2, tmp_v3, k3_v1, k3_v2, k3_v3,
-                V1_r, V2_r, V3_r, work_r1, work_r2, work_r3,
-                rot1_c, rot2_c, rot3_c, rot1_r, rot2_r, rot3_r,
-                nl1_c, nl2_c, nl3_c, visc1_c, visc2_c, visc3_c,
-                f1_c, f2_c, f3_c, div_c, phi_c, tmp_c,
-                t + 0.5*dt, dx, dy, dz, /*preserve_V=*/false);
-
-    #pragma omp parallel for
-    for (long i = 0; i < nc; ++i) {
-        tmp_v1[i][0] = V1_c[i][0] + dt*k3_v1[i][0];
-        tmp_v1[i][1] = V1_c[i][1] + dt*k3_v1[i][1];
-        tmp_v2[i][0] = V2_c[i][0] + dt*k3_v2[i][0];
-        tmp_v2[i][1] = V2_c[i][1] + dt*k3_v2[i][1];
-        tmp_v3[i][0] = V3_c[i][0] + dt*k3_v3[i][0];
-        tmp_v3[i][1] = V3_c[i][1] + dt*k3_v3[i][1];
-    }
-    g_timer.mark(PH_SPEC);
-
-    // k4 = RHS(V^n + dt*k3, t + dt)
-    // preserve_V=false：tmp_v 在此调用后不再使用（直接进入最终 RK4 更新），无需保护
-    compute_rhs(ctx, plan, tmp_v1, tmp_v2, tmp_v3, k4_v1, k4_v2, k4_v3,
-                V1_r, V2_r, V3_r, work_r1, work_r2, work_r3,
-                rot1_c, rot2_c, rot3_c, rot1_r, rot2_r, rot3_r,
-                nl1_c, nl2_c, nl3_c, visc1_c, visc2_c, visc3_c,
-                f1_c, f2_c, f3_c, div_c, phi_c, tmp_c,
-                t + dt, dx, dy, dz, /*preserve_V=*/false);
-
-    // V^{n+1} = V^n + dt/6 * (k1 + 2k2 + 2k3 + k4)
-    #pragma omp parallel for
-    for (long i = 0; i < nc; ++i) {
-        V1_c[i][0] += (dt/6.0)*(k1_v1[i][0] + 2*k2_v1[i][0] + 2*k3_v1[i][0] + k4_v1[i][0]);
-        V1_c[i][1] += (dt/6.0)*(k1_v1[i][1] + 2*k2_v1[i][1] + 2*k3_v1[i][1] + k4_v1[i][1]);
-        V2_c[i][0] += (dt/6.0)*(k1_v2[i][0] + 2*k2_v2[i][0] + 2*k3_v2[i][0] + k4_v2[i][0]);
-        V2_c[i][1] += (dt/6.0)*(k1_v2[i][1] + 2*k2_v2[i][1] + 2*k3_v2[i][1] + k4_v2[i][1]);
-        V3_c[i][0] += (dt/6.0)*(k1_v3[i][0] + 2*k2_v3[i][0] + 2*k3_v3[i][0] + k4_v3[i][0]);
-        V3_c[i][1] += (dt/6.0)*(k1_v3[i][1] + 2*k2_v3[i][1] + 2*k3_v3[i][1] + k4_v3[i][1]);
-    }
-    g_timer.mark(PH_SPEC);
+    rk4_stage(ctx, plan, F, dt, t,          dx, dy, dz, 1);
+    rk4_stage(ctx, plan, F, dt, t + 0.5*dt, dx, dy, dz, 2);
+    rk4_stage(ctx, plan, F, dt, t + 0.5*dt, dx, dy, dz, 3);
+    rk4_stage(ctx, plan, F, dt, t + dt,     dx, dy, dz, 4);
 }
 
 // ==============================================================================
@@ -658,62 +492,33 @@ int main(int argc, char** argv) {
     long rsz = ctx.local_size_r * sizeof(double);
     long csz = (long)alloc_max;
 
-    // 速度场（实空间 + 频谱空间）
-    double*  V1_r = (double*)  accfft_alloc(rsz);
-    double*  V2_r = (double*)  accfft_alloc(rsz);
-    double*  V3_r = (double*)  accfft_alloc(rsz);
-    Complex* V1_c = (Complex*) accfft_alloc(csz);
-    Complex* V2_c = (Complex*) accfft_alloc(csz);
-    Complex* V3_c = (Complex*) accfft_alloc(csz);
+    // 全尺寸数组：15 个复数（V、rot、rhs、V_orig、acc 各 3 个）+ 6 个实数（Vr、rotr 各 3 个），
+    // bench 与 verify 相同（verify 的外力复用 Vr 与 V）
+    Fields F;
+    for (int c = 0; c < 3; ++c) {
+        F.V[c]    = (Complex*) accfft_alloc(csz);
+        F.rot[c]  = (Complex*) accfft_alloc(csz);
+        F.rhs[c]  = (Complex*) accfft_alloc(csz);
+        F.orig[c] = (Complex*) accfft_alloc(csz);
+        F.acc[c]  = (Complex*) accfft_alloc(csz);
+        F.Vr[c]   = (double*)  accfft_alloc(rsz);
+        F.rotr[c] = (double*)  accfft_alloc(rsz);
+    }
+    double  *V1_r = F.Vr[0], *V2_r = F.Vr[1], *V3_r = F.Vr[2];
+    Complex *V1_c = F.V[0],  *V2_c = F.V[1],  *V3_c = F.V[2];
+    // 诊断（计时结束后）用的临时缓冲：复用 rhs1 的内存（此时 rhs 已无用）
+    Complex* tmp_c = F.rhs[0];
 
-    // 旋度场（实空间 + 频谱空间）
-    double*  rot1_r = (double*)  accfft_alloc(rsz);
-    double*  rot2_r = (double*)  accfft_alloc(rsz);
-    double*  rot3_r = (double*)  accfft_alloc(rsz);
-    Complex* rot1_c = (Complex*) accfft_alloc(csz);
-    Complex* rot2_c = (Complex*) accfft_alloc(csz);
-    Complex* rot3_c = (Complex*) accfft_alloc(csz);
-
-    // 外力实空间工作数组（仅 verify 模式分配；只在 compute_rhs 的外力分支中使用）
-    double*  work_r1 = g_with_force ? (double*) accfft_alloc(rsz) : nullptr;
-    double*  work_r2 = g_with_force ? (double*) accfft_alloc(rsz) : nullptr;
-    double*  work_r3 = g_with_force ? (double*) accfft_alloc(rsz) : nullptr;
-
-    // 投影工作数组
-    Complex* div_c = (Complex*) accfft_alloc(csz);
-    Complex* phi_c = (Complex*) accfft_alloc(csz);
-
-    // 非线性、粘性、外力频谱项
-    Complex* nl1_c    = (Complex*) accfft_alloc(csz);
-    Complex* nl2_c    = (Complex*) accfft_alloc(csz);
-    Complex* nl3_c    = (Complex*) accfft_alloc(csz);
-    Complex* visc1_c  = (Complex*) accfft_alloc(csz);
-    Complex* visc2_c  = (Complex*) accfft_alloc(csz);
-    Complex* visc3_c  = (Complex*) accfft_alloc(csz);
-    // 外力频谱（仅 verify 模式分配；只在 compute_rhs 的外力分支中使用）
-    Complex* f1_c     = g_with_force ? (Complex*) accfft_alloc(csz) : nullptr;
-    Complex* f2_c     = g_with_force ? (Complex*) accfft_alloc(csz) : nullptr;
-    Complex* f3_c     = g_with_force ? (Complex*) accfft_alloc(csz) : nullptr;
-
-    // RK4 工作数组
-    Complex* k1_v1 = (Complex*) accfft_alloc(csz);
-    Complex* k1_v2 = (Complex*) accfft_alloc(csz);
-    Complex* k1_v3 = (Complex*) accfft_alloc(csz);
-    Complex* k2_v1 = (Complex*) accfft_alloc(csz);
-    Complex* k2_v2 = (Complex*) accfft_alloc(csz);
-    Complex* k2_v3 = (Complex*) accfft_alloc(csz);
-    Complex* k3_v1 = (Complex*) accfft_alloc(csz);
-    Complex* k3_v2 = (Complex*) accfft_alloc(csz);
-    Complex* k3_v3 = (Complex*) accfft_alloc(csz);
-    Complex* k4_v1 = (Complex*) accfft_alloc(csz);
-    Complex* k4_v2 = (Complex*) accfft_alloc(csz);
-    Complex* k4_v3 = (Complex*) accfft_alloc(csz);
-    Complex* tmp_v1 = (Complex*) accfft_alloc(csz);
-    Complex* tmp_v2 = (Complex*) accfft_alloc(csz);
-    Complex* tmp_v3 = (Complex*) accfft_alloc(csz);
-
-    // 单个通用临时复数缓冲（逆变换前复制用，顺序执行可复用）
-    Complex* tmp_c = (Complex*) accfft_alloc(csz);
+    {
+        const double GB = 1024.0*1024.0*1024.0;
+        double mx[2] = { (double)csz, (double)rsz }, g[2];
+        MPI_Allreduce(mx, g, 2, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        if (rank == 0) {
+            printf("Memory report (per process, max over ranks):\n");
+            printf("  Full-size arrays: 15 complex of %.3f GB, 6 real of %.3f GB\n", g[0]/GB, g[1]/GB);
+            fflush(stdout);
+        }
+    }
 
     // ------------------------------------------------------------------
     // 创建 FFT 计划（一个计划可用于所有相同大小的变换）
@@ -754,7 +559,7 @@ int main(int argc, char** argv) {
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space...\n";
-    make_div_free(ctx, V1_c, V2_c, V3_c, div_c, phi_c);
+    make_div_free(ctx, V1_c, V2_c, V3_c);
 
     // ------------------------------------------------------------------
     // 误差计算辅助函数（使用 tmp_c 作为临时缓冲）
@@ -824,22 +629,7 @@ int main(int argc, char** argv) {
         double t_cur = it * dt;
         double t0 = MPI_Wtime();
         g_timer.start();
-        rk4_step(ctx, plan,
-                 V1_c, V2_c, V3_c,
-                 V1_r, V2_r, V3_r,
-                 work_r1, work_r2, work_r3,
-                 k1_v1, k1_v2, k1_v3,
-                 k2_v1, k2_v2, k2_v3,
-                 k3_v1, k3_v2, k3_v3,
-                 k4_v1, k4_v2, k4_v3,
-                 tmp_v1, tmp_v2, tmp_v3,
-                 rot1_c, rot2_c, rot3_c,
-                 rot1_r, rot2_r, rot3_r,
-                 nl1_c, nl2_c, nl3_c,
-                 visc1_c, visc2_c, visc3_c,
-                 f1_c, f2_c, f3_c,
-                 div_c, phi_c, tmp_c,
-                 dt, t_cur, dx, dy, dz);
+        rk4_step(ctx, plan, F, dt, t_cur, dx, dy, dz);
         double step_time = MPI_Wtime() - t0;
         double global_step;
         MPI_Allreduce(&step_time, &global_step, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -885,21 +675,11 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 清理
     // ------------------------------------------------------------------
-    accfft_free(V1_r);    accfft_free(V2_r);    accfft_free(V3_r);
-    accfft_free(V1_c);    accfft_free(V2_c);    accfft_free(V3_c);
-    accfft_free(rot1_r);  accfft_free(rot2_r);  accfft_free(rot3_r);
-    accfft_free(rot1_c);  accfft_free(rot2_c);  accfft_free(rot3_c);
-    if (work_r1) { accfft_free(work_r1); accfft_free(work_r2); accfft_free(work_r3); }
-    accfft_free(div_c);   accfft_free(phi_c);
-    accfft_free(nl1_c);   accfft_free(nl2_c);   accfft_free(nl3_c);
-    accfft_free(visc1_c); accfft_free(visc2_c); accfft_free(visc3_c);
-    if (f1_c)    { accfft_free(f1_c);    accfft_free(f2_c);    accfft_free(f3_c); }
-    accfft_free(k1_v1);   accfft_free(k1_v2);   accfft_free(k1_v3);
-    accfft_free(k2_v1);   accfft_free(k2_v2);   accfft_free(k2_v3);
-    accfft_free(k3_v1);   accfft_free(k3_v2);   accfft_free(k3_v3);
-    accfft_free(k4_v1);   accfft_free(k4_v2);   accfft_free(k4_v3);
-    accfft_free(tmp_v1);  accfft_free(tmp_v2);  accfft_free(tmp_v3);
-    accfft_free(tmp_c);
+    for (int c = 0; c < 3; ++c) {
+        accfft_free(F.V[c]);    accfft_free(F.rot[c]);  accfft_free(F.rhs[c]);
+        accfft_free(F.orig[c]); accfft_free(F.acc[c]);
+        accfft_free(F.Vr[c]);   accfft_free(F.rotr[c]);
+    }
 
     accfft_destroy_plan(plan);
     MPI_Comm_free(&c_comm);
