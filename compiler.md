@@ -95,7 +95,7 @@ nvcc -O3 -std=c++17 -arch=sm_80 \
     NavierStokes_periodic_heffte_v2.cpp \
     -L/home/user/.local/lib -lheffte \
     -L/usr/local/cuda-12.2/lib64 -lcufft -lcudart \
-    -lfftw3 -lfftw3f -lm \
+    -lfftw3_omp -lfftw3 -lfftw3f -lm \
     -Xlinker -rpath,/home/user/.local/lib \
     -o ns_heffte_v2
 ```

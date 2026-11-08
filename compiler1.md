@@ -148,7 +148,7 @@ nvcc -O3 -std=c++17 -arch=sm_80 \
     -I$HEFFTE_DIR/include -I/opt/fftw3/include \
     NavierStokes_periodic_heffte_v2.cpp \
     -L$HEFFTE_DIR/lib -lheffte \
-    -L/opt/fftw3/lib -lfftw3 -lfftw3f -lm \
+    -L/opt/fftw3/lib -lfftw3_omp -lfftw3 -lfftw3f -lm \
     -Xlinker -rpath,$HEFFTE_DIR/lib \
     -Xlinker -rpath,/opt/fftw3/lib \
     -o ns_heffte_v2

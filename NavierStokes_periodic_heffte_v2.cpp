@@ -25,6 +25,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include <heffte.h>
+#include <fftw3.h>
 #include "common_mode.h"
 
 using namespace std;
@@ -505,6 +506,10 @@ int main(int argc, char** argv) {
     int nt_run = atoi(argv[5]);
     int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
+    // heFFTe 的 FFTW 后端在首次执行时才创建 FFTW 计划，并沿用全局的线程设置；
+    // 不调用这两行，每个进程内的 FFT 只用 1 个线程。需链接 libfftw3_omp（原因见 FFTW 版）。
+    fftw_init_threads();
+    fftw_plan_with_nthreads(nthreads);
     int max_threads = nthreads;
 
     const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;

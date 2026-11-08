@@ -14,7 +14,7 @@ c ns_fftw    mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno NavierStokes_periodi
 c ns_accfft  mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno NavierStokes_periodic_accfft.cpp -I$ACCFFT_DIR/include -L$ACCFFT_DIR/lib \
              -laccfft -laccfft_utils -lfftw3_mpi -lfftw3_omp -lfftw3 -lfftw3f_omp -lfftw3f -lpthread -lm $RPC
 c ns_heffte_v2 nvcc -O3 -std=c++17 -arch=sm_80 -ccbin mpicxx -Xcompiler -fopenmp -Xcompiler -fno-math-errno NavierStokes_periodic_heffte_v2.cpp \
-             -lheffte -lfftw3 -lfftw3f -lm $RPN
+             -lheffte -lfftw3_omp -lfftw3 -lfftw3f -lm $RPN
 c ns_cufft   nvcc -O3 -std=c++17 -arch=sm_80 NavierStokes_periodic_cufft.cu -lcufft -lm $RPN
 c ns_cufftxt nvcc -O3 -std=c++17 -arch=sm_80 -ccbin mpicxx NavierStokes_periodic_cufftxt.cu -lcufft -lm $RPN
 for v in gpu1 mgpu multigpu; do
