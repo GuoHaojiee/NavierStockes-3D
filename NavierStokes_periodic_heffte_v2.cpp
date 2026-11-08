@@ -39,6 +39,10 @@ using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode
 using Cvec = vector<complex<double>>;
 using Rvec = vector<double>;
 
+// heFFTe 常驻工作区（main 中分配一次，所有正/逆变换共用）。不传工作区时，heFFTe 每次调用都会
+// 新建并清零一个 size_workspace() 大小的缓冲区，在单进程多线程时占 FFT 时间的很大一部分。
+static complex<double>* g_fft_ws = nullptr;
+
 // ==============================================================================
 // 解析解与强迫项（与 FFTW 版本完全一致）
 // ==============================================================================
@@ -277,12 +281,12 @@ void compute_nonlinear(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
 
     // 2. 逆变换到实空间（scale::full 自动除以 N，得到物理值）
     //    heFFTe backward 不破坏输入，无需复制
-    fft.backward(V1_c.data(), V1_r.data(), heffte::scale::full);
-    fft.backward(V2_c.data(), V2_r.data(), heffte::scale::full);
-    fft.backward(V3_c.data(), V3_r.data(), heffte::scale::full);
-    fft.backward(rot1_c.data(), rot1_r.data(), heffte::scale::full);
-    fft.backward(rot2_c.data(), rot2_r.data(), heffte::scale::full);
-    fft.backward(rot3_c.data(), rot3_r.data(), heffte::scale::full);
+    fft.backward(V1_c.data(), V1_r.data(), g_fft_ws, heffte::scale::full);
+    fft.backward(V2_c.data(), V2_r.data(), g_fft_ws, heffte::scale::full);
+    fft.backward(V3_c.data(), V3_r.data(), g_fft_ws, heffte::scale::full);
+    fft.backward(rot1_c.data(), rot1_r.data(), g_fft_ws, heffte::scale::full);
+    fft.backward(rot2_c.data(), rot2_r.data(), g_fft_ws, heffte::scale::full);
+    fft.backward(rot3_c.data(), rot3_r.data(), g_fft_ws, heffte::scale::full);
     g_timer.mark(PH_FFT);
 
     // 3. 实空间计算 v × rot(v)，结果覆盖 rot_r（复用为工作数组）
@@ -298,9 +302,9 @@ void compute_nonlinear(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
     g_timer.mark(PH_PHYS);
 
     // 4. 正变换回频谱空间（scale::none，得到 DFT = N × FFT_norm，与 V_c 一致）
-    fft.forward(rot1_r.data(), nl1_c.data(), heffte::scale::none);
-    fft.forward(rot2_r.data(), nl2_c.data(), heffte::scale::none);
-    fft.forward(rot3_r.data(), nl3_c.data(), heffte::scale::none);
+    fft.forward(rot1_r.data(), nl1_c.data(), g_fft_ws, heffte::scale::none);
+    fft.forward(rot2_r.data(), nl2_c.data(), g_fft_ws, heffte::scale::none);
+    fft.forward(rot3_r.data(), nl3_c.data(), g_fft_ws, heffte::scale::none);
     g_timer.mark(PH_FFT);
 }
 
@@ -352,9 +356,9 @@ void compute_rhs(heffte::fft3d_r2c<heffte::backend::fftw>& fft,
             }
         }
         // scale::none：f_c = DFT(f) = N * FFT_norm(f)，与 V_c 约定一致
-        fft.forward(work_r1.data(), f1_c.data(), heffte::scale::none);
-        fft.forward(work_r2.data(), f2_c.data(), heffte::scale::none);
-        fft.forward(work_r3.data(), f3_c.data(), heffte::scale::none);
+        fft.forward(work_r1.data(), f1_c.data(), g_fft_ws, heffte::scale::none);
+        fft.forward(work_r2.data(), f2_c.data(), g_fft_ws, heffte::scale::none);
+        fft.forward(work_r3.data(), f3_c.data(), g_fft_ws, heffte::scale::none);
         g_timer.mark(PH_FORCE);
 
         // 4. 组合各项：RHS = v×rot(v) + P∆V + f
@@ -555,6 +559,8 @@ int main(int argc, char** argv) {
 
     size_t nr = inbox_r.count();
     size_t nc = outbox_c.count();
+    vector<complex<double>> fft_ws(fft.size_workspace());
+    g_fft_ws = fft_ws.data();
 
     // ------------------------------------------------------------------
     // 分配内存
@@ -596,9 +602,9 @@ int main(int argc, char** argv) {
     }
 
     // 正变换：scale::none → V_c = DFT(V_r) = N × FFT_norm(V_phys)
-    fft.forward(V1_r.data(), V1_c.data(), heffte::scale::none);
-    fft.forward(V2_r.data(), V2_c.data(), heffte::scale::none);
-    fft.forward(V3_r.data(), V3_c.data(), heffte::scale::none);
+    fft.forward(V1_r.data(), V1_c.data(), g_fft_ws, heffte::scale::none);
+    fft.forward(V2_r.data(), V2_c.data(), g_fft_ws, heffte::scale::none);
+    fft.forward(V3_r.data(), V3_c.data(), g_fft_ws, heffte::scale::none);
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space...\n";
@@ -609,9 +615,9 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // V_c → V_r：backward(scale::full) 自动除以 N，得到物理值（不破坏 V_c）
     auto to_physical = [&]() {
-        fft.backward(V1_c.data(), V1_r.data(), heffte::scale::full);
-        fft.backward(V2_c.data(), V2_r.data(), heffte::scale::full);
-        fft.backward(V3_c.data(), V3_r.data(), heffte::scale::full);
+        fft.backward(V1_c.data(), V1_r.data(), g_fft_ws, heffte::scale::full);
+        fft.backward(V2_c.data(), V2_r.data(), g_fft_ws, heffte::scale::full);
+        fft.backward(V3_c.data(), V3_r.data(), g_fft_ws, heffte::scale::full);
     };
 
     auto compute_error = [&](double time) -> pair<double, double> {
