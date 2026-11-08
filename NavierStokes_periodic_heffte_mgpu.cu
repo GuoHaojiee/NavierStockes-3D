@@ -36,8 +36,8 @@ using namespace std;
 
 // Run mode / phase timing (see common_mode.h).
 //   g_with_force = true  (verify): analytic forcing f every RHS (original behaviour)
-//   g_with_force = false (bench) : f = 0; forcing fill and its 3 forward FFTs are
-//                                  skipped; work*_r / f*_c are not allocated.
+//   g_with_force = false (bench) : f = 0; forcing fill and its 3 forward FFTs are skipped.
+// Time scheme: classic RK4 in accumulated form (see kernel_rk4_stage); k is never stored.
 // heFFTe (cufft backend, no user stream) runs on the default stream, so the
 // cudaEvent-based phase timer brackets its transforms correctly.
 static bool g_with_force = true;
@@ -151,20 +151,9 @@ __global__ void kernel_energy_sq(const GReal* V1, const GReal* V2, const GReal* 
 static __device__ __forceinline__ double kx_fold(int gi){return gi<=d_NX/2?(double)gi:(double)(gi-d_NX);}
 static __device__ __forceinline__ double ky_fold(int gj){return gj<=d_NY/2?(double)gj:(double)(gj-d_NY);}
 
-__global__ void kernel_compute_rot(
-    const GCplx* V1, const GCplx* V2, const GCplx* V3,
-    GCplx* R1, GCplx* R2, GCplx* R3,
-    int lo0, int lo1, int lo2, int s0, int s1, int s2, long long n)
-{
-    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(idx>=n)return;
-    int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
-    R1[idx].x=-(ky*V3[idx].y-kz*V2[idx].y); R1[idx].y=ky*V3[idx].x-kz*V2[idx].x;
-    R2[idx].x=-(kz*V1[idx].y-kx*V3[idx].y); R2[idx].y=kz*V1[idx].x-kx*V3[idx].x;
-    R3[idx].x=-(kx*V2[idx].y-ky*V1[idx].y); R3[idx].y=kx*V2[idx].x-ky*V1[idx].x;
-}
-__global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
+// Kernel A: rot = ik × V and rhs = -k² V in one pass (outbox layout, x fastest)
+__global__ void kernel_rot_and_viscous(const GCplx* V1, const GCplx* V2, const GCplx* V3,
+    GCplx* R1, GCplx* R2, GCplx* R3, GCplx* H1, GCplx* H2, GCplx* H3,
     int lo0, int lo1, int lo2, int s0, int s1, int s2, long long n)
 {
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
@@ -172,8 +161,65 @@ __global__ void kernel_compute_viscous(const GCplx* V, GCplx* visc,
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
     double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
     double k2=kx*kx+ky*ky+kz*kz;
-    visc[idx].x=-k2*V[idx].x; visc[idx].y=-k2*V[idx].y;
+    GCplx v1=V1[idx],v2=V2[idx],v3=V3[idx];
+    R1[idx].x=-(ky*v3.y-kz*v2.y); R1[idx].y=ky*v3.x-kz*v2.x;
+    R2[idx].x=-(kz*v1.y-kx*v3.y); R2[idx].y=kz*v1.x-kx*v3.x;
+    R3[idx].x=-(kx*v2.y-ky*v1.y); R3[idx].y=kx*v2.x-ky*v1.x;
+    H1[idx].x=-k2*v1.x; H1[idx].y=-k2*v1.y;
+    H2[idx].x=-k2*v2.x; H2[idx].y=-k2*v2.y;
+    H3[idx].x=-k2*v3.x; H3[idx].y=-k2*v3.y;
 }
+
+enum { ACC_INIT = 0, ACC_ADD = 1, ACC_KEEP = 2 };
+
+// Kernel B: end of every RK4 stage (classic RK4, accumulated form), k in registers only.
+// All spectral data are non-normalised DFTs (forward scale::none).
+//   k = P[ nl + (-k^2 V + f) ]     (f only in verify, aliases V; sum order as before)
+//   ACC_INIT: acc = base + a_acc*k;  ACC_ADD: acc += a_acc*k;  ACC_KEEP: acc unchanged
+//   V = base + a_v*k
+// Stage 1: base=V_orig INIT tau/6, a_v=tau/2 | 2: V_orig ADD tau/3, tau/2 |
+// Stage 3: V_orig ADD tau/3, tau | 4: base=acc KEEP, a_v=tau/6.  k²=0 is left unprojected.
+__global__ void kernel_rk4_stage(GCplx* V1, GCplx* V2, GCplx* V3,
+    const GCplx* b1, const GCplx* b2, const GCplx* b3,
+    GCplx* acc1, GCplx* acc2, GCplx* acc3,
+    const GCplx* nl1, const GCplx* nl2, const GCplx* nl3,
+    const GCplx* h1, const GCplx* h2, const GCplx* h3,
+    const GCplx* f1, const GCplx* f2, const GCplx* f3,
+    double a_acc, double a_v, int acc_mode,
+    int lo0, int lo1, int lo2, int s0, int s1, int s2, long long n)
+{
+    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(idx>=n)return;
+    int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
+    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
+    double k2=kx*kx+ky*ky+kz*kz;
+    double s1x=h1[idx].x, s1y=h1[idx].y, s2x=h2[idx].x, s2y=h2[idx].y, s3x=h3[idx].x, s3y=h3[idx].y;
+    if(f1){ s1x+=f1[idx].x; s1y+=f1[idx].y; s2x+=f2[idx].x; s2y+=f2[idx].y; s3x+=f3[idx].x; s3y+=f3[idx].y; }
+    double k1x=nl1[idx].x+s1x, k1y=nl1[idx].y+s1y;
+    double k2x=nl2[idx].x+s2x, k2y=nl2[idx].y+s2y;
+    double k3x=nl3[idx].x+s3x, k3y=nl3[idx].y+s3y;
+    if(k2>=1e-10){
+        double dr=-(kx*k1y+ky*k2y+kz*k3y), di=kx*k1x+ky*k2x+kz*k3x;
+        double pr=dr/(-k2), pi=di/(-k2);
+        k1x-=-kx*pi; k1y-=kx*pr;
+        k2x-=-ky*pi; k2y-=ky*pr;
+        k3x-=-kz*pi; k3y-=kz*pr;
+    }
+    GCplx c1=b1[idx],c2=b2[idx],c3=b3[idx];
+    if(acc_mode==ACC_INIT){
+        acc1[idx].x=c1.x+a_acc*k1x; acc1[idx].y=c1.y+a_acc*k1y;
+        acc2[idx].x=c2.x+a_acc*k2x; acc2[idx].y=c2.y+a_acc*k2y;
+        acc3[idx].x=c3.x+a_acc*k3x; acc3[idx].y=c3.y+a_acc*k3y;
+    }else if(acc_mode==ACC_ADD){
+        acc1[idx].x+=a_acc*k1x; acc1[idx].y+=a_acc*k1y;
+        acc2[idx].x+=a_acc*k2x; acc2[idx].y+=a_acc*k2y;
+        acc3[idx].x+=a_acc*k3x; acc3[idx].y+=a_acc*k3y;
+    }
+    V1[idx].x=c1.x+a_v*k1x; V1[idx].y=c1.y+a_v*k1y;
+    V2[idx].x=c2.x+a_v*k2x; V2[idx].y=c2.y+a_v*k2y;
+    V3[idx].x=c3.x+a_v*k3x; V3[idx].y=c3.y+a_v*k3y;
+}
+
 __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
     int lo0, int lo1, int lo2, int s0, int s1, int s2, long long n)
 {
@@ -190,50 +236,6 @@ __global__ void kernel_make_div_free(GCplx* V1, GCplx* V2, GCplx* V3,
     V2[idx].x-=-ky*pi; V2[idx].y-= ky*pr;
     V3[idx].x-=-kz*pi; V3[idx].y-= kz*pr;
 }
-__global__ void kernel_add_rhs(GCplx* r1, GCplx* r2, GCplx* r3,
-    const GCplx* v1, const GCplx* v2, const GCplx* v3,
-    const GCplx* f1, const GCplx* f2, const GCplx* f3, long long n)
-{
-    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(idx>=n)return;
-    r1[idx].x+=v1[idx].x+f1[idx].x; r1[idx].y+=v1[idx].y+f1[idx].y;
-    r2[idx].x+=v2[idx].x+f2[idx].x; r2[idx].y+=v2[idx].y+f2[idx].y;
-    r3[idx].x+=v3[idx].x+f3[idx].x; r3[idx].y+=v3[idx].y+f3[idx].y;
-}
-// bench mode (f = 0): rhs += visc
-__global__ void kernel_add_visc_rhs(GCplx* r1, GCplx* r2, GCplx* r3,
-    const GCplx* v1, const GCplx* v2, const GCplx* v3, long long n)
-{
-    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(idx>=n)return;
-    r1[idx].x+=v1[idx].x; r1[idx].y+=v1[idx].y;
-    r2[idx].x+=v2[idx].x; r2[idx].y+=v2[idx].y;
-    r3[idx].x+=v3[idx].x; r3[idx].y+=v3[idx].y;
-}
-
-__global__ void kernel_rk4_axpy(GCplx* V1, GCplx* V2, GCplx* V3,
-    const GCplx* o1, const GCplx* o2, const GCplx* o3,
-    const GCplx* k1, const GCplx* k2, const GCplx* k3,
-    double a, long long n)
-{
-    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(idx>=n)return;
-    V1[idx].x=o1[idx].x+a*k1[idx].x; V1[idx].y=o1[idx].y+a*k1[idx].y;
-    V2[idx].x=o2[idx].x+a*k2[idx].x; V2[idx].y=o2[idx].y+a*k2[idx].y;
-    V3[idx].x=o3[idx].x+a*k3[idx].x; V3[idx].y=o3[idx].y+a*k3[idx].y;
-}
-
-__global__ void kernel_rk4_accum(GCplx* s1, GCplx* s2, GCplx* s3,
-    const GCplx* k1, const GCplx* k2, const GCplx* k3,
-    double w, long long n)
-{
-    long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(idx>=n)return;
-    s1[idx].x+=w*k1[idx].x; s1[idx].y+=w*k1[idx].y;
-    s2[idx].x+=w*k2[idx].x; s2[idx].y+=w*k2[idx].y;
-    s3[idx].x+=w*k3[idx].x; s3[idx].y+=w*k3[idx].y;
-}
-
 __global__ void kernel_div_abs(const GCplx* V1, const GCplx* V2, const GCplx* V3,
     GReal* out, int lo0, int lo1, int lo2, int s0, int s1, int s2, long long n)
 {
@@ -259,49 +261,40 @@ static BoxGPU make_box(const heffte::box3d<>& b){
 }
 
 struct GPUArrays {
-    GReal *V1_r, *V2_r, *V3_r;
-    GReal *rot1_r, *rot2_r, *rot3_r;
-    GReal *work1_r = nullptr, *work2_r = nullptr, *work3_r = nullptr;  // forcing only (verify)
-    GReal *scratch;
-
-    GCplx *V1_c, *V2_c, *V3_c;
-    GCplx *rot1_c, *rot2_c, *rot3_c;
-    GCplx *visc1_c, *visc2_c, *visc3_c;
-    GCplx *f1_c = nullptr, *f2_c = nullptr, *f3_c = nullptr;            // forcing only (verify)
-
-    GCplx *orig1_c, *orig2_c, *orig3_c;
-    GCplx *ksum1_c, *ksum2_c, *ksum3_c;
-    GCplx *ktmp1_c, *ktmp2_c, *ktmp3_c;
+    GReal *V1_r, *V2_r, *V3_r;          // real velocity; also holds the forcing f in verify mode
+    GReal *rot1_r, *rot2_r, *rot3_r;    // real vorticity, overwritten by the cross product
+    GCplx *V1_c, *V2_c, *V3_c;          // stage value (spectral)
+    GCplx *rot1_c, *rot2_c, *rot3_c;    // vorticity; after the forward FFT: nl
+    GCplx *rhs1_c, *rhs2_c, *rhs3_c;    // -k^2 V (viscous term)
+    GCplx *orig1_c, *orig2_c, *orig3_c; // V^n
+    GCplx *acc1_c, *acc2_c, *acc3_c;    // RK4 accumulator
+    GReal *scratch;                     // diagnostics only; shares rhs1_c's memory when it fits
+    bool scratch_own = false;
 };
 
 static void alloc_arrays(GPUArrays& g, long long nr, long long nc){
-    gm(&g.V1_r,nr);  gm(&g.V2_r,nr);  gm(&g.V3_r,nr);
-    gm(&g.rot1_r,nr);gm(&g.rot2_r,nr);gm(&g.rot3_r,nr);
-    if (g_with_force) { gm(&g.work1_r,nr);gm(&g.work2_r,nr);gm(&g.work3_r,nr); }
-    gm(&g.scratch, max(nr,nc));
-
-    gm(&g.V1_c,nc);  gm(&g.V2_c,nc);  gm(&g.V3_c,nc);
-    gm(&g.rot1_c,nc);gm(&g.rot2_c,nc);gm(&g.rot3_c,nc);
-    gm(&g.visc1_c,nc);gm(&g.visc2_c,nc);gm(&g.visc3_c,nc);
-    if (g_with_force) { gm(&g.f1_c,nc); gm(&g.f2_c,nc); gm(&g.f3_c,nc); }
-
+    gm(&g.V1_r,nr);   gm(&g.V2_r,nr);   gm(&g.V3_r,nr);
+    gm(&g.rot1_r,nr); gm(&g.rot2_r,nr); gm(&g.rot3_r,nr);
+    gm(&g.V1_c,nc);   gm(&g.V2_c,nc);   gm(&g.V3_c,nc);
+    gm(&g.rot1_c,nc); gm(&g.rot2_c,nc); gm(&g.rot3_c,nc);
+    gm(&g.rhs1_c,nc); gm(&g.rhs2_c,nc); gm(&g.rhs3_c,nc);
     gm(&g.orig1_c,nc);gm(&g.orig2_c,nc);gm(&g.orig3_c,nc);
-    gm(&g.ksum1_c,nc);gm(&g.ksum2_c,nc);gm(&g.ksum3_c,nc);
-    gm(&g.ktmp1_c,nc);gm(&g.ktmp2_c,nc);gm(&g.ktmp3_c,nc);
+    gm(&g.acc1_c,nc); gm(&g.acc2_c,nc); gm(&g.acc3_c,nc);
+    // Diagnostics run after the timed loop, when rhs is no longer needed: reuse rhs1
+    // (2*nc doubles) if it holds max(nr,nc) doubles, otherwise allocate a separate scratch.
+    if (2*nc >= max(nr,nc)) g.scratch = (GReal*)g.rhs1_c;
+    else { gm(&g.scratch, max(nr,nc)); g.scratch_own = true; }
 }
 
 static void free_arrays(GPUArrays& g){
-    cudaFree(g.V1_r);  cudaFree(g.V2_r);  cudaFree(g.V3_r);
-    cudaFree(g.rot1_r);cudaFree(g.rot2_r);cudaFree(g.rot3_r);
-    cudaFree(g.work1_r);cudaFree(g.work2_r);cudaFree(g.work3_r);   // nullptr in bench: no-op
-    cudaFree(g.scratch);
-    cudaFree(g.V1_c);  cudaFree(g.V2_c);  cudaFree(g.V3_c);
-    cudaFree(g.rot1_c);cudaFree(g.rot2_c);cudaFree(g.rot3_c);
-    cudaFree(g.visc1_c);cudaFree(g.visc2_c);cudaFree(g.visc3_c);
-    cudaFree(g.f1_c);  cudaFree(g.f2_c);  cudaFree(g.f3_c);
+    cudaFree(g.V1_r);   cudaFree(g.V2_r);   cudaFree(g.V3_r);
+    cudaFree(g.rot1_r); cudaFree(g.rot2_r); cudaFree(g.rot3_r);
+    cudaFree(g.V1_c);   cudaFree(g.V2_c);   cudaFree(g.V3_c);
+    cudaFree(g.rot1_c); cudaFree(g.rot2_c); cudaFree(g.rot3_c);
+    cudaFree(g.rhs1_c); cudaFree(g.rhs2_c); cudaFree(g.rhs3_c);
     cudaFree(g.orig1_c);cudaFree(g.orig2_c);cudaFree(g.orig3_c);
-    cudaFree(g.ksum1_c);cudaFree(g.ksum2_c);cudaFree(g.ksum3_c);
-    cudaFree(g.ktmp1_c);cudaFree(g.ktmp2_c);cudaFree(g.ktmp3_c);
+    cudaFree(g.acc1_c); cudaFree(g.acc2_c); cudaFree(g.acc3_c);
+    if (g.scratch_own) cudaFree(g.scratch);
 }
 
 // ============================================================
@@ -319,123 +312,66 @@ static void heffte_bwd(FFT& fft, GCplx* c, GReal* r, std::complex<double>* ws){
 // ============================================================
 // Physics
 // ============================================================
+// One RK4 stage (9 FFTs, +3 for the forcing in verify mode); heFFTe backward keeps its input.
 template<typename FFT>
-static void compute_nonlinear(FFT& fft, GPUArrays& g,
-    GCplx* nl1, GCplx* nl2, GCplx* nl3, const BoxGPU& br, const BoxGPU& bc,
-    std::complex<double>* ws)
+static void rk4_stage(FFT& fft, GPUArrays& g, const BoxGPU& br, const BoxGPU& bc,
+    double t, int stage, std::complex<double>* ws)
 {
     int gc=bc.grid(BLOCK), gr=br.grid(BLOCK);
-    kernel_compute_rot<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
-        g.rot1_c,g.rot2_c,g.rot3_c,
-        bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
+    // 1. Kernel A: rot = ik × V, rhs = -k² V
+    kernel_rot_and_viscous<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c, g.rot1_c,g.rot2_c,g.rot3_c,
+        g.rhs1_c,g.rhs2_c,g.rhs3_c, bc.lo[0],bc.lo[1],bc.lo[2], bc.sz[0],bc.sz[1],bc.sz[2], bc.n());
     g_timer.mark(PH_SPEC);
-    heffte_bwd(fft,g.V1_c,g.V1_r, ws);
-    heffte_bwd(fft,g.V2_c,g.V2_r, ws);
-    heffte_bwd(fft,g.V3_c,g.V3_r, ws);
-    heffte_bwd(fft,g.rot1_c,g.rot1_r, ws);
-    heffte_bwd(fft,g.rot2_c,g.rot2_r, ws);
-    heffte_bwd(fft,g.rot3_c,g.rot3_r, ws);
+    // 2. Inverse FFT: V, rot → real space (scale::full: physical values)
+    heffte_bwd(fft,g.V1_c,g.V1_r,ws);     heffte_bwd(fft,g.V2_c,g.V2_r,ws);     heffte_bwd(fft,g.V3_c,g.V3_r,ws);
+    heffte_bwd(fft,g.rot1_c,g.rot1_r,ws); heffte_bwd(fft,g.rot2_c,g.rot2_r,ws); heffte_bwd(fft,g.rot3_c,g.rot3_r,ws);
     g_timer.mark(PH_FFT);
-    kernel_cross_product<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,
-        g.rot1_r,g.rot2_r,g.rot3_r,br.n());
+    // 3. Cross product V × rot → rot_r
+    kernel_cross_product<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r, g.rot1_r,g.rot2_r,g.rot3_r, br.n());
     g_timer.mark(PH_PHYS);
-    heffte_fwd(fft,g.rot1_r,nl1, ws);
-    heffte_fwd(fft,g.rot2_r,nl2, ws);
-    heffte_fwd(fft,g.rot3_r,nl3, ws);
+    // 4. Forward FFT: rot_r → rot_c (nl, scale::none)
+    heffte_fwd(fft,g.rot1_r,g.rot1_c,ws); heffte_fwd(fft,g.rot2_r,g.rot2_c,ws); heffte_fwd(fft,g.rot3_r,g.rot3_c,ws);
     g_timer.mark(PH_FFT);
-}
-
-template<typename FFT>
-static void compute_rhs(FFT& fft, GPUArrays& g,
-    GCplx* r1, GCplx* r2, GCplx* r3,
-    const BoxGPU& br, const BoxGPU& bc, double t,
-    std::complex<double>* ws)
-{
-    int gc=bc.grid(BLOCK), gr=br.grid(BLOCK);
-    kernel_compute_viscous<<<gc,BLOCK>>>(g.V1_c,g.visc1_c,
-        bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    kernel_compute_viscous<<<gc,BLOCK>>>(g.V2_c,g.visc2_c,
-        bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    kernel_compute_viscous<<<gc,BLOCK>>>(g.V3_c,g.visc3_c,
-        bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
-    g_timer.mark(PH_SPEC);
-    compute_nonlinear(fft,g,r1,r2,r3,br,bc, ws);
+    // 5. Forcing [verify only]: fill the free V_r, forward FFT into V_c
     if (g_with_force) {
-        // Forcing [verify only]: fill, 3 forward FFTs, rhs += visc + f
-        kernel_fill_forcing<<<gr,BLOCK>>>(g.work1_r,g.work2_r,g.work3_r,
-            br.lo[0],br.lo[1],br.lo[2],br.sz[0],br.sz[1],br.sz[2],br.n(),t);
-        heffte_fwd(fft,g.work1_r,g.f1_c, ws);
-        heffte_fwd(fft,g.work2_r,g.f2_c, ws);
-        heffte_fwd(fft,g.work3_r,g.f3_c, ws);
+        kernel_fill_forcing<<<gr,BLOCK>>>(g.V1_r,g.V2_r,g.V3_r,
+            br.lo[0],br.lo[1],br.lo[2], br.sz[0],br.sz[1],br.sz[2], br.n(), t);
+        heffte_fwd(fft,g.V1_r,g.V1_c,ws); heffte_fwd(fft,g.V2_r,g.V2_c,ws); heffte_fwd(fft,g.V3_r,g.V3_c,ws);
         g_timer.mark(PH_FORCE);
-        kernel_add_rhs<<<gc,BLOCK>>>(r1,r2,r3,
-            g.visc1_c,g.visc2_c,g.visc3_c,g.f1_c,g.f2_c,g.f3_c,bc.n());
-    } else {
-        // bench mode (f = 0): rhs += visc
-        kernel_add_visc_rhs<<<gc,BLOCK>>>(r1,r2,r3, g.visc1_c,g.visc2_c,g.visc3_c, bc.n());
     }
-    kernel_make_div_free<<<gc,BLOCK>>>(r1,r2,r3,
-        bc.lo[0],bc.lo[1],bc.lo[2],bc.sz[0],bc.sz[1],bc.sz[2],bc.n());
+    // 6. Kernel B: sum + projection + RK4 update → V_c (next stage value)
+    const GCplx *b1=g.orig1_c, *b2=g.orig2_c, *b3=g.orig3_c;
+    double a_acc=0., a_v=0.; int acc_mode=ACC_ADD;
+    switch (stage) {
+        case 1:  acc_mode=ACC_INIT; a_acc=TAU/6.; a_v=0.5*TAU; break;
+        case 2:                     a_acc=TAU/3.; a_v=0.5*TAU; break;
+        case 3:                     a_acc=TAU/3.; a_v=TAU;     break;
+        default: acc_mode=ACC_KEEP;               a_v=TAU/6.;
+                 b1=g.acc1_c; b2=g.acc2_c; b3=g.acc3_c;        break;
+    }
+    kernel_rk4_stage<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c, b1,b2,b3, g.acc1_c,g.acc2_c,g.acc3_c,
+        g.rot1_c,g.rot2_c,g.rot3_c, g.rhs1_c,g.rhs2_c,g.rhs3_c,
+        g_with_force ? g.V1_c : nullptr, g_with_force ? g.V2_c : nullptr, g_with_force ? g.V3_c : nullptr,
+        a_acc, a_v, acc_mode, bc.lo[0],bc.lo[1],bc.lo[2], bc.sz[0],bc.sz[1],bc.sz[2], bc.n());
     g_timer.mark(PH_SPEC);
 }
 
+// RK4 time step (spectral space, non-normalized convention)
 template<typename FFT>
-static void rk4_step(FFT& fft, GPUArrays& g,
-    const BoxGPU& br, const BoxGPU& bc, double t,
+static void rk4_step(FFT& fft, GPUArrays& g, const BoxGPU& br, const BoxGPU& bc, double t,
     std::complex<double>* ws)
 {
     long long nc=bc.n();
-    int gc=bc.grid(BLOCK);
-
     CUDA_CHECK(cudaMemcpy(g.orig1_c,g.V1_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.orig2_c,g.V2_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(g.orig3_c,g.V3_c,nc*sizeof(GCplx),cudaMemcpyDeviceToDevice));
-
-    CUDA_CHECK(cudaMemset(g.ksum1_c,0,nc*sizeof(GCplx)));
-    CUDA_CHECK(cudaMemset(g.ksum2_c,0,nc*sizeof(GCplx)));
-    CUDA_CHECK(cudaMemset(g.ksum3_c,0,nc*sizeof(GCplx)));
     g_timer.mark(PH_SPEC);
-
-    // Stage 1
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t, ws);
-    kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
-    kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
-        g.orig1_c,g.orig2_c,g.orig3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
-    g_timer.mark(PH_SPEC);
-
-    // Stage 2
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
-    kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
-    kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
-        g.orig1_c,g.orig2_c,g.orig3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,0.5*TAU,nc);
-    g_timer.mark(PH_SPEC);
-
-    // Stage 3
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+0.5*TAU, ws);
-    kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,2.0,nc);
-    kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
-        g.orig1_c,g.orig2_c,g.orig3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,TAU,nc);
-    g_timer.mark(PH_SPEC);
-
-    // Stage 4
-    compute_rhs(fft,g,g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,br,bc,t+TAU, ws);
-    kernel_rk4_accum<<<gc,BLOCK>>>(g.ksum1_c,g.ksum2_c,g.ksum3_c,
-        g.ktmp1_c,g.ktmp2_c,g.ktmp3_c,1.0,nc);
-
-    // Final update
-    kernel_rk4_axpy<<<gc,BLOCK>>>(g.V1_c,g.V2_c,g.V3_c,
-        g.orig1_c,g.orig2_c,g.orig3_c,
-        g.ksum1_c,g.ksum2_c,g.ksum3_c,TAU/6.0,nc);
-    g_timer.mark(PH_SPEC);
+    rk4_stage(fft,g,br,bc,t,         1,ws);
+    rk4_stage(fft,g,br,bc,t+0.5*TAU, 2,ws);
+    rk4_stage(fft,g,br,bc,t+0.5*TAU, 3,ws);
+    rk4_stage(fft,g,br,bc,t+TAU,     4,ws);
 }
 
-// Returns {L2 error (verify) or kinetic energy 0.5*sum|v|^2 (bench), max|div V|}
 template<typename FFT>
 static pair<double,double> compute_diagnostics(FFT& fft, GPUArrays& g,
     const BoxGPU& br, const BoxGPU& bc, double t,
@@ -539,9 +475,9 @@ int main(int argc, char** argv) {
     long long nr=br.n(), nc=bc.n();
 
     if (rank==0) {
-        // bench: no work*_r (3 real) / f*_c (3 complex)
-        double mb_real = (g_with_force ? 10.0 : 7.0)  * nr * sizeof(GReal)  / (1024.*1024.);
-        double mb_cplx = (g_with_force ? 21.0 : 18.0) * nc * sizeof(GCplx)  / (1024.*1024.);
+        // 6 real + 15 complex full-size arrays (same in bench and verify)
+        double mb_real = 6.0  * nr * sizeof(GReal)  / (1024.*1024.);
+        double mb_cplx = 15.0 * nc * sizeof(GCplx)  / (1024.*1024.);
         printf("  Estimated device alloc per rank: %.0f MB real + %.0f MB complex = %.0f MB\n",
                mb_real, mb_cplx, mb_real+mb_cplx);
     }
@@ -553,6 +489,21 @@ int main(int argc, char** argv) {
     size_t ws_size = fft.size_workspace();
     std::complex<double>* d_ws = nullptr;
     CUDA_CHECK(cudaMalloc(&d_ws, ws_size * sizeof(std::complex<double>)));
+    {   // Memory report (per GPU, max over ranks)
+        const double GB=1024.*1024.*1024.;
+        size_t mf=0, mt=0; CUDA_CHECK(cudaMemGetInfo(&mf,&mt));
+        double in[4]={ (double)(nc*sizeof(GCplx)), (double)(nr*sizeof(GReal)),
+                       (double)(ws_size*sizeof(std::complex<double>)), (double)(mt-mf) }, mx[4];
+        MPI_Allreduce(in,mx,4,MPI_DOUBLE,MPI_MAX,MPI_COMM_WORLD);
+        if (rank==0) {
+            printf("Memory report (per GPU, max over ranks):\n");
+            printf("  Full-size arrays: 15 complex of %.3f GB, 6 real of %.3f GB%s\n", mx[0]/GB, mx[1]/GB,
+                   g.scratch_own ? " (+ separate diagnostics scratch)" : "");
+            printf("  heFFTe workspace: %.3f GB\n", mx[2]/GB);
+            printf("  GPU memory in use (max over ranks, cudaMemGetInfo): %.3f GB of %.3f GB\n", mx[3]/GB, mt/GB);
+            fflush(stdout);
+        }
+    }
     if (rank==0) printf("  heFFTe workspace per rank: %.0f MB\n",
                         ws_size * sizeof(std::complex<double>) / (1024.*1024.));
 
