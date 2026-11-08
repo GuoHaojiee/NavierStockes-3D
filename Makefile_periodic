@@ -7,7 +7,7 @@ CXXFLAGS = -O3 -std=c++11 -Wall -fopenmp -fno-math-errno
 
 # FFTW路径（系统安装）
 FFTW_INC = -I/usr/include
-FFTW_LIB = -L/usr/lib/x86_64-linux-gnu -lfftw3_mpi -lfftw3 -lfftw3_threads -lm
+FFTW_LIB = -L/usr/lib/x86_64-linux-gnu -lfftw3_mpi -lfftw3 -lfftw3_omp -lm
 
 # 包含和链接
 INCLUDES = $(FFTW_INC)

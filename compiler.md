@@ -55,7 +55,7 @@ cd /home/user/guo/NavierStockes-3D
 # FFTW3
 mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_fftw.cpp \
-    -lfftw3_threads -lfftw3 -lfftw3_mpi -lpthread -lm \
+    -lfftw3_omp -lfftw3 -lfftw3_mpi -lpthread -lm \
     -o ns_fftw
 
 # AccFFT
@@ -64,7 +64,7 @@ mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     -I/home/user/.local/include \
     -L/home/user/.local/lib \
     -laccfft -laccfft_utils \
-    -lfftw3_threads -lfftw3 -lfftw3_mpi \
+    -lfftw3_omp -lfftw3 -lfftw3_mpi \
     -lmpi_cxx -lpthread -lm \
     -Xlinker -rpath,/home/user/.local/lib \
     -o ns_accfft

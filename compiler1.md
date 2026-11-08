@@ -108,7 +108,7 @@ export PATH=$_NVHPC_ARCH/compilers/bin:$MPI_HOME/bin:/opt/ucx-1.17/bin:$PATH
 $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     NavierStokes_periodic_fftw.cpp \
     -I/opt/fftw3/include -L/opt/fftw3/lib \
-    -lfftw3_threads -lfftw3 -lfftw3_mpi -lpthread -lm \
+    -lfftw3_omp -lfftw3 -lfftw3_mpi -lpthread -lm \
     -Xlinker -rpath,/opt/fftw3/lib \
     -o ns_fftw
 
@@ -118,8 +118,8 @@ $MPI_HOME/bin/mpicxx -O3 -std=c++17 -fopenmp -fno-math-errno \
     -I/opt/accfft/include -I/opt/fftw3/include \
     -L/opt/accfft/lib -L/opt/fftw3/lib \
     -laccfft -laccfft_utils \
-    -lfftw3_threads -lfftw3 -lfftw3_mpi \
-    -lfftw3f_threads -lfftw3f \
+    -lfftw3_omp -lfftw3 -lfftw3_mpi \
+    -lfftw3f_omp -lfftw3f \
     -lmpi_cxx -lpthread -lm \
     -Xlinker -rpath,/opt/accfft/lib \
     -Xlinker -rpath,/opt/fftw3/lib \

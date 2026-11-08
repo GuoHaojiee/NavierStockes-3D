@@ -14,7 +14,7 @@ INCLUDES = -I$(ACCFFT_DIR)/include
 
 # 库路径和链接（AccFFT不使用fftw_mpi，自己实现MPI通信）
 LIBS = -L$(ACCFFT_DIR)/lib -L$(FFTW_LIB) \
-       -laccfft -lfftw3 -lfftw3f -lfftw3_threads -lfftw3f_threads -lm \
+       -laccfft -lfftw3 -lfftw3f -lfftw3_omp -lfftw3f_omp -lm \
        -Wl,-rpath,$(ACCFFT_DIR)/lib
 
 # 目标可执行文件

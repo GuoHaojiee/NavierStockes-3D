@@ -9,6 +9,7 @@
 #include <string.h>
 #include <fftw3.h>
 #include <omp.h>
+#include <sched.h>
 #include "common_mode.h"
 
 using namespace std;
@@ -629,6 +630,11 @@ int main(int argc, char **argv) {
     const double L_x = 2*M_PI, L_y = 2*M_PI, L_z = 2*M_PI;
     double dx = L_x/nx, dy = L_y/ny, dz = L_z/nz;
 
+    // FFTW 多线程：须在 fftw_mpi_init 之前 init_threads，在建计划之前设定线程数。
+    // 必须链接 libfftw3_omp（而非 libfftw3_threads）：_threads 版用 pthread 创建工作线程，
+    // 工作线程继承主线程的 CPU 亲和性；设置 OMP_PROC_BIND/OMP_PLACES 时 libgomp 在启动时
+    // 就把主线程绑到第一个 place，所有 FFTW 工作线程挤在同一个 place 上，FFT 退化为串行。
+    // _omp 版直接使用 OpenMP 线程组，与逐点循环的线程绑定方式相同。
     fftw_init_threads();
     fftw_plan_with_nthreads(max_threads);
     fftw_mpi_init();
@@ -642,6 +648,12 @@ int main(int argc, char **argv) {
         cout << "Domain: [0, 2π]³" << endl;
         cout << "MPI processes: " << size << endl;
         cout << "OpenMP threads/process: " << max_threads << endl;
+        {
+            cpu_set_t cs; CPU_ZERO(&cs);
+            int ncpu = (sched_getaffinity(0, sizeof(cs), &cs) == 0) ? CPU_COUNT(&cs) : -1;
+            cout << "FFTW planner threads: " << fftw_planner_nthreads()
+                 << "  (main-thread CPU affinity: " << ncpu << " CPUs)" << endl;
+        }
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
         cout << "============================================================" << endl;
