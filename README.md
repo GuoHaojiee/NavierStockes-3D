@@ -139,7 +139,7 @@ FFTW MPI 版本仅支持 **1D slab 分解**（沿单一维度切分），当进�
 
 - **文件：** `NavierStokes_periodic_heffte_v2.cpp`
 - **特性：** 支持 CPU/GPU 后端，2D pencil 分解，ORNL 开发
-- GPU 多节点版（`NavierStokes_periodic_heffte_multigpu.cu`）：实空间按 x 切片、谱空间按 y 切片，与 cuFFTMp 相同，每次变换只需 1 次 reshape
+- GPU 单节点多卡版与多节点版（`heffte_mgpu.cu`、`heffte_multigpu.cu`）：实空间按 x 切片、谱空间按 y 切片，与 cuFFTMp 相同，每次变换只需 1 次 reshape
 - R2C 沿 z 方向，$k_z \in [0, N_z/2]$；$k_x, k_y$ 按标准折叠规则
 - 逆变换不破坏输入，无需复制缓冲区
 - `forward(scale::none)` + `backward(scale::full)`（自动 $/N$）
@@ -247,7 +247,11 @@ make -f Makefile_accfft
 ```
 
 在 MSU-270 上，编译命令以 `scripts/compile_all.sh` 为准。P3DFFT 版必须用 nvc++ 编译
-（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++，并加 `-fno-math-errno`；nvc++ 不接受 `-fno-math-errno`，因此 P3DFFT 的编译行不加该选项。
+（`OMPI_CXX=nvc++ mpicxx ... -mp`）：libp3dfft 由 nvfortran/nvc 构建，用 g++ 会混用两套 OpenMP 运行库导致崩溃。其余 CPU 版用 g++，并加 `-fno-math-errno`。
+
+**FFTW 多线程必须链接 `libfftw3_omp`，不要链接 `libfftw3_threads`。** 原因：`_threads` 版用 pthread 创建工作线程，这些线程继承主线程的 CPU 亲和性。设置了 `OMP_PROC_BIND`/`OMP_PLACES` 时，libgomp 在启动时就把主线程绑到第一个 place，结果 FFT 只用一个 place，退回串行速度；`_omp` 版直接使用 OpenMP 线程组。FFTW、AccFFT、heFFTe CPU 版已改为链接 `_omp`（heFFTe 原来根本没有启用 FFTW 多线程）。P3DFFT 用 nvc++ 编译，不能链接 GCC 编译的 `libfftw3_omp`，所以仍链接 `_threads`：做 Pure OpenMP 测试时，不要把 `OMP_PLACES` 设成每核一个 place（例如保持 `{0:128}` 这种单个大 place）。
+
+nvc++ 不接受 `-fno-math-errno`，因此 P3DFFT 的编译行不加该选项。
 
 ### 运行
 
@@ -348,38 +352,50 @@ mpirun -np 4 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 10 bench
     FFTs per step:              36
 ```
 
-- **FFT**：所有求解器内的正/逆变换（含库内转置通信）；AccFFT / p3dfft 在逆变换前为保护输入所做的复制也计入此项。
-- **Spectral pointwise**：旋度、粘性项、投影、RHS 合并、归一化缩放、RK4 组合与复制等。
+- **FFT**：所有求解器内的正/逆变换（含库内转置通信）。
+- **Spectral pointwise**：旋度+粘性项（一个核函数/循环）、缩放+求和+投影+RK4 更新（一个核函数/循环）、保存 V^n。
 - **Physical pointwise**：实空间归一化与叉乘 v×rot(v)。
 - **Forcing**：外力填充 + 其 3 次 FFT + 复制/缩放（bench 下为 0）。外力的 FFT 不计入 FFT 项，因此两种模式的 FFT 项可直接比较。
 - 多进程时每一项分别对各进程取最大值，因此 Sum of phases 可能略大于 Total。
 - CPU 版用主机墙钟；单 GPU / 每进程一 GPU 的版本（cuFFT、cuFFTMp、heFFTe GPU）用默认流上的 cudaEvent，不额外同步；
   cuFFTXt（单进程多 GPU）在每个计时点前同步全部 GPU（复用已有的 SYNC 点，bench 模式不增加同步）。
 
-### cuFFTMp 多节点版的显存
+### 显存：累加形式的 RK4（所有版本）
 
-`NavierStokes_periodic_cufftmp_multinode.cu` 为了减少显存，改用累加形式存储 RK4。它仍是同一个经典 RK4，系数不变：
+除已弃用的 `cufftmp_mgpu` 外，所有求解器都按累加形式存储 RK4。它仍是同一个经典 RK4，系数不变，只改了存储方式和计算顺序：
 
 ```
-k    = P[ inv_N·rot + rhs (+ inv_N·work，仅 verify) ]    # k 不写回显存
+k    = P[ nl + (-k²V) (+ f，仅 verify) ]    # k 只在一个核函数/循环内存在，不写回内存
 阶段1: acc  = V_orig + τ/6·k;   V = V_orig + τ/2·k
 阶段2: acc += τ/3·k;            V = V_orig + τ/2·k
 阶段3: acc += τ/3·k;            V = V_orig + τ·k
 阶段4:                          V = acc + τ/6·k
 ```
 
-每个 GPU 上的全尺寸复数数组：
+每个进程（GPU 版为每块 GPU）上的全尺寸数组（复数 + 实数）：
 
-| | bench | verify |
-|---|---|---|
-| 修改前 | 27 + scratch 0.5 | 33 + scratch 0.5 |
-| 修改后 | 15（V×3、rot×3、rhs×3、V_orig×3、acc×3） | 18（另加 work×3） |
+| 版本 | 修改前 bench | 修改前 verify | 修改后（两种模式） |
+|---|---|---|---|
+| cuFFTMp 多节点 | 27 复数 + scratch | 33 复数 + scratch | 15 复数（verify 18）* |
+| cuFFTXt | 27 复数 + scratch | 33 复数 + scratch | 15 复数（verify 18）* |
+| cuFFT 单卡 | 24 + 6 + scratch | 27 + 9 + scratch | 15 + 6 |
+| heFFTe gpu1 / multigpu | 25 + 6 + scratch | 28 + 9 + scratch | 15 + 6 |
+| heFFTe mgpu | 18 + 6 + scratch | 21 + 9 + scratch | 15 + 6 |
+| FFTW | 32 + 6 | 35 + 9 | 15 + 6 |
+| AccFFT | 30 + 6 | 33 + 9 | 15 + 6 |
+| P3DFFT | 29 + 6（另有每次 RHS 的 6 个临时复制） | 32 + 9 | 15 + 6 |
+| heFFTe CPU | 29 + 6 | 32 + 9 | 15 + 6 |
 
+\* cuFFTMp/cuFFTXt 的实空间与谱空间共用同一个原地缓冲区，因此没有单独的实数数组；verify 另需 work×3。
+
+- 其余版本中，r2c 的输出直接写回 rot；verify 的外力复用已经空闲的实空间速度和谱空间速度，所以两种模式的数组个数相同。
+- 诊断用的 scratch 复用 rhs1 的内存（heFFTe GPU 的 pencil 分解若不够大，会单独分配）。
+- AccFFT 和 P3DFFT 的逆变换会破坏输入。新方案在逆变换之后不再使用其输入，所以原来为保护输入所做的复制都去掉了。
 - 诊断用的 scratch 复用 rhs1 的内存。
 - 与修改前相比，结果只有舍入级的差异。
-- 程序启动时打印 `Memory report`：`ws_r2c`、`ws_c2r`、数组个数和大小、每卡已用显存。
+- 程序启动时打印 `Memory report`：数组个数和大小；GPU 版还打印每卡已用显存（cudaMemGetInfo），cuFFTMp 另打印 `ws_r2c`/`ws_c2r`，heFFTe 另打印工作区大小。
 
-**共享工作区：** R2C 和 C2R 两个计划从不同时执行，默认共用一块 cuFFT 工作区（用 `nvshmem_malloc` 分配）。
+**共享工作区（cuFFTMp 多节点版）：** R2C 和 C2R 两个计划从不同时执行，默认共用一块 cuFFT 工作区（用 `nvshmem_malloc` 分配）。
 做法见 NVIDIA 示例 [r2c_c2r_shared_scratch](https://github.com/NVIDIA/CUDALibrarySamples/tree/master/cuFFTMp/samples/r2c_c2r_shared_scratch)。
 设置 `NS_SHARE_WORK_AREA=0` 可以改回每个计划各自分配，不需要重新编译。
 
