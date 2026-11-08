@@ -166,6 +166,53 @@ inline void reduce_phases_max(const double in[PH_COUNT], double out[PH_COUNT],
 #endif
 
 // -----------------------------------------------------------------------------
+// heFFTe plan options from the environment (only when heffte.h was included first)
+//   NS_HEFFTE_ALGO    = alltoallv | alltoall | p2p | p2p_plined   (default: the caller's)
+//   NS_HEFFTE_REORDER = 0 | 1                                     (default: the caller's)
+// Only algorithm and use_reorder are touched; every other option is left as given.
+// Read on rank 0 and broadcast, so all ranks use the same plan. Rank 0 prints the result.
+// -----------------------------------------------------------------------------
+#if defined(HEFFTE_H) && defined(MPI_VERSION)
+namespace nsmode {
+inline const char* heffte_algo_name(heffte::reshape_algorithm a) {
+    switch (a) {
+        case heffte::reshape_algorithm::alltoallv:  return "alltoallv";
+        case heffte::reshape_algorithm::alltoall:   return "alltoall";
+        case heffte::reshape_algorithm::p2p:        return "p2p";
+        case heffte::reshape_algorithm::p2p_plined: return "p2p_plined";
+    }
+    return "?";
+}
+inline void heffte_options_from_env(heffte::plan_options& opt, int rank, MPI_Comm comm = MPI_COMM_WORLD) {
+    int v[3] = { (int)opt.algorithm, opt.use_reorder ? 1 : 0, 0 };   // v[2]: 1 = invalid value
+    if (rank == 0) {
+        if (const char* a = std::getenv("NS_HEFFTE_ALGO")) {
+            if      (!std::strcmp(a, "alltoallv"))  v[0] = (int)heffte::reshape_algorithm::alltoallv;
+            else if (!std::strcmp(a, "alltoall"))   v[0] = (int)heffte::reshape_algorithm::alltoall;
+            else if (!std::strcmp(a, "p2p"))        v[0] = (int)heffte::reshape_algorithm::p2p;
+            else if (!std::strcmp(a, "p2p_plined")) v[0] = (int)heffte::reshape_algorithm::p2p_plined;
+            else { std::fprintf(stderr, "Error: NS_HEFFTE_ALGO=%s (expected alltoallv|alltoall|p2p|p2p_plined)\n", a); v[2] = 1; }
+        }
+        if (const char* r = std::getenv("NS_HEFFTE_REORDER")) {
+            if      (!std::strcmp(r, "0")) v[1] = 0;
+            else if (!std::strcmp(r, "1")) v[1] = 1;
+            else { std::fprintf(stderr, "Error: NS_HEFFTE_REORDER=%s (expected 0|1)\n", r); v[2] = 1; }
+        }
+    }
+    MPI_Bcast(v, 3, MPI_INT, 0, comm);
+    if (v[2]) MPI_Abort(comm, 1);
+    opt.algorithm   = (heffte::reshape_algorithm)v[0];
+    opt.use_reorder = (v[1] != 0);
+    if (rank == 0) {
+        std::printf("heFFTe plan options: algorithm = %s (NS_HEFFTE_ALGO), use_reorder = %d (NS_HEFFTE_REORDER)\n",
+                    heffte_algo_name(opt.algorithm), opt.use_reorder ? 1 : 0);
+        std::fflush(stdout);
+    }
+}
+} // namespace nsmode
+#endif
+
+// -----------------------------------------------------------------------------
 // GPU event-based phase timer (one device per process)
 // -----------------------------------------------------------------------------
 #ifdef __CUDACC__

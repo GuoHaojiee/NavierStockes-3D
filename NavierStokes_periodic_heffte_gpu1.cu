@@ -496,7 +496,11 @@ int main(int argc, char** argv) {
 
     if (rank==0) cout << "heFFTe pencil grid: " << pg[0] << "x" << pg[1] << "x" << pg[2] << "\n";
 
-    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD);
+    // Library defaults for the cufft backend (alltoallv, use_reorder = false), unless
+    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER.
+    auto options = heffte::default_options<heffte::backend::cufft>();
+    nsmode::heffte_options_from_env(options, rank);
+    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
 
     BoxGPU br = make_box(inbox_r);
     BoxGPU bc = make_box(outbox_c);

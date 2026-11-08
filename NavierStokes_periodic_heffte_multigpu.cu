@@ -404,6 +404,7 @@ int main(int argc, char** argv) {
     options.use_gpu_aware = true;
     options.use_reorder   = false;
     options.algorithm     = heffte::reshape_algorithm::alltoallv; 
+    nsmode::heffte_options_from_env(options, rank);   // NS_HEFFTE_ALGO / NS_HEFFTE_REORDER
     heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,2,MPI_COMM_WORLD,options);
     BoxGPU br=make_box(inbox_r),bc=make_box(outbox_c);
     long long nr=br.n(),nc=bc.n();

@@ -455,7 +455,11 @@ int main(int argc, char** argv) {
     }
 
     // 创建 FFT 引擎（使用 FFTW 后端，R2C 沿 dim=2 即 z 方向）
-    heffte::fft3d_r2c<heffte::backend::fftw> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD);
+    // Library defaults for the fftw backend (alltoallv, use_reorder = true), unless
+    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER.
+    auto options = heffte::default_options<heffte::backend::fftw>();
+    nsmode::heffte_options_from_env(options, rank);
+    heffte::fft3d_r2c<heffte::backend::fftw> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
 
     size_t nr = inbox_r.count();
     size_t nc = outbox_c.count();
