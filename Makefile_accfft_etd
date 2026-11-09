@@ -1,0 +1,45 @@
+# Makefile for AccFFT + ETD4RK 版本求解器（NavierStokes_periodic_accfft_etd.cpp）
+#
+# 用法：
+#   make -f Makefile_accfft_etd                         # 默认 AccFFT 路径
+#   make -f Makefile_accfft_etd ACCFFT_DIR=/path/to/accfft_install
+#   make -f Makefile_accfft_etd run NP=1 OMP=16          # 小测试
+
+CXX      = mpicxx
+CXXFLAGS = -O3 -std=c++17 -Wall -fopenmp
+
+# AccFFT 安装路径（可在命令行覆盖）
+ACCFFT_DIR ?= /home/guohaojie/.local
+
+# FFTW 路径（AccFFT 依赖，系统安装；可覆盖）
+FFTW_LIB ?= /usr/lib/x86_64-linux-gnu
+
+INCLUDES = -I$(ACCFFT_DIR)/include
+
+# AccFFT 不使用 fftw_mpi，自己实现 MPI 通信
+LIBS = -L$(ACCFFT_DIR)/lib -L$(FFTW_LIB) \
+       -laccfft -lfftw3 -lfftw3f -lfftw3_threads -lfftw3f_threads -lm \
+       -Wl,-rpath,$(ACCFFT_DIR)/lib
+
+TARGET = navier_stokes_accfft_etd
+NP  ?= 1
+OMP ?= 4
+
+all: $(TARGET)
+
+$(TARGET): NavierStokes_periodic_accfft_etd.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIBS)
+	@echo "编译成功！可执行文件: $(TARGET)"
+
+# 快速自检：dt 很小时 rk4 与 etd4rk 一致
+run: $(TARGET)
+	mpirun -np $(NP) ./$(TARGET) 32 32 32 1e-4 100 $(OMP) compare
+
+# 系数检查（Python，需要 numpy/mpmath/sympy）
+check:
+	python3 etd_coeff_check.py
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all run check clean
