@@ -8,6 +8,16 @@
 | `fb2_heffte_gpu.sbatch` | heFFTe GPU 版慢，有多少来自布局 / reorder / 批处理这些可调参数 | 30–40 分钟 |
 | `fb3_cpu.sbatch` | heFFTe CPU 版比 FFTW 慢一倍，是不是因为砖块分解（4 次重排） | 15–25 分钟 |
 
+后续三个作业（2026‑11‑14 增加）：
+
+| 作业 | 回答的问题 | 需要 |
+|---|---|---|
+| `fb4_msgsize.sbatch` | 一次转置的时间怎样随数据量和 GPU 数变化（固定开销 + 带宽两个参数）；每节点点数固定时 1 / 2 / 4 节点的弱扩展 | 4 节点，约 30 分钟，不用重新编译 |
+| `fb5_nodes.sbatch` | 8、16 节点上模型的预测是否成立 | 8 或 16 节点（拿到配额时再跑） |
+| `fb6_fftw_lit.sbatch` | 为什么 heFFTe 作者测出 heFFTe ≥ FFTW，而我们测出 FFTW 更快：按作者基准代码的方式调用 FFTW（自然顺序输出 = 两次转置，ESTIMATE） | 1 节点，约 20 分钟，需要先重新运行 `build_fb.sh` |
+
+`fb_fftw` 新增环境变量 `FB_TRANSPOSED=0`：不用转置输出，每次变换两次全局转置。只作诊断，不是推荐配置。
+
 ## 使用
 
 ```bash

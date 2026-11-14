@@ -33,8 +33,9 @@ for f in "$@"; do
       printf "%-11s %-14s %3s %5s %-7s %-7s %3s %-10s %3s %3s %4s %9s %9s %9s %9s %8s %7s\n", kv($0,"lib"),kv($0,"N"),kv($0,"P"),kv($0,"nodes"),kv($0,"in"),kv($0,"out"),kv($0,"r2c"),kv($0,"algo"),kv($0,"reorder"),kv($0,"batch"),kv($0,"reshapes"),kv($0,"t_fwd_ms"),kv($0,"t_bwd_ms"),kv($0,"t_mean_ms"),kv($0,"step_fft_s"),z(kv($0,"B_node")),kv($0,"ws_GiB")
       got = 1; next }
     /^RESULT lib=fftw/ {
-      if (!h3++) printf "%-11s %-14s %4s %3s %-9s %9s %9s %9s %9s %8s\n", "lib","N","P","thr","flag","fwd_ms","bwd_ms","mean_ms","step_s","plan_s"
-      printf "%-11s %-14s %4s %3s %-9s %9s %9s %9s %9s %8s\n", "fftw",kv($0,"N"),kv($0,"P"),kv($0,"threads"),kv($0,"flag"),kv($0,"t_fwd_ms"),kv($0,"t_bwd_ms"),kv($0,"t_mean_ms"),kv($0,"step_fft_s"),kv($0,"plan_s")
+      if (!h3++) printf "%-11s %-14s %4s %3s %-9s %6s %9s %9s %9s %9s %8s\n", "lib","N","P","thr","flag","transp","fwd_ms","bwd_ms","mean_ms","step_s","plan_s"
+      tr = kv($0,"transposes"); if (tr == "-") tr = 1
+      printf "%-11s %-14s %4s %3s %-9s %6s %9s %9s %9s %9s %8s\n", "fftw",kv($0,"N"),kv($0,"P"),kv($0,"threads"),kv($0,"flag"),tr,kv($0,"t_fwd_ms"),kv($0,"t_bwd_ms"),kv($0,"t_mean_ms"),kv($0,"step_fft_s"),kv($0,"plan_s")
       got = 1; next }
     /^heFFTe way|^ESTIMATE on real|^MEASURE  on real|^PATIENT  on real|^== (contiguous|strided)/ { print "  " $0; got = 1; next }
     /\[check\].*FAIL/ { print "  !! CHECK FAILED in: " cur }

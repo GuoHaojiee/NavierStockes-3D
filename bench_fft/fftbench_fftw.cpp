@@ -5,10 +5,15 @@
  *
  * Usage: fftbench_fftw NX NY NZ [iters=20] [nfields=3] [omp_threads=1]
  * Env:   FB_FLAG = estimate | measure | patient   (default measure)
+ *        FB_TRANSPOSED = 1 | 0                     (default 1)
  *        FB_CHECK = 0 | 1                          (default 1)
  *
- * FB_FLAG=estimate reproduces how heFFTe's FFTW backend plans (it always uses FFTW_ESTIMATE),
- * so the effect of the planner flag alone can be separated from heFFTe's communication.
+ * FB_TRANSPOSED=1 (default) is the solver's configuration: transposed output, ONE global transpose per FFT.
+ * FB_TRANSPOSED=0 plans without FFTW_MPI_TRANSPOSED_OUT/IN: the output is in natural order and FFTW
+ *   transposes back, i.e. TWO global transposes per FFT. Together with FB_FLAG=estimate this is how the
+ *   heFFTe authors' benchmark suite (github.com/icl-utk-edu/fiber, hpfft_backend_fftw.h) calls FFTW,
+ *   so it reproduces the conditions under which they report heFFTe to be faster than FFTW.
+ *   It is a diagnostic, not a configuration to use.
  */
 #include <cstdio>
 #include <cstdlib>
@@ -49,14 +54,17 @@ int main(int argc, char** argv) {
     else if (!strcmp(fs, "patient")) flag = FFTW_PATIENT;
     else if (strcmp(fs, "measure")) { if (!rank) fprintf(stderr, "FB_FLAG must be estimate|measure|patient\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
 
-    ptrdiff_t lnx, lx0, lny, ly0;
-    const ptrdiff_t alloc = fftw_mpi_local_size_3d_transposed(NX, NY, NZC, MPI_COMM_WORLD, &lnx, &lx0, &lny, &ly0);
+    const int transposed = getenv("FB_TRANSPOSED") ? atoi(getenv("FB_TRANSPOSED")) : 1;
+    ptrdiff_t lnx, lx0, lny = 0, ly0 = 0;
+    const ptrdiff_t alloc = transposed
+        ? fftw_mpi_local_size_3d_transposed(NX, NY, NZC, MPI_COMM_WORLD, &lnx, &lx0, &lny, &ly0)
+        : fftw_mpi_local_size_3d(NX, NY, NZC, MPI_COMM_WORLD, &lnx, &lx0);
 
     std::vector<double*> buf(NF);
     for (int f = 0; f < NF; ++f) { buf[f] = fftw_alloc_real(2 * alloc); std::fill(buf[f], buf[f] + 2 * alloc, 0.0); }
     double t_plan0 = MPI_Wtime();
-    fftw_plan pf = fftw_mpi_plan_dft_r2c_3d(NX, NY, NZ, buf[0], (fftw_complex*)buf[0], MPI_COMM_WORLD, flag | FFTW_MPI_TRANSPOSED_OUT);
-    fftw_plan pb = fftw_mpi_plan_dft_c2r_3d(NX, NY, NZ, (fftw_complex*)buf[0], buf[0], MPI_COMM_WORLD, flag | FFTW_MPI_TRANSPOSED_IN);
+    fftw_plan pf = fftw_mpi_plan_dft_r2c_3d(NX, NY, NZ, buf[0], (fftw_complex*)buf[0], MPI_COMM_WORLD, transposed ? (flag | FFTW_MPI_TRANSPOSED_OUT) : flag);
+    fftw_plan pb = fftw_mpi_plan_dft_c2r_3d(NX, NY, NZ, (fftw_complex*)buf[0], buf[0], MPI_COMM_WORLD, transposed ? (flag | FFTW_MPI_TRANSPOSED_IN) : flag);
     double t_plan = max_all(MPI_Wtime() - t_plan0);
     for (int f = 0; f < NF; ++f) std::fill(buf[f], buf[f] + 2 * alloc, 0.0);   // planning may scribble
 
@@ -64,6 +72,8 @@ int main(int argc, char** argv) {
         printf("============================================================\n");
         printf(" FFTW-MPI pure FFT benchmark  %td x %td x %td  ranks=%d  threads=%d  flag=%s  nfields=%d  iters=%d\n",
                NX, NY, NZ, P, NT, fs, NF, ITERS);
+        printf(" %s\n", transposed ? "transposed output: 1 global transpose per FFT (solver configuration)"
+                                   : "natural-order output: 2 global transposes per FFT (as in the heFFTe authors' benchmark)");
 #ifndef FB_THREADS
         if (NT > 1) printf(" WARNING: built without -DFB_THREADS, omp_threads ignored\n");
 #endif
@@ -102,8 +112,8 @@ int main(int argc, char** argv) {
     const double t_f = max_all(tf / nfft), t_b = max_all(tb / nfft), t_m = 0.5 * (t_f + t_b);
     if (!rank) {
         printf("[time] per FFT: forward %.3f ms, backward %.3f ms, mean %.3f ms -> 36 FFT/step = %.4f s/step\n", t_f * 1e3, t_b * 1e3, t_m * 1e3, 36 * t_m);
-        printf("RESULT lib=fftw N=%tdx%tdx%td P=%d threads=%d flag=%s nf=%d t_fwd_ms=%.4f t_bwd_ms=%.4f t_mean_ms=%.4f step_fft_s=%.4f plan_s=%.2f\n",
-               NX, NY, NZ, P, NT, fs, NF, t_f * 1e3, t_b * 1e3, t_m * 1e3, 36 * t_m, t_plan);
+        printf("RESULT lib=fftw N=%tdx%tdx%td P=%d threads=%d flag=%s transposes=%d nf=%d t_fwd_ms=%.4f t_bwd_ms=%.4f t_mean_ms=%.4f step_fft_s=%.4f plan_s=%.2f\n",
+               NX, NY, NZ, P, NT, fs, transposed ? 1 : 2, NF, t_f * 1e3, t_b * 1e3, t_m * 1e3, 36 * t_m, t_plan);
         fflush(stdout);
     }
     fftw_destroy_plan(pf); fftw_destroy_plan(pb);
