@@ -13,8 +13,8 @@
 #   /work/build/bin_pl/ns_p3dfft_{estimate,measure,patient}
 #
 # P3DFFT layout: the solver must be linked against a library configured like the container one.
-# Pass the configure arguments of the container build in P3DFFT_CONF (see logs/build_p3dfft2.log).
-# P3DFFT only:  ... $M env PL_ONLY_P3DFFT=1 P3DFFT_CONF="..." bash .../build_planner.sh
+# P3DFFT is built exactly like build/build_p3dfft.sh (/opt/p3dfft_v2), plus the planner option.
+# P3DFFT only:  ... $M env PL_ONLY_P3DFFT=1 bash .../build_planner.sh
 #
 # Run on a compute node:
 #   source ~/guohaojie/runs/common.sh
@@ -26,7 +26,7 @@ FFTWD=/opt/fftw3; J=${J:-16}
 mkdir -p $OPT $OUT $WRK
 c(){ name=$1; shift; if "$@" > $OUT/$name.log 2>&1; then echo "OK   $name"; else echo "FAIL $name (see $OUT/$name.log)"; return 1; fi; }
 
-echo "container: ACCFFT_DIR=$ACCFFT_DIR  P3DFFT_HOME=$P3DFFT_HOME  P3DFFT_CONF='${P3DFFT_CONF:-}'"
+echo "container: ACCFFT_DIR=$ACCFFT_DIR  P3DFFT_HOME=$P3DFFT_HOME"
 
 if [ -z "$PL_SOLVERS_ONLY" ]; then
 # ---------------------------------------------------------------- AccFFT, patched
@@ -47,18 +47,28 @@ build_accfft() {
 
 # ---------------------------------------------------------------- P3DFFT x3
 build_p3dfft() {   # $1 = estimate | measure | patient
+    # Same steps and arguments as build/build_p3dfft.sh (the container library /opt/p3dfft_v2);
+    # the only difference is --enable-estimate / --enable-patient. Subshell: the OMPI_* exports
+    # must not leak into the solver builds below.
+    (
+    set -e
     local f=$1 opt=""
     [ $f = estimate ] && opt=--enable-estimate
     [ $f = patient  ] && opt=--enable-patient
-    cd $WRK || return 1
-    [ -d p3dfft ] || git clone -q https://github.com/sdsc/p3dfft.git p3dfft || return 1
-    rm -rf p3dfft_$f && cp -r p3dfft p3dfft_$f && cd p3dfft_$f || return 1
-    # P3DFFT_CONF: the configure arguments of the original container build (without --prefix and without
-    # --enable-estimate/--enable-patient), e.g. taken from logs/build_p3dfft2.log. Default = a guess.
-    # eval, so quoted values with spaces in P3DFFT_CONF (e.g. FCFLAGS="-O3 -Mextend") stay one argument
-    local conf=${P3DFFT_CONF:-"--enable-pgi --enable-fftw --with-fftw=$FFTWD FC=${P3DFFT_FC:-mpifort} CC=mpicc"}
-    echo "  ./configure --prefix=$OPT/p3dfft_$f $opt $conf"
-    eval ./configure --prefix=$OPT/p3dfft_$f $opt $conf && make -j$J && make install
+    export OMPI_FC=nvfortran OMPI_CC=nvc OMPI_CXX=nvc++
+    cd $WRK
+    [ -d p3dfft ] || git clone -q --depth 1 https://github.com/sdsc/p3dfft.git p3dfft
+    rm -rf p3dfft_$f $OPT/p3dfft_$f && cp -r p3dfft p3dfft_$f && cd p3dfft_$f
+    autoreconf -fi
+    echo "  ./configure --prefix=$OPT/p3dfft_$f $opt (+ arguments of build_p3dfft.sh)"
+    ./configure --prefix=$OPT/p3dfft_$f $opt --enable-fftw --with-fftw=$FFTWD --enable-openmp \
+      FC=mpif90 F77=mpif90 CC=mpicc CXX=mpicxx \
+      LIBS="-L$FFTWD/lib -lfftw3 -lfftw3f -lfftw3_mpi" CPPFLAGS="-I$FFTWD/include"
+    grep -E "define (ESTIMATE|MEASURE|PATIENT|STRIDE1)" config.h || true
+    make -j1 -C build
+    make -C build install
+    mkdir -p $OPT/p3dfft_$f/include; cp include/*.h $OPT/p3dfft_$f/include/; cp build/*.mod $OPT/p3dfft_$f/include/ 2>/dev/null || true
+    )
 }
 for f in estimate measure patient; do c lib_p3dfft_$f build_p3dfft $f; done
 fi
