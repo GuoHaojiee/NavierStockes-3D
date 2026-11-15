@@ -523,12 +523,28 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 创建 FFT 计划（一个计划可用于所有相同大小的变换）
     // ------------------------------------------------------------------
+    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient
+    // 注意：原版 AccFFT（src/accfft.cpp）只区分 ESTIMATE 与"其他"，ACCFFT_PATIENT 会被当成
+    // FFTW_MEASURE。要真正用 PATIENT，必须链接打过补丁的库（scripts/build_planner_libs.sh）。
+    const int rigor_id = nsmode::plan_rigor_from_env();
+    if (rigor_id == nsmode::PLAN_INVALID || rigor_id == nsmode::PLAN_EXHAUSTIVE) {
+        if (rank == 0) cerr << "Error: NS_FFTW_PLAN must be estimate|measure|patient for AccFFT\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    const unsigned acc_flags[] = { ACCFFT_ESTIMATE, ACCFFT_MEASURE, ACCFFT_PATIENT };
+#ifdef NS_ACCFFT_PATCHED
+    const char* acc_lib = "patched AccFFT: PATIENT -> FFTW_PATIENT";
+#else
+    const char* acc_lib = "stock AccFFT: PATIENT is treated as FFTW_MEASURE";
+#endif
+    if (rank == 0) cout << "AccFFT planner flag: ACCFFT_" << nsmode::plan_rigor_name(rigor_id)
+                        << " (NS_FFTW_PLAN; " << acc_lib << ")\n";
     if (rank == 0) cout << "Creating AccFFT plan...\n";
     MPI_Barrier(c_comm);
     double t_plan = MPI_Wtime();
 
     accfft_plan* plan = accfft_plan_dft_3d_r2c(n, V1_r, (double*)V1_c,
-                                                c_comm, ACCFFT_MEASURE);
+                                                c_comm, acc_flags[rigor_id]);
     MPI_Barrier(c_comm);
     if (rank == 0)
         cout << "AccFFT plan time: " << MPI_Wtime() - t_plan << " s\n";

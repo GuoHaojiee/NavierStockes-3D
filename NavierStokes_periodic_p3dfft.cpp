@@ -500,12 +500,23 @@ int main(int argc, char** argv) {
         cout << "============================================================\n";
     }
 
+    // P3DFFT 的 FFTW 规划强度在编译库时决定（configure --enable-estimate / measure / patient），
+    // 运行时无法更改。build 脚本通过 -DNS_P3DFFT_PLAN="..." 把所链接库的设置写进程序。
+#ifndef NS_P3DFFT_PLAN
+#define NS_P3DFFT_PLAN "unknown (library default is MEASURE)"
+#endif
+    if (rank == 0) cout << "P3DFFT planner flag (fixed at library build): " << NS_P3DFFT_PLAN << "\n";
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_setup = MPI_Wtime();
+
     int memsize[3];
     Cp3dfft_setup(dims, nx, ny, nz,
                   MPI_Comm_c2f(MPI_COMM_WORLD),
                   nx, ny, nz,
                   1,       // OW=1: btran_c2r 允许覆盖输入（我们始终复制，此处设为1）
                   memsize);
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) cout << "P3DFFT setup (planning) time: " << MPI_Wtime() - t_setup << " s\n";
 
     ctx.memsize[0] = memsize[0];
     ctx.memsize[1] = memsize[1];

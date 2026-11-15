@@ -151,6 +151,34 @@ inline void print_phase_summary(const double acc[PH_COUNT], double total_wall, l
     std::fflush(stdout);
 }
 
+// -----------------------------------------------------------------------------
+// FFTW planner rigor from the environment (CPU solvers whose library takes it at run time)
+//   NS_FFTW_PLAN = estimate | measure | patient | exhaustive      (default: measure)
+// The environment is the same on every rank (srun exports it), so no broadcast is needed.
+// Returns PLAN_INVALID for an unknown value; the caller aborts.
+// -----------------------------------------------------------------------------
+enum PlanRigor { PLAN_INVALID = -1, PLAN_ESTIMATE = 0, PLAN_MEASURE = 1, PLAN_PATIENT = 2, PLAN_EXHAUSTIVE = 3 };
+
+inline int plan_rigor_from_env(int def = PLAN_MEASURE) {
+    const char* s = std::getenv("NS_FFTW_PLAN");
+    if (!s || !*s)                     return def;
+    if (!std::strcmp(s, "estimate"))   return PLAN_ESTIMATE;
+    if (!std::strcmp(s, "measure"))    return PLAN_MEASURE;
+    if (!std::strcmp(s, "patient"))    return PLAN_PATIENT;
+    if (!std::strcmp(s, "exhaustive")) return PLAN_EXHAUSTIVE;
+    return PLAN_INVALID;
+}
+
+inline const char* plan_rigor_name(int r) {
+    switch (r) {
+        case PLAN_ESTIMATE:   return "ESTIMATE";
+        case PLAN_MEASURE:    return "MEASURE";
+        case PLAN_PATIENT:    return "PATIENT";
+        case PLAN_EXHAUSTIVE: return "EXHAUSTIVE";
+    }
+    return "INVALID";
+}
+
 } // namespace nsmode
 
 // -----------------------------------------------------------------------------

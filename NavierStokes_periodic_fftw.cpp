@@ -134,14 +134,15 @@ double func_f3(double x, double y, double z, double t) {
  *
  * any_r : 任意一个已分配的实数组（大小 2*alloc_local），用于 plan 创建
  * any_c : 任意一个已分配的复数组（大小 alloc_local），用于 plan 创建
+ * rigor : FFTW_ESTIMATE / FFTW_MEASURE / FFTW_PATIENT / FFTW_EXHAUSTIVE（由 NS_FFTW_PLAN 选择）
  */
 void initialize_fftw_3d(ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                        double *any_r, fftw_complex *any_c) {
+                        double *any_r, fftw_complex *any_c, unsigned rigor) {
     // 谱空间保持转置布局 [y][x][z]（y 分布），省去正变换末尾和逆变换开头的全局转置
     plan_r2c = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, any_r, any_c,
-                                         MPI_COMM_WORLD, FFTW_MEASURE | FFTW_MPI_TRANSPOSED_OUT);
+                                         MPI_COMM_WORLD, rigor | FFTW_MPI_TRANSPOSED_OUT);
     plan_c2r = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, any_c, any_r,
-                                         MPI_COMM_WORLD, FFTW_MEASURE | FFTW_MPI_TRANSPOSED_IN);
+                                         MPI_COMM_WORLD, rigor | FFTW_MPI_TRANSPOSED_IN);
 }
 
 void finalize_fft_plans() {
@@ -497,12 +498,21 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     // 初始化所有 FFTW 计划（所有数组已预分配，指针固定）
     // ------------------------------------------------------------------
+    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient | exhaustive
+    const int rigor_id = nsmode::plan_rigor_from_env();
+    if (rigor_id == nsmode::PLAN_INVALID) {
+        if (rank == 0) cerr << "Error: NS_FFTW_PLAN must be estimate|measure|patient|exhaustive" << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    const unsigned rigor_flags[] = { FFTW_ESTIMATE, FFTW_MEASURE, FFTW_PATIENT, FFTW_EXHAUSTIVE };
+    if (rank == 0) cout << "FFTW planner flag: FFTW_" << nsmode::plan_rigor_name(rigor_id)
+                        << " (NS_FFTW_PLAN)" << endl;
     if (rank == 0) cout << "Initializing FFTW plans..." << endl;
     MPI_Barrier(MPI_COMM_WORLD);
     double t_plan_start = MPI_Wtime();
 
     // 只需任意一对合法缓冲区创建 plan；执行时通过 fftw_mpi_execute_* 换指针
-    initialize_fftw_3d(nx, ny, nz, V1_r, V1_c);
+    initialize_fftw_3d(nx, ny, nz, V1_r, V1_c, rigor_flags[rigor_id]);
 
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
