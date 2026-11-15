@@ -1,0 +1,4 @@
+b2b_v2_8n_heffte_bind_r1.sbatch
+b2b_v2_8n_heffte_bind_r2.sbatch
+b2b_v2_16n_heffte_bind_r1.sbatch
+b2b_v2_16n_heffte_bind_r2.sbatch
