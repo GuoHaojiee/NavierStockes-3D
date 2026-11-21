@@ -532,6 +532,11 @@ int main(int argc, char** argv) {
 #define NS_P3DFFT_PLAN "unknown (library default is MEASURE)"
 #endif
     if (rank == 0) cout << "P3DFFT planner flag (fixed at library build): " << NS_P3DFFT_PLAN << "\n";
+    // 所链接的 libp3dfft.a（静态库，路径是编译时的）及其编译选项，scripts/p3dfft/build_p3dfft_opt.sh 用 -DNS_P3DFFT_LIB 写入
+#ifndef NS_P3DFFT_LIB
+#define NS_P3DFFT_LIB "not recorded (built without -DNS_P3DFFT_LIB)"
+#endif
+    if (rank == 0) cout << "P3DFFT library: " << NS_P3DFFT_LIB << "\n";
     MPI_Barrier(MPI_COMM_WORLD);
     double t_setup = MPI_Wtime();
 
