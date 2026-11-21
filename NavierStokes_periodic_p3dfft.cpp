@@ -1,10 +1,19 @@
 /**
- * Navier-Stokes 求解器 - p3dfft 版本（2D pencil 分解）
+ * Navier-Stokes 求解器 - p3dfft 版本（slab 或 2D pencil 分解，NS_DECOMP 选择）
  *
  * 基于 NavierStokes_periodic_fftw.cpp 的核心算法，使用 p3dfft C 接口代替 FFTW MPI。
  *
  * 与 FFTW 版本的关键区别：
- *   - p3dfft 支持 2D pencil 分解（非 FFTW 的 1D slab），可更好地利用多节点并行
+ *   - 分解方式由 NS_DECOMP 决定（auto | slab | pencil，见 common_mode.h）。dims = {P1, P2}，
+ *     P1 = dims[0] = iproc，P2 = dims[1] = jproc（DIMS_C 未定义时 setup.F90 只在 MPI_Cart_create
+ *     里交换顺序，iproc 仍是 dims(1)）。布局（STRIDE1 未定义，用户手册 2.7.5 表 6）：
+ *       实空间  Nx × Ny/P1 × Nz/P2         谱空间  (Nx/2+1)/P1 × Ny/P2 × Nz      （x 最快）
+ *       slab  : dims = {1, p}（手册："(1,12) can be specified for 1D decomposition"）。
+ *               ftran/btran 中 "if (iproc .gt. 1)" 跳过 X↔Y 转置，每次 FFT 只有 1 次 Y↔Z 转置。
+ *               实空间 z 切分、谱空间 y 切分。configure 的 --enable-oned 只定义 ONED 宏，
+ *               源码中没有任何地方使用它，因此不开也能用 slab。
+ *       pencil: dims = MPI_Dims_create(p, 2)，每次 FFT 2 次转置
+ *     两种情况布局顺序相同，只是块大小不同；下标只通过 get_dims 的 start/end/size 使用，无需修改
  *   - R2C 压缩第一维（x 方向）：kx = 0..nx/2（非负），ky/kz 需折叠处理
  *   - 数据布局：Fortran 列主序（x 变化最快），使用 1-based 全局索引
  *   - p3dfft btran_c2r 会销毁输入数组：时间推进中逆变换之后不再使用其谱空间内容；诊断时先复制
@@ -468,13 +477,26 @@ int main(int argc, char** argv) {
     double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
 
     // ------------------------------------------------------------------
-    // 初始化 p3dfft（2D pencil 分解）
+    // 初始化 p3dfft（分解方式：NS_DECOMP = auto | slab | pencil）
     // ------------------------------------------------------------------
     P3DCtx ctx;
     ctx.nx = nx; ctx.ny = ny; ctx.nz = nz;
 
+    // slab {1,p} 在实空间切 z（Fortran 顺序中最慢的方向）、在谱空间切 y
+    const int decomp = nsmode::decomp_from_env(nprocs, min(ny, nz));
+    if (decomp != nsmode::DECOMP_SLAB && decomp != nsmode::DECOMP_PENCIL) {
+        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
+                            << " (P3DFFT: expected auto|slab|pencil)\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(ny, nz)) {
+        if (rank == 0) cerr << "Error: slab needs nprocs <= min(ny, nz) = " << min(ny, nz)
+                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
     int dims[2] = {0, 0};
-    MPI_Dims_create(nprocs, 2, dims);
+    if (decomp == nsmode::DECOMP_SLAB) { dims[0] = 1; dims[1] = nprocs; }
+    else                               MPI_Dims_create(nprocs, 2, dims);
 
     // ------------------------------------------------------------------
     // FFTW 多线程初始化（必须在 Cp3dfft_setup 之前调用，使 p3dfft 内部的
@@ -487,17 +509,21 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         cout << "============================================================\n";
-        cout << "  Navier-Stokes Solver - p3dfft Version (2D Pencil)\n";
+        cout << "  Navier-Stokes Solver - p3dfft Version (" << nsmode::decomp_name(decomp) << ")\n";
         cout << "============================================================\n";
         cout << "Grid: " << nx << " x " << ny << " x " << nz
              << ", dt=" << scientific << dt << ", steps=" << nt_run << "\n";
         cout << "Domain: [0, 2π]^3\n";
-        cout << "MPI processes: " << nprocs
-             << " (2D grid " << dims[0] << "x" << dims[1] << ")\n";
+        cout << "MPI processes: " << nprocs << "\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
+        char grid[160];
+        snprintf(grid, sizeof grid, "%dx%d (dims = P1 x P2)%s", dims[0], dims[1],
+                 (decomp == nsmode::DECOMP_PENCIL && (dims[0] == 1 || dims[1] == 1))
+                     ? " -- MPI_Dims_create gave a 1D grid" : "");
+        nsmode::print_decomp(decomp, grid);
     }
 
     // P3DFFT 的 FFTW 规划强度在编译库时决定（configure --enable-estimate / measure / patient），

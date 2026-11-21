@@ -179,6 +179,49 @@ inline const char* plan_rigor_name(int r) {
     return "INVALID";
 }
 
+// -----------------------------------------------------------------------------
+// Domain decomposition from the environment (CPU solvers AccFFT / P3DFFT / heFFTe)
+//   NS_DECOMP = auto | slab | pencil | brick      (default: auto; brick = heFFTe only)
+//   auto: slab when nprocs <= n_slab, otherwise pencil.
+//   n_slab = number of grid points along the direction(s) a slab decomposition splits
+//            (the slowest-varying direction; the caller passes the minimum over the
+//            real-space and spectral-space split directions, so a slab never has empty
+//            ranks).  For an N^3 grid this is simply N.
+// The environment is the same on every rank (srun exports it), so no broadcast is needed.
+// Returns DECOMP_INVALID for an unknown value; the caller aborts.  The caller also
+// rejects values its library does not support (brick outside heFFTe).
+// -----------------------------------------------------------------------------
+enum Decomp { DECOMP_INVALID = -1, DECOMP_SLAB = 0, DECOMP_PENCIL = 1, DECOMP_BRICK = 2 };
+
+inline const char* decomp_env_value() {
+    const char* s = std::getenv("NS_DECOMP");
+    return (s && *s) ? s : "auto (unset)";
+}
+
+inline int decomp_from_env(int nprocs, long n_slab) {
+    const char* s = std::getenv("NS_DECOMP");
+    if (!s || !*s || !std::strcmp(s, "auto")) return (nprocs <= n_slab) ? DECOMP_SLAB : DECOMP_PENCIL;
+    if (!std::strcmp(s, "slab"))   return DECOMP_SLAB;
+    if (!std::strcmp(s, "pencil")) return DECOMP_PENCIL;
+    if (!std::strcmp(s, "brick"))  return DECOMP_BRICK;
+    return DECOMP_INVALID;
+}
+
+inline const char* decomp_name(int d) {
+    switch (d) {
+        case DECOMP_SLAB:   return "slab";
+        case DECOMP_PENCIL: return "pencil";
+        case DECOMP_BRICK:  return "brick";
+    }
+    return "INVALID";
+}
+
+// One line, the same in every solver (scripts grep for "decomposition:").
+inline void print_decomp(int d, const char* grid) {
+    std::printf("decomposition: %s   process grid: %s   NS_DECOMP=%s\n", decomp_name(d), grid, decomp_env_value());
+    std::fflush(stdout);
+}
+
 } // namespace nsmode
 
 // -----------------------------------------------------------------------------

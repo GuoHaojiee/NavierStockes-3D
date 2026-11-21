@@ -1,10 +1,17 @@
 /**
- * Navier-Stokes 求解器 - heFFTe 版本（2D pencil 分解）
+ * Navier-Stokes 求解器 - heFFTe 版本（slab / pencil / brick 分解，NS_DECOMP 选择）
  *
  * 基于 NavierStokes_periodic_fftw.cpp 的核心算法，使用 heFFTe 库代替 FFTW MPI。
  *
  * 与 FFTW 版本的关键区别：
- *   - heFFTe fft3d_r2c 自动进行 2D pencil 分解（非 FFTW 的 1D slab）
+ *   - 分解方式由 NS_DECOMP 决定（auto | slab | pencil | brick，见 common_mode.h）；
+ *     只换输入/输出的进程网格，所有循环都用全局下标和 box_idx，无需区分：
+ *       slab  : inbox {p,1,1}（x 切分），outbox {1,p,1}（y 切分），use_pencils=false，期望 1 次重排
+ *       pencil: inbox {p1,p2,1}（z-pencil），outbox {1,p1,p2}（x-pencil），p1*p2=p 取最接近的
+ *               因子分解（heffte::make_procgrid），use_pencils=true，期望 2 次重排
+ *       brick : 输入输出都是 proc_setup_min_surface（原来的行为），一般 4 次重排
+ *               （网格某一维已经完整时更少，例如 4 进程 1x2x2 为 3 次）
+ *     实际的 MPI 重排次数由 plan_operations 算出并打印
  *   - R2C 压缩第三维 (dim=2, 即 z)：kz = 0..nz/2（非负）
  *   - kx = (i<=nx/2)?i:i-nx，ky = (j<=ny/2)?j:j-ny（需折叠）
  *   - 正变换使用 scale::none（不归一化），逆变换使用 scale::full（自动除以 N）
@@ -20,6 +27,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <array>
 #include <tuple>
 #include <vector>
 #include <mpi.h>
@@ -416,12 +424,25 @@ int main(int argc, char** argv) {
     fftw_plan_with_nthreads(nthreads);
     int max_threads = nthreads;
 
+    // slab 在实空间切 x、在谱空间切 y
+    const int decomp = nsmode::decomp_from_env(nprocs, min(nx, ny));
+    if (decomp == nsmode::DECOMP_INVALID) {
+        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
+                            << " (heFFTe: expected auto|slab|pencil|brick)\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(nx, ny)) {
+        if (rank == 0) cerr << "Error: slab needs nprocs <= min(nx, ny) = " << min(nx, ny)
+                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;
     double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
 
     if (rank == 0) {
         cout << "============================================================\n";
-        cout << "  Navier-Stokes Solver - heFFTe Version (2D Pencil)\n";
+        cout << "  Navier-Stokes Solver - heFFTe Version (" << nsmode::decomp_name(decomp) << ")\n";
         cout << "============================================================\n";
         cout << "Grid: " << nx << " x " << ny << " x " << nz
              << ", dt=" << scientific << dt << ", steps=" << nt_run << "\n";
@@ -434,7 +455,7 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // 初始化 heFFTe（自动 2D pencil 分解）
+    // 初始化 heFFTe（分解方式：NS_DECOMP）
     // ------------------------------------------------------------------
     // 注意：heFFTe fft 对象析构时会释放内部 MPI 通信子，
     //       必须在 MPI_Finalize() 之前完成析构，故用块作用域包围。
@@ -442,23 +463,48 @@ int main(int argc, char** argv) {
     heffte::box3d<> world_r = {{0, 0, 0}, {nx - 1, ny - 1, nz - 1}};
     heffte::box3d<> world_c = {{0, 0, 0}, {nx - 1, ny - 1, nz / 2}};  // R2C 压缩 z
 
-    auto proc_grid   = heffte::proc_setup_min_surface(world_r, nprocs);
-    auto all_inboxes = heffte::split_world(world_r, proc_grid);
-    auto all_outboxes = heffte::split_world(world_c, proc_grid);
+    std::array<int, 3> grid_in, grid_out;
+    if (decomp == nsmode::DECOMP_SLAB) {
+        grid_in  = {nprocs, 1, 1};
+        grid_out = {1, nprocs, 1};
+    } else if (decomp == nsmode::DECOMP_PENCIL) {
+        std::array<int, 2> pg = heffte::make_procgrid(nprocs);   // p1*p2 = p，面积最小 = 最接近正方形
+        grid_in  = {pg[0], pg[1], 1};
+        grid_out = {1, pg[0], pg[1]};
+    } else {
+        grid_in = grid_out = heffte::proc_setup_min_surface(world_r, nprocs);
+    }
+    auto all_inboxes  = heffte::split_world(world_r, grid_in);
+    auto all_outboxes = heffte::split_world(world_c, grid_out);
 
     heffte::box3d<> inbox_r  = all_inboxes[rank];
     heffte::box3d<> outbox_c = all_outboxes[rank];
 
-    if (rank == 0) {
-        cout << "heFFTe pencil grid: "
-             << proc_grid[0] << "x" << proc_grid[1] << "x" << proc_grid[2] << "\n";
-    }
-
     // 创建 FFT 引擎（使用 FFTW 后端，R2C 沿 dim=2 即 z 方向）
     // Library defaults for the fftw backend (alltoallv, use_reorder = true), unless
-    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER.
+    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER. use_pencils follows the decomposition
+    // (brick keeps the library default).
     auto options = heffte::default_options<heffte::backend::fftw>();
     nsmode::heffte_options_from_env(options, rank);
+    if (decomp == nsmode::DECOMP_SLAB)   options.use_pencils = false;
+    if (decomp == nsmode::DECOMP_PENCIL) options.use_pencils = true;
+
+    // 与 fft3d_r2c 构造函数内部完全相同的规划（集体操作），用来数出每次 FFT 的 MPI 重排次数：
+    // 某一阶段的输入输出 box 几何不同（box3d 的 == 忽略 order）才需要通信
+    int n_reshape = 0;
+    {
+        auto lplan = heffte::plan_operations(heffte::mpi::gather_boxes(inbox_r, outbox_c, MPI_COMM_WORLD), 2,
+                                             heffte::set_options<heffte::backend::fftw, true>(options), rank);
+        for (int i = 0; i < 4; ++i) if (!heffte::match(lplan.in_shape[i], lplan.out_shape[i])) ++n_reshape;
+    }
+    if (rank == 0) {
+        char grid[160];
+        snprintf(grid, sizeof grid, "in %dx%dx%d, out %dx%dx%d, use_pencils=%d, MPI reshapes per FFT = %d",
+                 grid_in[0], grid_in[1], grid_in[2], grid_out[0], grid_out[1], grid_out[2],
+                 options.use_pencils ? 1 : 0, n_reshape);
+        nsmode::print_decomp(decomp, grid);
+    }
+
     heffte::fft3d_r2c<heffte::backend::fftw> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
 
     size_t nr = inbox_r.count();

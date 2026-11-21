@@ -1,10 +1,16 @@
 /**
- * Navier-Stokes 求解器 - AccFFT 版本（2D pencil 分解）
+ * Navier-Stokes 求解器 - AccFFT 版本（slab 或 2D pencil 分解，NS_DECOMP 选择）
  *
  * 基于 NavierStokes_periodic_fftw.cpp 的核心算法，使用 AccFFT 库代替 FFTW MPI。
  *
  * 与 FFTW 版本的关键区别（库差异，算法相同）：
- *   - AccFFT 2D pencil 分解（非 FFTW 的 1D slab）
+ *   - 分解方式由 NS_DECOMP 决定（auto | slab | pencil，见 common_mode.h）：
+ *       slab  : c_dims = {p,1}，AccFFT 走 oneD 路径（src/accfft.cpp：np[1]==1 时 oneD=true），每次 FFT 1 次转置
+ *               实空间 x 切分 [nx/p, ny, nz]，谱空间 y 切分 [nx, ny/p, nz/2+1]
+ *       pencil: c_dims = {0,0}，库用 MPI_Dims_create 选 P0 x P1，每次 FFT 2 次转置
+ *               实空间 [nx/P0, ny/P1, nz]，谱空间 [nx, ny/P0, (nz/2+1)/P1]
+ *     两种情况 accfft_local_size_dft_r2c 返回的 osize/ostart 都是同一种布局（osize_2：x 完整、
+ *     y 按 P0、z 按 P1 切分），下标只通过 isize/istart/osize/ostart 使用，无需区分分解方式
  *   - R2C 压缩第三维（z 方向）：kz = 0..nz/2（非负）
  *   - kx = (gi<=nx/2)?gi:gi-nx，ky 类似（折叠，Nyquist 置零）
  *   - Complex = double[2]，访问方式 A[idx][0] / A[idx][1]
@@ -430,13 +436,27 @@ int main(int argc, char** argv) {
     double dx = Lx/nx, dy = Ly/ny, dz = Lz/nz;
 
     // ------------------------------------------------------------------
-    // 初始化 AccFFT（2D pencil 分解）
+    // 初始化 AccFFT（分解方式：NS_DECOMP = auto | slab | pencil）
     // ------------------------------------------------------------------
     AccCtx ctx;
     ctx.nx = nx;  ctx.ny = ny;  ctx.nz = nz;
     ctx.norm_inv = 1.0 / (static_cast<double>(nx) * ny * nz);
 
-    int c_dims[2] = {0, 0};   // {0,0} 让 AccFFT 自动选择最优进程网格
+    // slab 在实空间切 x、在谱空间切 y，两者都不能少于 p 个点
+    const int decomp = nsmode::decomp_from_env(nprocs, min(nx, ny));
+    if (decomp != nsmode::DECOMP_SLAB && decomp != nsmode::DECOMP_PENCIL) {
+        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
+                            << " (AccFFT: expected auto|slab|pencil)\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(nx, ny)) {
+        if (rank == 0) cerr << "Error: slab needs nprocs <= min(nx, ny) = " << min(nx, ny)
+                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    // slab：{p,1} → np[1]==1，AccFFT 内部 oneD=true；pencil：{0,0} 让 AccFFT 自动选择进程网格
+    int c_dims[2] = {0, 0};
+    if (decomp == nsmode::DECOMP_SLAB) { c_dims[0] = nprocs; c_dims[1] = 1; }
     MPI_Comm c_comm;
     accfft_create_comm(MPI_COMM_WORLD, c_dims, &c_comm);
 
@@ -467,7 +487,7 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         cout << "============================================================\n";
-        cout << "  Navier-Stokes Solver - AccFFT Version (2D Pencil)\n";
+        cout << "  Navier-Stokes Solver - AccFFT Version (" << nsmode::decomp_name(decomp) << ")\n";
         cout << "============================================================\n";
         cout << "Grid: " << nx << " x " << ny << " x " << nz
              << ", dt=" << scientific << dt << ", steps=" << nt_run << "\n";
@@ -477,6 +497,11 @@ int main(int argc, char** argv) {
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
+        char grid[160];
+        snprintf(grid, sizeof grid, "%dx%d (c_dims)%s", c_dims[0], c_dims[1],
+                 (decomp == nsmode::DECOMP_PENCIL && (c_dims[0] == 1 || c_dims[1] == 1))
+                     ? " -- MPI_Dims_create gave a 1D grid, AccFFT runs it as slab" : "");
+        nsmode::print_decomp(decomp, grid);
         cout << "Real space local:     ["
              << ctx.istart[0] << "+" << ctx.isize[0] << "] x ["
              << ctx.istart[1] << "+" << ctx.isize[1] << "] x [0+" << ctx.isize[2] << "]\n";

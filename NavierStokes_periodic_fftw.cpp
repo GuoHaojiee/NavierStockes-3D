@@ -457,6 +457,10 @@ int main(int argc, char **argv) {
         }
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
+        // FFTW MPI 只有 slab（x 切分）；NS_DECOMP 不起作用，只打印出来便于核对
+        char pgrid[96];
+        snprintf(pgrid, sizeof pgrid, "%dx1 (x slabs; FFTW MPI is slab only, NS_DECOMP ignored)", size);
+        nsmode::print_decomp(nsmode::DECOMP_SLAB, pgrid);
         cout << "============================================================" << endl;
     }
 
