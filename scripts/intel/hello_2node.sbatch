@@ -41,13 +41,20 @@
 #                        rank 0 prints ucx_info -v
 #        E4_tcp          FI_PROVIDER=tcp — diagnosis: if only this works, launch and PMI are fine and only the
 #                        high-speed network layer is missing
+#   E5 as E3 (D1 pmi2 launcher, FI_PROVIDER=mlx, Intel provider directory only), only the UCX settings change;
+#      UCX_LOG_LEVEL=info, rank 0 prints ucx_info -v; the transports/devices UCX chose go to <variant>.<bytes>.txt
+#      (also when the run works) and into the RESULT line as ucx=<tl/dev,...>:
+#        E5a_mlx5tls   UCX_TLS=rc_mlx5,ud_mlx5,sm,self (as run_env.sh for Open MPI, CPU mode), no UCX_NET_DEVICES
+#        E5b_dc        UCX_TLS=dc_mlx5,sm,self, no UCX_NET_DEVICES
+#        E5c_default   UCX_TLS and UCX_NET_DEVICES unset (UCX defaults)
+#        E5d_alldev    UCX_TLS=rc_mlx5,ud_mlx5,sm,self, UCX_NET_DEVICES=mlx5_0:1,...,mlx5_9:1 (8 HCAs; E5D_NET_DEVICES=...)
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
 # Every Intel variant also reports the PMI API Intel MPI really used ("MPI startup(): PMI API: ..." with I_MPI_DEBUG=5):
 #   RESULT ... pmi_api=<pmi|pmi2|pmix>; PMI_API_MISMATCH(expected=...) when it is not the one the variant asked for.
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
 # Argument: the Intel image (default: the one in $MI, i.e. ns3d_intel.sqsh); "v2" = containers/ns3d_intel_v2.sqsh.
-# HELLO_GROUPS selects the groups (default "R A B D E C F"), e.g. only the reference and the E group on the new image:
+# HELLO_GROUPS selects the groups (default "R A B D E E5 C F"; "R E5" = reference + UCX settings), e.g. only the reference and the E group on the new image:
 #   sbatch --export=ALL,HELLO_GROUPS="R E" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch
@@ -55,7 +62,7 @@
 [ -n "$1" ] && export INTEL_IMAGE=$1                   # image choice, see intel_common.sh
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
-GROUPS_=${HELLO_GROUPS:-"R A B D E C F"}
+GROUPS_=${HELLO_GROUPS:-"R A B D E E5 C F"}
 want() { [[ " $GROUPS_ " == *" $1 "* ]]; }
 IE="source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1"
 HB=/work/build/bin_intel/hello_a2a
@@ -96,6 +103,22 @@ T() {
             echo "    failure details: $TMP/$v.$sz.txt"
         fi
         l=$(grep "^HELLO_OK" $f | tail -1)
+        # UCX: what it really selected (UCX_LOG_LEVEL=info), written to <variant>.<bytes>.txt also for a run that worked
+        local ux=""
+        if [ -n "$UCXLOG" ]; then
+            { [ $st = OK ] && echo "# $v bytes=$sz rc=$rc status=OK   srun $so ... | $c"
+              echo "# ---- ucx_info -v (rank 0)"
+              grep -E "^# " $f | head -6
+              echo "# ---- UCX transport / device selection (UCX_LOG_LEVEL=info; time, host, pid stripped; counted)"
+              grep -E "UCX +(INFO|WARN|ERROR)|ucp_ep|transport|ep_cfg|lane" $f | grep -v "^>>>" \
+                | sed -E 's/^\[[0-9.]+\] +\[[^]]+\] +//' | sort | uniq -c | sort -rn | head -60
+              echo "# ---- transport/device pairs seen"
+              grep -oE "[a-z_0-9]+/(mlx5_[0-9]+:[0-9]+|memory|lo|ib[0-9a-z]*|eth[0-9a-z]*|en[0-9a-z]*)" $f | sort | uniq -c | sort -rn | head -20
+            } >> $TMP/$v.$sz.txt
+            ux=$(grep -oE "(rc|ud|dc|rc_mlx5|ud_mlx5|dc_mlx5|rc_verbs|ud_verbs|tcp)/[a-z0-9_]+(:[0-9]+)?" $f | sort -u | head -12 | tr '\n' ',' | sed 's/,$//')
+            ux="ucx=${ux:-none}"
+            echo "    UCX selection: ${ux#ucx=}   (details: $TMP/$v.$sz.txt)"
+        fi
         # PMI API actually used by Intel MPI (I_MPI_DEBUG >= 2 prints it); EXPECT_API = what the variant asked for
         local api pa=""
         api=$(grep -m1 -o "PMI API: *[A-Za-z0-9_]*" $f | awk '{print $NF}')
@@ -105,7 +128,7 @@ T() {
                 pa="$pa PMI_API_MISMATCH(expected=$EXPECT_API)"; echo "    WARNING: Intel MPI used PMI API '${api:-none}', not $EXPECT_API"
             fi
         fi
-        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa"; echo
+        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa $ux"; echo
         [ $st = OK ] || { [ "$si" != "${SIZES##* }" ] && echo "    (larger sizes of $v skipped)"; return 1; }
     done
     return 0
@@ -249,15 +272,17 @@ if [ -n "$D_PMI2" ]; then   # 2 ranks per node: not used as the launcher for F (
 fi
 fi   # group D
 
-if want E; then
-# ---------------------------------------------------------------- E) D1 launcher, Intel's own libfabric providers only
-echo "=============== E) srun --mpi=pmi2 + libpmi2.so.0, FI_PROVIDER_PATH = Intel libfabric providers only"
+# ---- shared by the E and E5 groups: the D1 launcher with Intel's libfabric providers only
 E_PMI2=${D_PMI2:-/usr/lib/x86_64-linux-gnu/libpmi2.so.0}
 E3NET=${E3_NET_DEVICES:-mlx5_2:1}
 # \$I_MPI_ROOT is expanded inside the container (after intel_env.sh)
 e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$E_PMI2 FI_PROVIDER_PATH=\$I_MPI_ROOT/opt/mpi/libfabric/lib/prov FI_LOG_LEVEL=warn; unset I_MPI_HYDRA_BOOTSTRAP"
 # printed once, by rank 0: which provider files exist and that the system directory is gone from the path
 pinfo="[ \${SLURM_PROCID:-0} = 0 ] && { echo \"FI_PROVIDER_PATH=\$FI_PROVIDER_PATH: \$(ls \$FI_PROVIDER_PATH 2>&1 | tr '\\n' ' ')\"; }"
+
+if want E; then
+# ---------------------------------------------------------------- E) D1 launcher, Intel's own libfabric providers only
+echo "=============== E) srun --mpi=pmi2 + libpmi2.so.0, FI_PROVIDER_PATH = Intel libfabric providers only"
 for v in "E1_verbs_rxm|export FI_PROVIDER='verbs;ofi_rxm'" \
          "E2_psm3|export FI_PROVIDER=psm3" \
          "E3_mlx_ucxtls|export FI_PROVIDER=mlx UCX_TLS=rc,ud,sm,self UCX_NET_DEVICES=$E3NET; [ \${SLURM_PROCID:-0} = 0 ] && ucx_info -v" \
@@ -267,6 +292,21 @@ for v in "E1_verbs_rxm|export FI_PROVIDER='verbs;ofi_rxm'" \
     && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
 done
 fi   # group E
+
+if want E5; then
+# ---------------------------------------------------------------- E5) as E3 (mlx), UCX settings only
+echo "=============== E5) mlx provider (E3 launcher), UCX transport / device settings"
+E5DEV=${E5D_NET_DEVICES:-mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1}
+ux0="export FI_PROVIDER=mlx UCX_LOG_LEVEL=info; [ \${SLURM_PROCID:-0} = 0 ] && ucx_info -v"
+for v in "E5a_mlx5tls|export UCX_TLS=rc_mlx5,ud_mlx5,sm,self; unset UCX_NET_DEVICES" \
+         "E5b_dc|export UCX_TLS=dc_mlx5,sm,self; unset UCX_NET_DEVICES" \
+         "E5c_default|unset UCX_TLS UCX_NET_DEVICES" \
+         "E5d_alldev|export UCX_TLS=rc_mlx5,ud_mlx5,sm,self UCX_NET_DEVICES=$E5DEV"; do
+  name=${v%%|*}; pe=${v#*|}
+  UCXLOG=1 EXPECT_API=pmi2 T $name "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $ux0; $pe; $pinfo; $HELLO" \
+    && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+done
+fi   # group E5
 
 if want C; then
 # ---------------------------------------------------------------- C) mpirun -bootstrap slurm inside the container

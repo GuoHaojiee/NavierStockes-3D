@@ -226,3 +226,40 @@ sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 ```
 
 rank 0 会先打印一行 `FI_PROVIDER_PATH=…/libfabric/lib/prov: libmlx-fi.so libpsm3-fi.so librxm-fi.so libtcp-fi.so libverbs-…`，确认 provider 目录。
+
+### E5 组：mlx 能通，但带宽太低
+
+E 组的结果：
+
+| 变体 | 结果 | 262144 字节时每节点带宽 |
+|---|---|---|
+| E3_mlx_ucxtls | 跨节点成功，`pmi_api=pmi2` | 2.19 GB/s |
+| E4_tcp | 成功 | 6.47 GB/s |
+| E1_verbs_rxm | 失败（rc=137） | — |
+| E2_psm3 | 失败（rc=143） | — |
+| Open MPI（参照） | 成功 | 30.75 GB/s |
+
+E3 能跨节点，但带宽只有 Open MPI 的 1/14，比 tcp 还低。
+
+E5 组的启动方式和 E3 完全一样（D1 的 pmi2 启动，`FI_PROVIDER=mlx`，只用 Intel 自带的 provider 目录），只改 UCX 设置：
+
+| 变体 | UCX_TLS | UCX_NET_DEVICES |
+|---|---|---|
+| E5a_mlx5tls | `rc_mlx5,ud_mlx5,sm,self`（和 Open MPI 的 run_env.sh CPU 模式相同） | 不设 |
+| E5b_dc | `dc_mlx5,sm,self` | 不设 |
+| E5c_default | 不设（UCX 默认） | 不设 |
+| E5d_alldev | `rc_mlx5,ud_mlx5,sm,self` | `mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1`（可用 `E5D_NET_DEVICES=...` 改） |
+
+每个变体都设 `UCX_LOG_LEVEL=info`，rank 0 打印 `ucx_info -v`。不管成功还是失败，每次运行都会写 `<variant>.<bytes>.txt`，里面有：
+
+- ucx_info 的版本；
+- UCX 的 INFO 行（去掉时间、主机、pid 后计数），也就是 `ep_cfg[...]: tag(rc_mlx5/mlx5_2:1 ...)`，即实际选中的传输方式和设备；
+- 出现过的「传输方式/设备」组合。
+
+RESULT 行末尾另有 `ucx=rc_mlx5/mlx5_2:1,...`。
+
+```bash
+sbatch --export=ALL,HELLO_GROUPS="R E5" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+grep -h "transport/device pairs" -A6 ~/guohaojie/logs/hello2_<job>.d/E5*.262144.txt
+```
