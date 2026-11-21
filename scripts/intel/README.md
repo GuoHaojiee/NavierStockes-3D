@@ -340,3 +340,84 @@ summary 最后一张表 `off-node bandwidth relative to R_ompi_pmix` 列出每�
 没测：v2 镜像里的真实依赖情况（rdma-core 39 对 HPC-X UCX 是否够新）、InfiniBand 和带宽。
 
 另外修了一个 bug：B2 的依赖检查原来用 `ld.so --list`，它遇到第一个缺的库就报 "cannot open shared object file" 并退出，不会逐个打印 "not found"，所以以前报的 "all dependencies resolve" 并不可靠。现在改成 `LD_TRACE_LOADED_OBJECTS=1 ld.so`，和 ldd 的做法一样。
+
+## 多节点 Intel MPI 的固定设置：intel_mn_env.sh + irun_mn
+
+hello_2node 里最好的是 E6d_a2a3，相对 Open MPI 的带宽为 2.72 / 0.96 / 0.93 倍（8 KB / 64 KB / 256 KB）。这套设置现在固定下来，以后所有多节点 Intel 作业都用它：
+
+- `intel_mn_env.sh`：在容器内 source，包含 E6d 的全部设置：
+  - pmi2 启动，`I_MPI_PMI_LIBRARY=libpmi2.so.0`；
+  - `I_MPI_FABRICS=shm:ofi`，`FI_PROVIDER=mlx`，只用 Intel 自带的 provider 目录；
+  - HPC-X 的 UCX 1.17（`/work/opt_ucx/hpcx`）；
+  - `UCX_TLS=rc_mlx5,ud_mlx5,sm,self`，8 块网卡；
+  - `I_MPI_ADJUST_ALLTOALL=3`。
+
+  rank 0 会打印一行 `intel_mn_env: …`，记录实际用了哪些设置。开关：
+
+  | 开关 | 默认 | 作用 |
+  |---|---|---|
+  | `IMN_ALLTOALLV` | 不设 | 设为 1 或 2 时导出 `I_MPI_ADJUST_ALLTOALLV`；heFFTe 和 AccFFT 用 MPI_Alltoallv |
+  | `IMN_ALLTOALL` | 3 | 设为空就用 Intel MPI 的默认值 |
+  | `IMN_UCX_DIR` | `/work/opt_ucx/hpcx` | 设为 `system` 用镜像自带的 UCX 1.12.1 |
+  | `IMN_NET_DEVICES` | 8 块网卡 | UCX_NET_DEVICES |
+  | `IMN_PIN` | `slurm` | `slurm`：由 srun 的 `--cpu-bind=cores` 绑核，`I_MPI_PIN=0`，和 Open MPI 一样；`intel`：用 `I_MPI_PIN_DOMAIN` |
+  | `IMN_DEBUG` | 不设 | I_MPI_DEBUG 级别 |
+
+- `intel_common.sh` 里的 `irun_mn <节点数> <每节点进程数> <每进程线程数> "<命令>"`：
+  - 执行 `srun --mpi=pmi2 -N … --ntasks-per-node=… -c … --cpu-bind=cores $MI`；
+  - 每个 rank 上设 `OMP_NUM_THREADS`、`OMP_PLACES=cores`、`OMP_PROC_BIND=close`，然后 source intel_mn_env.sh，再执行命令；
+  - `IMN_*` 会传进容器；`IRUN_SRUN_OPTS` 给 srun 加参数；`IMN_SHOWBIND=1` 时 rank 0、1 打印各自的 CPU 列表。
+  - 用之前要 `export INTEL_IMAGE=v2`，再 source intel_common.sh。
+
+## cmp_toolchain_4n：4 节点，求解器，gcc 对 intel
+
+- **gcc**：GCC 容器，Open MPI，`srun --mpi=pmix`。程序是 `bin_gcc` 里的 ns_fftw、ns_accfft、ns_heffte_v2，以及 `bin_p3d/gcc/ns_p3dfft`。
+- **intel**：v2 镜像，用 `irun_mn` 启动，`KMP_BLOCKTIME=0`。程序是 `bin_intel` 里的 ns_fftw、ns_accfft，`ns_heffte_v2_mkl` 加 `NS_HEFFTE_REORDER=1`，以及 `bin_p3d/intel/ns_p3dfft`。
+
+四个库都用 `NS_DECOMP=slab`、`NS_FFTW_PLAN=measure`。每节点布局 128×1 和 64×2，即 512 个进程 × 1 线程，或 256 个进程 × 2 线程。每个配置跑 2 次，重复放外层循环，gcc 和 intel 交替。
+
+标签格式是 `<库>-<网格>_<gcc|intel>_<每节点布局>`，例如 `heFFTe-1024_intel_64x2`。ct_parse.sh 和 pl_parse.sh 都能直接解析。
+
+**时长估算**：每个网格 32 次运行（4 个库 × 2 种工具链 × 2 种布局 × 2 次）。
+
+- 512³：每次约 1–1.5 分钟，共约 35–50 分钟；
+- 1024³：每次约 2–4 分钟，共约 65–130 分钟。
+
+两个加起来 1.7–3 小时，太接近 3 小时，所以每个网格单独一个作业。另外，ct4_parse.sh 每份日志只能用一个动能参考值，这也要求每个网格一份日志。
+
+| 参数 | 网格 | 时间步 | 动能参考 |
+|---|---|---|---|
+| `dry` | 64³，dt=5e-5，10 步，每个库每种工具链 1 次；4 节点 × 每节点 16 进程 × 8 线程（slab 要求进程数不超过 N，即最多 64） | | 3.3526466678e+05 |
+| `512` | 512³，dt=1e-6 | 20 步 | 1.7933833444e+08 |
+| `1024` | 1024³，dt=1e-6 | 10 步 | 1.4360200052e+09 |
+
+```bash
+cd ~/guohaojie/src/NavierStockes-3D/scripts/intel
+sbatch -J ct4dry   -t 00:30:00 cmp_toolchain_4n.sbatch dry
+bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4dry_*.out | head -1)
+# dry 通过后：
+sbatch -J ct4_512  -t 01:30:00 cmp_toolchain_4n.sbatch 512
+sbatch -J ct4_1024 -t 03:00:00 cmp_toolchain_4n.sbatch 1024
+bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4_512_*.out | head -1)
+bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4_1024_*.out | head -1)
+```
+
+ct4_parse.sh 的输出依次是：
+
+- ct_parse 的表：每个配置的 step 时间中位数、`vs gcc`、`energy ok`；
+- `best configuration per (library, grid) and toolchain`：每种工具链在能量全对的布局里取最快的一个，最后一列是 intel/gcc；
+- 退出码不为 0 的运行。
+
+**dry 通过的标志**：
+
+- 8 行 `energy ok / failed` 都是 `1 / 0`；
+- 都是 `decomposition: slab   process grid: 1x64`；
+- 第一次 Intel 运行打印 `intel_mn_env: … UCX=/work/opt_ucx/hpcx/lib/ucx … ALLTOALL=3`、`MPI startup(): libfabric provider: mlx`，以及两行 BIND；
+- 没有退出码不为 0 的运行。
+
+本机测过的部分：
+
+- 用假 srun（4 个 rank，Open MPI，8 个程序都指向本机的 P3DFFT 程序）跑通了 dry：能量 3.3526466678e+05 全对，ct4_parse 三张表都正常；
+- `IMN_ALLTOALLV=2` 能传到每个 rank，非法值 7 被忽略。
+
+没测：v2 镜像里真实的 4 节点运行、各库的 Intel 程序、带宽和耗时。
