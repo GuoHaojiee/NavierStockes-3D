@@ -11,3 +11,4 @@ test_spectral_derivative_p3dfft
 # Run logs
 *.log
 slurm-*.out
+__pycache__/

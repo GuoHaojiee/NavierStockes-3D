@@ -449,6 +449,17 @@ int main(int argc, char **argv) {
         cout << "Domain: [0, 2π]³" << endl;
         cout << "MPI processes: " << size << endl;
         cout << "OpenMP threads/process: " << max_threads << endl;
+        {   // threads really in effect (runtime), for the logs of scripts/cpu_final
+            int in_par = 0;
+            #pragma omp parallel
+            {
+                #pragma omp master
+                in_par = omp_get_num_threads();
+            }
+            cout << "Threads (runtime): omp_get_max_threads()=" << omp_get_max_threads()
+                 << " omp_get_num_threads(in parallel)=" << in_par
+                 << "\n";
+        }
         {
             cpu_set_t cs; CPU_ZERO(&cs);
             int ncpu = (sched_getaffinity(0, sizeof(cs), &cs) == 0) ? CPU_COUNT(&cs) : -1;

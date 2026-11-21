@@ -484,6 +484,20 @@ int main(int argc, char** argv) {
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs << "\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
+        {   // threads really in effect (runtime), for the logs of scripts/cpu_final
+            int in_par = 0;
+            #pragma omp parallel
+            {
+                #pragma omp master
+                in_par = omp_get_num_threads();
+            }
+            cout << "Threads (runtime): omp_get_max_threads()=" << omp_get_max_threads()
+                 << " omp_get_num_threads(in parallel)=" << in_par
+#if NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_mkl
+                 << " mkl_get_max_threads()=" << mkl_get_max_threads()
+#endif
+                 << "\n";
+        }
         cout << "heFFTe backend: " << kBackendName << " (NS_HEFFTE_BACKEND, compile time)\n";
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
@@ -541,7 +555,12 @@ int main(int argc, char** argv) {
         nsmode::print_decomp(decomp, grid);
     }
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t_plan = MPI_Wtime();
     heffte::fft3d_r2c<FftBackend> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
+    MPI_Barrier(MPI_COMM_WORLD);
+    // fft3d_r2c 构造：重排计划 + 本地 FFT 计划（MKL 在这里提交 DFTI 描述符；FFTW 后端的计划在首次执行时才建，不计在内）
+    if (rank == 0) cout << "heFFTe plan time: " << MPI_Wtime() - t_plan << " s\n";
 
     size_t nr = inbox_r.count();
     size_t nc = outbox_c.count();

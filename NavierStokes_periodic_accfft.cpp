@@ -494,6 +494,17 @@ int main(int argc, char** argv) {
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs << "\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
+        {   // threads really in effect (runtime), for the logs of scripts/cpu_final
+            int in_par = 0;
+            #pragma omp parallel
+            {
+                #pragma omp master
+                in_par = omp_get_num_threads();
+            }
+            cout << "Threads (runtime): omp_get_max_threads()=" << omp_get_max_threads()
+                 << " omp_get_num_threads(in parallel)=" << in_par
+                 << "\n";
+        }
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
