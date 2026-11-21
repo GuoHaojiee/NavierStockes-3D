@@ -23,6 +23,7 @@
 # Results:
 #   for l in fftw accfft p3dfft heffte; do bash ct_parse.sh $(ls -t ~/guohaojie/logs/ct_ct_${l}_*.out | head -1); done
 # Options (environment at sbatch time): CT_N (512), CT_STEPS (20), CT_REP (3), CT_LAYOUTS ("128x1 64x2"),
+#   CT_DECOMP (slab | pencil | brick, default slab; e.g. sbatch -J ctp_accfft --export=ALL,CT_DECOMP=pencil ...),
 #   CT_EREF (reference energy for another grid), CT_ISRUN (how the single Intel launcher task is started)
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
@@ -30,7 +31,8 @@ LIB=${1:?usage: sbatch cmp_toolchain.sbatch fftw|accfft|p3dfft|heffte}
 GBIN=${CT_GBIN:-/work/build/bin_gcc}; IBIN=/work/build/bin_intel
 N=${CT_N:-512}; DT=1e-6; NS=${CT_STEPS:-20}; REP=${CT_REP:-3}; LAYOUTS=${CT_LAYOUTS:-"128x1 64x2"}
 ISRUN=${CT_ISRUN:-"srun -N 1 -n 1 -c 128 --cpu-bind=none"}
-COMMON="NS_FFTW_PLAN=measure NS_DECOMP=slab"
+DECOMP=${CT_DECOMP:-slab}
+COMMON="NS_FFTW_PLAN=measure NS_DECOMP=$DECOMP"
 KEEP="^decomposition:|process grid|MPI reshapes|heFFTe backend|heFFTe plan options|planner flag|planning time|plan time|\(planning\) time|Kinetic energy|Avg per step:|FFT \(incl|rror|MPI startup\(\): +(Rank|Intel|[0-9]+ )"
 
 # G <label> <ranks> <threads> "<extra env>" <program>       GCC container, Open MPI, srun launches the ranks
@@ -53,7 +55,7 @@ I() {
     echo "<<< exit=${PIPESTATUS[0]}"; echo
 }
 
-echo "library=$LIB  N=$N steps=$NS reps=$REP layouts=$LAYOUTS  node=$(hostname)"
+echo "library=$LIB  decomposition=$DECOMP  N=$N steps=$NS reps=$REP layouts=$LAYOUTS  node=$(hostname)"
 echo "GCC binaries: $(ls -l --time-style=+%F_%R $SCR/build/bin_gcc/ns_fftw $SCR/build/bin_gcc/ns_accfft $SCR/build/bin_gcc/ns_p3dfft $SCR/build/bin_gcc/ns_heffte_v2 2>&1 | awk '{print $6, $7}' | tr '\n' ' ')"
 echo "Intel binaries: $(ls $SCR/build/bin_intel 2>&1 | grep -v log | tr '\n' ' ')"
 for rep in $(seq 1 $REP); do
