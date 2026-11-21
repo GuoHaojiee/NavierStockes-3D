@@ -196,3 +196,33 @@ sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 - 看 `logs/hello2_<job>.d/D*_*.8192.txt`：里面有 MPI startup/PMI 行和最后 20 行错误；
 - D3（每节点 2 个进程）成功而 D1 失败：问题和每节点进程数有关；
 - D2 失败而 D1 成功：多半是 PMIx 4.1.2 客户端和 Slurm 的 PMIx 3.2.3 服务端不兼容。
+
+### E 组：D1 的启动方式 + 只用 Intel 自带的 libfabric provider
+
+D1 在 v2 镜像上已经用上了 PMI-2（日志里 `PMI API: pmi2`，共享内存的错误也没有了），但网络这一层还不通：
+
+- verbs：`fi_getinfo() failed: No data available`；
+- mlx：`get_ep_names: OFI get endpoint name failed: Invalid argument`。
+
+E 组用和 D1 一样的启动方式：`srun --mpi=pmi2`，`I_MPI_PMI=pmi2`，`I_MPI_PMI_LIBRARY=/usr/lib/x86_64-linux-gnu/libpmi2.so.0`，`I_MPI_FABRICS=shm:ofi`。另外：
+
+- `FI_PROVIDER_PATH` 只留 `$I_MPI_ROOT/opt/mpi/libfabric/lib/prov`，去掉系统的 libfabric 目录；
+- `FI_LOG_LEVEL=warn`，失败时 `<variant>.8192.txt` 里有去掉 pid 并计数后的 libfabric 日志。
+
+四个变体：
+
+| 变体 | FI_PROVIDER | 说明 |
+|---|---|---|
+| E1_verbs_rxm | `verbs;ofi_rxm` | |
+| E2_psm3 | `psm3` | Intel 自带的 `libpsm3-fi.so`，走 verbs 设备 |
+| E3_mlx_ucxtls | `mlx` | 另设 `UCX_TLS=rc,ud,sm,self`、`UCX_NET_DEVICES=mlx5_2:1`（GPU0 对应的网卡，可用 `E3_NET_DEVICES=...` 改）；rank 0 打印 `ucx_info -v` |
+| E4_tcp | `tcp` | 诊断用：如果只有它能通，说明启动和 PMI 都没问题，只剩高速网络这一层 |
+
+运行：
+
+```bash
+sbatch --export=ALL,HELLO_GROUPS="R E" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+```
+
+rank 0 会先打印一行 `FI_PROVIDER_PATH=…/libfabric/lib/prov: libmlx-fi.so libpsm3-fi.so librxm-fi.so libtcp-fi.so libverbs-…`，确认 provider 目录。

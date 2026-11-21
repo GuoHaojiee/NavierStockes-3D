@@ -14,7 +14,8 @@
 #     RESULT variant=<name> bytes=<size> status=OK|FAIL|SKIP rc=<exit code> a2a_us=... GBs_node_offnode=...
 # If the smallest size fails, the larger ones of that variant are skipped. A hung srun is killed after 200 s.
 # Files in logs/hello2_<job>.d/: <variant>.<bytes>.raw = full output of every srun; for a FAILED srun also
-# <variant>.<bytes>.txt = the "MPI startup"/PMI lines (I_MPI_DEBUG=5) and the last 20 error lines.
+# <variant>.<bytes>.txt = the "MPI startup"/PMI lines (I_MPI_DEBUG=5), the libfabric log (FI_LOG_LEVEL=warn, E group)
+# and the last 20 error lines.
 #   0  discovery: PMI libraries on the host and inside the container, srun inside the container?
 #   R  reference: Open MPI (GCC container, srun --mpi=pmix) — the fallback if all Intel variants fail
 #   A  srun --mpi=pmi2 (the host has no libpmi2.so):
@@ -32,20 +33,29 @@
 #        D2_pmixlib_<prov>       srun --mpi=pmix, I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=<libpmix.so.2 of the image>
 #        D3_pmi2lib_ppn2_<prov>  as D1 with 2 ranks per node
 #      I_MPI_FABRICS=shm:ofi, <prov> = FI_PROVIDER mlx, then verbs. Skipped when the image has no such library.
+#   E  the D1 launcher (srun --mpi=pmi2, I_MPI_PMI=pmi2, I_MPI_PMI_LIBRARY=libpmi2.so.0 of the image, shm:ofi) with
+#      FI_PROVIDER_PATH = $I_MPI_ROOT/opt/mpi/libfabric/lib/prov only (no system libfabric directory), FI_LOG_LEVEL=warn:
+#        E1_verbs_rxm    FI_PROVIDER="verbs;ofi_rxm"
+#        E2_psm3         FI_PROVIDER=psm3 (Intel's libpsm3-fi.so, runs over the verbs device)
+#        E3_mlx_ucxtls   FI_PROVIDER=mlx, UCX_TLS=rc,ud,sm,self UCX_NET_DEVICES=mlx5_2:1 (NIC of GPU0; E3_NET_DEVICES=...),
+#                        rank 0 prints ucx_info -v
+#        E4_tcp          FI_PROVIDER=tcp — diagnosis: if only this works, launch and PMI are fine and only the
+#                        high-speed network layer is missing
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
 # Every Intel variant also reports the PMI API Intel MPI really used ("MPI startup(): PMI API: ..." with I_MPI_DEBUG=5):
 #   RESULT ... pmi_api=<pmi|pmi2|pmix>; PMI_API_MISMATCH(expected=...) when it is not the one the variant asked for.
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
 # Argument: the Intel image (default: the one in $MI, i.e. ns3d_intel.sqsh); "v2" = containers/ns3d_intel_v2.sqsh.
-# HELLO_GROUPS selects the groups (default "R A B D C F"), e.g. only the new variants on the new image:
+# HELLO_GROUPS selects the groups (default "R A B D E C F"), e.g. only the reference and the E group on the new image:
+#   sbatch --export=ALL,HELLO_GROUPS="R E" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch
 #   sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 [ -n "$1" ] && export INTEL_IMAGE=$1                   # image choice, see intel_common.sh
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
-GROUPS_=${HELLO_GROUPS:-"R A B D C F"}
+GROUPS_=${HELLO_GROUPS:-"R A B D E C F"}
 want() { [[ " $GROUPS_ " == *" $1 "* ]]; }
 IE="source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1"
 HB=/work/build/bin_intel/hello_a2a
@@ -75,6 +85,10 @@ T() {
             { echo "# $v bytes=$sz rc=$rc   srun $so ... | $c"
               echo "# ---- MPI startup / PMI lines"
               grep -E "MPI startup|PMI|pmi" $f | sort | uniq -c | sort -rn | head -60
+              if grep -q "libfabric:" $f; then
+                  echo "# ---- libfabric log (FI_LOG_LEVEL=warn; pid/time stripped, counted)"
+                  grep "libfabric:" $f | sed -E 's/libfabric:[0-9]+:[0-9]+:/libfabric:/' | sort | uniq -c | sort -rn | head -40
+              fi
               echo "# ---- last 20 error lines"
               grep -iE "error|fail|abort|unable|cannot|denied|not found|killed|signal" $f | tail -20
               echo "# ---- last 20 lines"
@@ -234,6 +248,25 @@ if [ -n "$D_PMI2" ]; then   # 2 ranks per node: not used as the launcher for F (
   done
 fi
 fi   # group D
+
+if want E; then
+# ---------------------------------------------------------------- E) D1 launcher, Intel's own libfabric providers only
+echo "=============== E) srun --mpi=pmi2 + libpmi2.so.0, FI_PROVIDER_PATH = Intel libfabric providers only"
+E_PMI2=${D_PMI2:-/usr/lib/x86_64-linux-gnu/libpmi2.so.0}
+E3NET=${E3_NET_DEVICES:-mlx5_2:1}
+# \$I_MPI_ROOT is expanded inside the container (after intel_env.sh)
+e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$E_PMI2 FI_PROVIDER_PATH=\$I_MPI_ROOT/opt/mpi/libfabric/lib/prov FI_LOG_LEVEL=warn; unset I_MPI_HYDRA_BOOTSTRAP"
+# printed once, by rank 0: which provider files exist and that the system directory is gone from the path
+pinfo="[ \${SLURM_PROCID:-0} = 0 ] && { echo \"FI_PROVIDER_PATH=\$FI_PROVIDER_PATH: \$(ls \$FI_PROVIDER_PATH 2>&1 | tr '\\n' ' ')\"; }"
+for v in "E1_verbs_rxm|export FI_PROVIDER='verbs;ofi_rxm'" \
+         "E2_psm3|export FI_PROVIDER=psm3" \
+         "E3_mlx_ucxtls|export FI_PROVIDER=mlx UCX_TLS=rc,ud,sm,self UCX_NET_DEVICES=$E3NET; [ \${SLURM_PROCID:-0} = 0 ] && ucx_info -v" \
+         "E4_tcp|export FI_PROVIDER=tcp"; do
+  name=${v%%|*}; pe=${v#*|}
+  EXPECT_API=pmi2 T $name "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $pe; $pinfo; $HELLO" \
+    && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+done
+fi   # group E
 
 if want C; then
 # ---------------------------------------------------------------- C) mpirun -bootstrap slurm inside the container
