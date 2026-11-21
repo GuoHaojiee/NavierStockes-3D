@@ -11,7 +11,7 @@ FFTW 快约 20%，AccFFT 无差别。这里补上 P3DFFT 和 heFFTe，并比较 
 | `check_env.sh` | Intel 容器内 | icpx/ifx/mpiifx 版本、MKL、cmake、PMI 库、libfabric provider |
 | `build_intel_libs.sh` | Intel 容器内 | P3DFFT 2.x（ifx，MEASURE，无 stride1），heFFTe 2.4.1 ×2（FFTW / MKL 后端） |
 | `build_intel_solvers.sh` | Intel 容器内 | 4 个求解器（heFFTe 两个后端）、`fb_backend_{fftw,mkl}`、`hello_a2a` |
-| `hello_2node.sbatch` + `hello_a2a.c` | 2 节点 | Intel MPI 多节点启动方式 + fabric 扫描；Open MPI 参照 |
+| `hello_2node.sbatch` + `hello_a2a.c` | 2 节点 | Intel MPI 多节点启动方式（含宿主机 libpmix）+ fabric 扫描；Open MPI 参照 |
 | `cmp_toolchain.sbatch` + `ct_parse.sh` | 1 节点 | 每个库 gcc vs intel，512³，128×1 / 64×2，各 3 次 |
 | `backend_1proc.sbatch` + `backend_parse.sh` | 1 节点 | 单进程单线程：heFFTe-FFTW / heFFTe-MKL / 原生 FFTW / 原生 MKL |
 
@@ -67,15 +67,21 @@ srun -p batch --exclude=$EXCL -N1 -n1 -c16 --time=00:30:00 $MI bash /work/src/Na
 应当看到 8 个 `OK`：`ns_fftw ns_accfft ns_p3dfft ns_heffte_v2_fftw fb_backend_fftw ns_heffte_v2_mkl fb_backend_mkl hello_a2a`。
 `ns_p3dfft` 如果第一次链接失败会自动用 `mpiifx -nofor-main` 重试（第一次的日志留在 `ns_p3dfft.try1.log`）。
 
-**4. 多节点启动**（2 节点，约 10–20 分钟）
+**4. 多节点启动**（2 节点，约 15–40 分钟）
 
 ```bash
 sbatch scripts/intel/hello_2node.sbatch
-grep -E "^RESULT|^candidates|no srun" $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 ```
-`RESULT variant=R_ompi_pmix status=OK` 是 Open MPI 参照。至少一个 `A*`/`B*`/`C*` 为 `status=OK` 就说明 Intel MPI
-能跨节点；`F_*` 几行给出各 provider 的 alltoall 时间和每节点带宽（`GBs_node_offnode`），日志里 `MPI startup(): libfabric provider: ...`
-说明实际用了哪个。全部 `FAIL`：多节点 CPU 用 Open MPI（理由：Intel MPI 只对 FFTW 有收益），把日志发给我。
+每个消息大小（每对进程 8192、65536、262144 字节）单独一次 srun；最小的失败，这个方式更大的就跳过。
+`RESULT variant=R_ompi_pmix bytes=... status=OK` 是 Open MPI 参照。Intel MPI 的方式：
+`A*`（srun --mpi=pmi2）、`B1_pmix_cont*`（容器里的 libpmix）、`B2_pmix_host_{mlx,verbs}`（宿主机的
+`libpmix.so.2.5.2` 和容器里缺的依赖库拷到 `logs/hello2_<job>.d/hostpmix/`，挂到容器 `/hostpmix`；日志里
+`pass N: missing in the container: ...` 和 `staged in /hostpmix:` 两行说明拷了什么）、`C_hydra_slurm`。
+任何一个三种大小都 `status=OK`，就说明 Intel MPI 能跨节点；`F_*` 用第一个成功的方式扫 FI_PROVIDER。
+summary 最后的表：每个成功的方式、每个大小的 alltoall 时间（µs）/ 每节点跨节点带宽（GB/s），和 `R_ompi_pmix` 那行比。
+日志里 `MPI startup(): libfabric provider: ...` 说明实际用了哪个 provider。
+全部 `FAIL`：多节点 CPU 用 Open MPI（理由：Intel MPI 只对 FFTW 有收益），把日志发给我。
 
 **5. 工具链对比**（4 个作业并行，4 个节点，每个约 40–80 分钟）
 
