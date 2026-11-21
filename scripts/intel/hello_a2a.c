@@ -1,5 +1,6 @@
 /* hello_a2a.c — multi-node MPI launch test: rank/host map, MPI_Alltoall, check of the received data.
  * Usage: hello_a2a [bytes_per_pair=8192] [iters=20]
+ * Rank 0 first prints "MAPS <path>" for every UCX / libfabric / MPI library mapped into the process.
  * Prints one line "HELLO_OK ranks=... nodes=... a2a_us=... GBs_node=... lib=..." on success,
  * "HELLO_FAIL ..." if the received data are wrong. */
 #include <mpi.h>
@@ -17,6 +18,25 @@ int main(int argc, char** argv) {
     MPI_Get_processor_name(host, &len);
     MPI_Get_library_version(lib, &len);
     for (i = 0; lib[i]; ++i) if (lib[i] == '\n') { lib[i] = 0; break; }
+    /* rank 0: which UCX / libfabric / MPI libraries this process really mapped (after MPI_Init, so the
+     * provider and UCX are loaded): one line "MAPS <path>" each */
+    if (r == 0) {
+        FILE* fm = fopen("/proc/self/maps", "r");
+        char line[4096], seen[48][512]; int ns = 0;
+        const char* keys[] = {"libucp", "libuct", "libucs", "libucm", "libfabric", "-fi.so", "libmpi.so", "libmpi_", "libopen-pal", 0};
+        while (fm && fgets(line, sizeof line, fm)) {
+            char* path = strchr(line, '/'); if (!path) continue;
+            path[strcspn(path, "\n")] = 0;
+            int hit = 0, k, dup = 0;
+            for (k = 0; keys[k]; ++k) if (strstr(path, keys[k])) hit = 1;
+            if (!hit) continue;
+            for (k = 0; k < ns; ++k) if (!strcmp(seen[k], path)) dup = 1;
+            if (dup || ns >= 48 || strlen(path) >= 512) continue;
+            strcpy(seen[ns++], path); printf("MAPS %s\n", path);
+        }
+        if (fm) fclose(fm);
+        fflush(stdout);
+    }
     long bytes = argc > 1 ? atol(argv[1]) : 8192;
     int iters = argc > 2 ? atoi(argv[2]) : 20;
     long n = bytes / 8; if (n < 1) n = 1;

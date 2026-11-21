@@ -48,13 +48,27 @@
 #        E5b_dc        UCX_TLS=dc_mlx5,sm,self, no UCX_NET_DEVICES
 #        E5c_default   UCX_TLS and UCX_NET_DEVICES unset (UCX defaults)
 #        E5d_alldev    UCX_TLS=rc_mlx5,ud_mlx5,sm,self, UCX_NET_DEVICES=mlx5_0:1,...,mlx5_9:1 (8 HCAs; E5D_NET_DEVICES=...)
+#   E6 as E5d_alldev (v2 image), UCX of HPC-X 2.19 (the one Open MPI uses; staged by stage_hpcx_ucx.sh in
+#      /work/opt_ucx/hpcx): LD_LIBRARY_PATH=/work/opt_ucx/hpcx/lib:..., UCX_MODULE_DIR=/work/opt_ucx/hpcx/lib/ucx
+#        E6a_hpcxucx         only that
+#        E6b_hpcxucx_relax   + UCX_IB_PCI_RELAXED_ORDERING=on
+#        E6c_a2a2            + I_MPI_ADJUST_ALLTOALL=2 (Isend/Irecv + waitall)
+#        E6d_a2a3            + I_MPI_ADJUST_ALLTOALL=3 (pairwise exchange)
+#        E6e_a2a4            + I_MPI_ADJUST_ALLTOALL=4 (Plum)
+#        E6f_mlxtls          + FI_MLX_TLS=rc_mlx5,ud_mlx5,sm,self
+#      hello_a2a rank 0 prints "MAPS <path>" of the UCX libraries it really mapped; if E6a does not run with the
+#      HPC-X libucp (missing stage, dependency or version problem), E6b-f fall back to the image's UCX 1.12.1.
+# Every RESULT line ends with ucx_version=<version printed by ucx_info -v> (R: Open MPI's ucx_info) and, when
+# hello_a2a printed it, ucx_lib=<directory of the libucp really loaded>.
+# Summary: bandwidth relative to R_ompi_pmix per size; PASS when >= 0.8x Open MPI at all three sizes
+# (at 262144 that is ~25 GB/s/node for Open MPI's 30.8).
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
 # Every Intel variant also reports the PMI API Intel MPI really used ("MPI startup(): PMI API: ..." with I_MPI_DEBUG=5):
 #   RESULT ... pmi_api=<pmi|pmi2|pmix>; PMI_API_MISMATCH(expected=...) when it is not the one the variant asked for.
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
 # Argument: the Intel image (default: the one in $MI, i.e. ns3d_intel.sqsh); "v2" = containers/ns3d_intel_v2.sqsh.
-# HELLO_GROUPS selects the groups (default "R A B D E E5 C F"; "R E5" = reference + UCX settings), e.g. only the reference and the E group on the new image:
+# HELLO_GROUPS selects the groups (default "R A B D E E5 E6 C F"; "R E5 E6" = reference, E5d for comparison, HPC-X UCX), e.g. only the reference and the E group on the new image:
 #   sbatch --export=ALL,HELLO_GROUPS="R E" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch
@@ -62,7 +76,7 @@
 [ -n "$1" ] && export INTEL_IMAGE=$1                   # image choice, see intel_common.sh
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
-GROUPS_=${HELLO_GROUPS:-"R A B D E E5 C F"}
+GROUPS_=${HELLO_GROUPS:-"R A B D E E5 E6 C F"}
 want() { [[ " $GROUPS_ " == *" $1 "* ]]; }
 IE="source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1"
 HB=/work/build/bin_intel/hello_a2a
@@ -128,7 +142,13 @@ T() {
                 pa="$pa PMI_API_MISMATCH(expected=$EXPECT_API)"; echo "    WARNING: Intel MPI used PMI API '${api:-none}', not $EXPECT_API"
             fi
         fi
-        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa $ux"; echo
+        # UCX version (ucx_info -v of rank 0: "Library version: X" since 1.13, "UCT version=X" in 1.12) and the libucp
+        # directory hello_a2a really mapped; UCXV_FALLBACK = version known from elsewhere (R: Open MPI's ucx_info)
+        local uv ul uf
+        uv=$(grep -m1 -oE "(Library version: *|UCT version=)[0-9]+\.[0-9]+(\.[0-9]+)?" $f | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?$")
+        ul=$(grep -m1 -E "^MAPS .*/libucp\.so" $f | awk '{print $2}')
+        uf="ucx_version=${uv:-${UCXV_FALLBACK:-unknown}}"; [ -n "$ul" ] && uf="$uf ucx_lib=$(dirname $ul)"
+        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa $ux $uf"; echo
         [ $st = OK ] || { [ "$si" != "${SIZES##* }" ] && echo "    (larger sizes of $v skipped)"; return 1; }
     done
     return 0
@@ -146,7 +166,12 @@ echo "--- inside the Intel container (${INTEL_IMAGE:-image of \$MI}):"
 srun -N1 -n1 --time=3 $MI bash -c "$IE; cat /opt/ns3d_pmi_libs.txt > $WTMP/manifest.txt 2>/dev/null; . /etc/os-release; echo \"\$PRETTY_NAME  I_MPI_ROOT=\$I_MPI_ROOT\"; ls -l $HB; command -v srun && srun --version || echo 'no srun inside the container'; \
     find / \( -path /proc -o -path /sys -o -path /dev -o -path /work -o -path /scratch \) -prune -o \( -name 'libpmi2.so*' -o -name 'libpmix.so*' -o -name 'libpmi.so*' \) -print 2>/dev/null | sort -u > $WTMP/pmilibs.txt; cat $WTMP/pmilibs.txt; \
     fi_info -l 2>/dev/null | grep -E '^[a-z]' | tr '\n' ' '; echo"
-[ -x $SCR/build/bin_intel/hello_a2a ] || { echo "ERROR: $SCR/build/bin_intel/hello_a2a missing — run build_intel_solvers.sh first"; }
+# hello_a2a prints "MAPS <lib>" since the E6 group: rebuild it in the Intel image when the source is newer
+if [ ! -x $SCR/build/bin_intel/hello_a2a ] || [ $SCR/src/NavierStockes-3D/scripts/intel/hello_a2a.c -nt $SCR/build/bin_intel/hello_a2a ]; then
+    echo "--- rebuilding $HB (source newer or binary missing)"
+    srun -N1 -n1 --time=3 $MI bash -c "$IE; mpicc -O2 /work/src/NavierStockes-3D/scripts/intel/hello_a2a.c -o $HB" \
+        || echo "ERROR: could not build $HB"
+fi
 PMI2=$(grep -E 'libpmi2\.so' $TMP/pmilibs.txt 2>/dev/null | head -3)
 PMIX=$(grep -E 'libpmix\.so' $TMP/pmilibs.txt 2>/dev/null | head -3)
 echo "candidates pmi2: ${PMI2:-none}   pmix: ${PMIX:-none}"
@@ -160,8 +185,14 @@ echo "D variants: pmi2 lib ${D_PMI2:-none}   pmix lib ${D_PMIX:-none}"
 if want R; then
 # ---------------------------------------------------------------- R) Open MPI reference (GCC container)
 echo "=============== R) Open MPI reference, GCC container"
+# the UCX Open MPI uses (HPC-X), for comparison with the E5/E6 RESULT lines
+srun -N1 -n1 --time=3 $M bash -c "export NS_MODE=cpu; source /work/build/run_env.sh; echo \"ucx_info: \$(command -v ucx_info)\"; ucx_info -v; \
+    p=\$(ompi_info --path libdir --parsable 2>/dev/null | cut -d: -f3); ls \$p/openmpi/mca_pml_ucx.so >/dev/null 2>&1 && ldd \$p/openmpi/mca_pml_ucx.so | grep -E 'libuc[pst]'; \
+    env | grep -E '^UCX_' | sort" > $TMP/ompi_ucx.txt 2>&1
+echo "--- Open MPI (GCC container) UCX:"; sed 's/^/    /' $TMP/ompi_ucx.txt
+OMPI_UCXV=$(grep -m1 -oE "(Library version: *|UCT version=)[0-9]+\.[0-9]+(\.[0-9]+)?" $TMP/ompi_ucx.txt | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?$")
 srun -N1 -n1 --time=3 $M bash -c "source /etc/profile.d/ns3d_env.sh; mpicc -O2 /work/src/NavierStockes-3D/scripts/intel/hello_a2a.c -o /work/build/bin_gcc/hello_a2a_ompi" \
-  && T R_ompi_pmix "--mpi=pmix $SR2 $M" "export NS_MODE=cpu; source /work/build/run_env.sh; /work/build/bin_gcc/hello_a2a_ompi @A@"
+  && UCXV_FALLBACK=$OMPI_UCXV T R_ompi_pmix "--mpi=pmix $SR2 $M" "export NS_MODE=cpu; source /work/build/run_env.sh; /work/build/bin_gcc/hello_a2a_ompi @A@"
 fi   # group R
 
 if want A; then
@@ -217,7 +248,7 @@ source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1
 export LD_LIBRARY_PATH=/hostpmix:$HPROOT/lib:\$LD_LIBRARY_PATH
 for f in $HPMIX $HPROOT/lib/pmix/*.so /hostpmix/*.so*; do
   [ -f "\$f" ] || continue
-  /lib64/ld-linux-x86-64.so.2 --list "\$f" 2>&1 | grep "=> not found" | awk '{print \$1}'
+  LD_TRACE_LOADED_OBJECTS=1 /lib64/ld-linux-x86-64.so.2 "\$f" 2>&1 | grep "=> not found" | awk '{print \$1}'
 done | sort -u
 EOF
   # where the host itself finds a library: ldconfig cache, else what ldd of the host PMIx libraries says
@@ -275,6 +306,7 @@ fi   # group D
 # ---- shared by the E and E5 groups: the D1 launcher with Intel's libfabric providers only
 E_PMI2=${D_PMI2:-/usr/lib/x86_64-linux-gnu/libpmi2.so.0}
 E3NET=${E3_NET_DEVICES:-mlx5_2:1}
+E5DEV=${E5D_NET_DEVICES:-mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1}
 # \$I_MPI_ROOT is expanded inside the container (after intel_env.sh)
 e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$E_PMI2 FI_PROVIDER_PATH=\$I_MPI_ROOT/opt/mpi/libfabric/lib/prov FI_LOG_LEVEL=warn; unset I_MPI_HYDRA_BOOTSTRAP"
 # printed once, by rank 0: which provider files exist and that the system directory is gone from the path
@@ -296,7 +328,6 @@ fi   # group E
 if want E5; then
 # ---------------------------------------------------------------- E5) as E3 (mlx), UCX settings only
 echo "=============== E5) mlx provider (E3 launcher), UCX transport / device settings"
-E5DEV=${E5D_NET_DEVICES:-mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1}
 ux0="export FI_PROVIDER=mlx UCX_LOG_LEVEL=info; [ \${SLURM_PROCID:-0} = 0 ] && ucx_info -v"
 for v in "E5a_mlx5tls|export UCX_TLS=rc_mlx5,ud_mlx5,sm,self; unset UCX_NET_DEVICES" \
          "E5b_dc|export UCX_TLS=dc_mlx5,sm,self; unset UCX_NET_DEVICES" \
@@ -307,6 +338,38 @@ for v in "E5a_mlx5tls|export UCX_TLS=rc_mlx5,ud_mlx5,sm,self; unset UCX_NET_DEVI
     && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
 done
 fi   # group E5
+
+if want E6; then
+# ---------------------------------------------------------------- E6) E5d_alldev + UCX of HPC-X 2.19
+echo "=============== E6) E5d_alldev settings with the UCX of HPC-X (stage_hpcx_ucx.sh -> /work/opt_ucx/hpcx)"
+HUCX=/work/opt_ucx/hpcx
+e5d="export FI_PROVIDER=mlx UCX_LOG_LEVEL=info UCX_TLS=rc_mlx5,ud_mlx5,sm,self UCX_NET_DEVICES=$E5DEV"
+uh="export LD_LIBRARY_PATH=$HUCX/lib:\$LD_LIBRARY_PATH UCX_MODULE_DIR=$HUCX/lib/ucx PATH=$HUCX/bin:\$PATH"
+# rank 0: version of the ucx_info first in PATH (HPC-X when staged) and the libucp it loads
+uinfo="[ \${SLURM_PROCID:-0} = 0 ] && { echo \"ucx_info: \$(command -v ucx_info)\"; ucx_info -v; }"
+if [ -f $SCR/opt_ucx/hpcx/lib/libucp.so.0 ]; then
+  echo "staged: $(grep -m1 -E 'version' $SCR/opt_ucx/hpcx/VERSION.txt)   check: $(grep -E '^(OK|FAIL)' $SCR/opt_ucx/hpcx/CHECK.txt 2>/dev/null | tr '\n' ' ' || echo 'not run')"
+  UCXLOG=1 EXPECT_API=pmi2 T E6a_hpcxucx "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $e5d; $uh; $uinfo; $pinfo; $HELLO"
+  if grep -q "^MAPS .*/opt_ucx/hpcx/lib/libucp" $TMP/E6a_hpcxucx.8192.raw 2>/dev/null && grep -q "^HELLO_OK" $TMP/E6a_hpcxucx.8192.raw; then
+    echo "E6a: hello_a2a mapped $(grep -m1 '^MAPS .*libucp' $TMP/E6a_hpcxucx.8192.raw | awk '{print $2}') — E6b-f use the HPC-X UCX"
+  else
+    echo "NOTE: E6a did not run with the HPC-X libucp ($(grep -m1 '^MAPS .*libucp' $TMP/E6a_hpcxucx.8192.raw 2>/dev/null | awk '{print $2}')) — E6b-f fall back to the image's UCX"
+    uh="true"
+  fi
+else
+  res "variant=E6a_hpcxucx bytes=- status=SKIP rc=- (no $SCR/opt_ucx/hpcx/lib/libucp.so.0: run stage_hpcx_ucx.sh) ucx_version=-"
+  echo "NOTE: E6b-f use the image's UCX"
+  uh="true"
+fi
+for v in "E6b_hpcxucx_relax|export UCX_IB_PCI_RELAXED_ORDERING=on" \
+         "E6c_a2a2|export I_MPI_ADJUST_ALLTOALL=2" \
+         "E6d_a2a3|export I_MPI_ADJUST_ALLTOALL=3" \
+         "E6e_a2a4|export I_MPI_ADJUST_ALLTOALL=4" \
+         "E6f_mlxtls|export FI_MLX_TLS=rc_mlx5,ud_mlx5,sm,self"; do
+  name=${v%%|*}; pe=${v#*|}
+  UCXLOG=1 EXPECT_API=pmi2 T $name "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $e5d; $uh; $pe; $uinfo; $pinfo; $HELLO"
+done
+fi   # group E6
 
 if want C; then
 # ---------------------------------------------------------------- C) mpirun -bootstrap slurm inside the container
@@ -348,4 +411,25 @@ awk '
         for (k = 1; k <= n; k++) { v=order[k]; if (!ok[v]) continue
           printf "%-22s", v; split("8192 65536 262144", B, " ")
           for (j = 1; j <= 3; j++) printf " %20s", ((v, B[j]) in r) ? r[v, B[j]] : "FAIL"; printf "\n" } }' $RES
+echo "--- off-node bandwidth relative to R_ompi_pmix (PASS: >= 0.8x Open MPI at 8192, 65536 and 262144; 0.8 x 30.8 = ~25 GB/s/node at 262144)"
+awk '
+  { v=""; b=""; s=""; g=""; u="-"
+    for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1]=="variant") v=kv[2]; else if (kv[1]=="bytes") b=kv[2];
+      else if (kv[1]=="status") s=kv[2]; else if (kv[1]=="GBs_node_offnode") g=kv[2]; else if (kv[1]=="ucx_version") u=kv[2] }
+    if (!(v in seen)) { seen[v]=1; order[++n]=v }
+    if (s=="OK" && g != "") { bw[v, b]=g; ok[v]++; uv[v]=u } }
+  END {
+    split("8192 65536 262144", B, " ")
+    if (!(("R_ompi_pmix", "262144") in bw)) { print "  (no complete R_ompi_pmix reference in this job)"; exit }
+    printf "%-22s %-10s %9s %9s %9s %12s  %s\n", "variant", "ucx", "8192", "65536", "262144", "GB/s@256K", "verdict"
+    for (k = 1; k <= n; k++) { v=order[k]; if (!ok[v]) continue
+      line=sprintf("%-22s %-10s", v, uv[v]); pass=1
+      for (j = 1; j <= 3; j++) {
+        ref=bw["R_ompi_pmix", B[j]]
+        if (((v, B[j]) in bw) && ref > 0) { q=bw[v, B[j]] / ref; line=line sprintf(" %9.2f", q); if (q < 0.8) pass=0 }
+        else { line=line sprintf(" %9s", "FAIL"); pass=0 }
+      }
+      g256=((v, "262144") in bw) ? bw[v, "262144"] : 0
+      if (v == "R_ompi_pmix") verdict="reference"; else verdict=(pass ? "PASS" : "below target")
+      printf "%s %12.2f  %s\n", line, g256, verdict } }' $RES
 cleanup_all

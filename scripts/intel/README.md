@@ -263,3 +263,80 @@ sbatch --export=ALL,HELLO_GROUPS="R E5" ~/guohaojie/src/NavierStockes-3D/scripts
 sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 grep -h "transport/device pairs" -A6 ~/guohaojie/logs/hello2_<job>.d/E5*.262144.txt
 ```
+
+### E6 组：换成 HPC-X 的 UCX（1.17.0）
+
+E5d_alldev 能跨节点，但带宽和 Open MPI（R_ompi_pmix）比：
+
+| 消息大小 | Intel / Open MPI |
+|---|---|
+| 8 KB | 0.67 倍 |
+| 64 KB | 1.16 倍 |
+| 256 KB | 0.52 倍（15.9 对 30.8 GB/s/节点） |
+
+两边的 UCX 版本不同：
+
+- v2 镜像：Ubuntu 22.04 自带的 1.12.1；
+- Open MPI：HPC-X 2.19 自带的 1.17.0（`/opt/nvidia/hpc_sdk/Linux_x86_64/24.7/comm_libs/12.5/hpcx/hpcx-2.19/ucx`）。
+
+**1. stage_hpcx_ucx.sh**（在登录节点运行，脚本自己发起两次 srun）
+
+```bash
+bash ~/guohaojie/src/NavierStockes-3D/scripts/intel/stage_hpcx_ucx.sh
+```
+
+- **copy（GCC 容器）**：把 HPC-X 的 `lib/libuc*.so*`、`lib/ucx/` 插件目录和 `bin/ucx_info` 复制到 `/work/opt_ucx/hpcx/`，`ucx_info -v` 的输出写进 `VERSION.txt`。
+  成功时打印 `OK copy (Library version: 1.17.0)`。
+- **check（v2 镜像）**：在 v2 镜像里对每个库查依赖（`LD_TRACE_LOADED_OBJECTS=1 ld.so`，和 ldd 同样的办法）。
+  - 只缺 CUDA、gdrcopy、xpmem、knem、ROCm 等 GPU 或内核模块库的插件，移到 `lib/ucx.unresolved/`，UCX 不再去加载它们；
+  - 核心库、ucx_info 或 IB 插件缺依赖则判 FAIL；
+  - 最后用 HPC-X 的 ucx_info 看 `rc_mlx5` 是否可见。
+
+  成功时应看到：
+  - 若干行 `SET ASIDE libuct_cuda… / libucm_cuda… / libuct_xpmem…`；
+  - `OK all core libraries, ucx_info and the remaining plugins resolve`；
+  - transports 一行里有 `rc_mlx5`、`ud_mlx5`、`dc_mlx5`；
+  - `OK rc_mlx5 visible …`，最后 `OK check`。
+
+  检查结果写进 `/work/opt_ucx/hpcx/CHECK.txt`。如果出现 `FAIL plugin libuct_ib…: libmlx5.so.1: version 'MLX5_1.xx' not found`，说明 HPC-X 的 UCX 需要的 rdma-core 比镜像里 Ubuntu 的 rdma-core 39 新，把这一行发给我。
+
+**2. hello_2node 的 E6 组**
+
+E6 全部以 E5d_alldev 的设置为基础（v2 镜像），每个变体测 3 种大小：
+
+| 变体 | 在 E6a 基础上另加 |
+|---|---|
+| E6a_hpcxucx | —（`LD_LIBRARY_PATH` 最前面放 `/work/opt_ucx/hpcx/lib`，`UCX_MODULE_DIR=/work/opt_ucx/hpcx/lib/ucx`） |
+| E6b_hpcxucx_relax | `UCX_IB_PCI_RELAXED_ORDERING=on` |
+| E6c_a2a2 | `I_MPI_ADJUST_ALLTOALL=2`（Isend/Irecv + waitall） |
+| E6d_a2a3 | `I_MPI_ADJUST_ALLTOALL=3`（pairwise exchange） |
+| E6e_a2a4 | `I_MPI_ADJUST_ALLTOALL=4`（Plum） |
+| E6f_mlxtls | `FI_MLX_TLS=rc_mlx5,ud_mlx5,sm,self` |
+
+- **确认用的是哪个 UCX**：hello_a2a 的 rank 0 在 MPI_Init 之后打印 `MAPS <路径>`，也就是进程实际映射的 libucp/libuct/libfabric/libmpi。源码比二进制新时，hello_2node 会在 Intel 镜像里自动重编 hello_a2a。
+- **退回自带 UCX**：如果 E6a 没用上 HPC-X 的 libucp（没 stage、缺依赖或版本问题），E6b–f 退回镜像自带的 UCX 1.12.1，并打印一行 NOTE。
+- **RESULT 行**：末尾都有 `ucx_version=<ucx_info -v 的版本>`；hello_a2a 打印了 MAPS 时，另有 `ucx_lib=<实际加载的 libucp 所在目录>`。原来的 `pmi_api=` 和 `ucx=` 字段保留。
+- **R_ompi_pmix**：本身不变。另外在它之前打印 Open MPI 用的 UCX：`ucx_info -v`、`mca_pml_ucx.so` 链接的 libucp，以及 `run_env.sh` 设置的 `UCX_*` 变量。
+
+```bash
+sbatch --export=ALL,HELLO_GROUPS="R E5 E6" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+```
+
+**达标标准**
+
+- 256 KB 时 Intel 的每节点跨节点带宽 ≥ 0.8 × Open MPI（Open MPI 是 30.8 GB/s，所以约 ≥ 25 GB/s/节点）；
+- 8 KB 和 64 KB 都 ≥ 0.8 × Open MPI。
+
+summary 最后一张表 `off-node bandwidth relative to R_ompi_pmix` 列出每个变体在三种大小下相对 Open MPI 的倍数、256 KB 时的 GB/s、ucx 版本，以及 `PASS` 或 `below target`。
+
+本机测过的部分：
+
+- copy 步骤在本机 NVHPC 24.7 Docker 镜像里跑通，HPC-X 的 UCX 是 1.17.0；
+- check 步骤在没有 CUDA 和 IB 的 Debian 镜像里跑通：5 个 GPU/xpmem 插件被放到一边，IB 插件因为缺 libibverbs 被判 FAIL；
+- E6 用假 srun 跑通：rank 0 的 MAPS 显示加载的是 `opt_ucx/hpcx/lib/libucp.so.0.0.0`，所以 E6b–f 都用了 HPC-X，`ucx_version=1.17.0`；
+- 判定表用虚构的数据测过。
+
+没测：v2 镜像里的真实依赖情况（rdma-core 39 对 HPC-X UCX 是否够新）、InfiniBand 和带宽。
+
+另外修了一个 bug：B2 的依赖检查原来用 `ld.so --list`，它遇到第一个缺的库就报 "cannot open shared object file" 并退出，不会逐个打印 "not found"，所以以前报的 "all dependencies resolve" 并不可靠。现在改成 `LD_TRACE_LOADED_OBJECTS=1 ld.so`，和 ldd 的做法一样。
