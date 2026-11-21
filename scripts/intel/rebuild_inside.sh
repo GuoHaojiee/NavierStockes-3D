@@ -7,7 +7,16 @@ export DEBIAN_FRONTEND=noninteractive
 . /etc/os-release; echo "image: $PRETTY_NAME ($VERSION_CODENAME), $(uname -m)"
 PKGS=${RC_PKGS:-"rdma-core libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 libucx0 ucx-utils libpmi2-0 libpmix2"}
 
-apt-get update -qq || { echo "FAIL apt-get update (no network on this node? proxy?)"; exit 1; }
+# The oneAPI base image ships third-party apt sources (e.g. repositories.intel.com/gpu) that answer 403 here.
+# None of our packages come from them: disable every source that is not an Ubuntu archive, and keep a note in the image.
+mkdir -p /etc/apt/sources.list.d.disabled
+for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    if grep -qvE '^\s*(#|$)|ubuntu\.com|ubuntu\.org' "$f" && ! grep -qE 'archive\.ubuntu|security\.ubuntu|ports\.ubuntu' "$f"; then
+        echo "disable apt source $f: $(grep -hoE 'https?://[^ ]+' "$f" | sort -u | tr '\n' ' ')"; mv "$f" /etc/apt/sources.list.d.disabled/
+    fi
+done
+apt-get update -qq || { echo "FAIL apt-get update (no network on this node? proxy?)"; grep -hE '^deb |^URIs' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; exit 1; }
 have=""; skipped=""
 for p in $PKGS; do
     v=$(apt-cache policy $p 2>/dev/null | awk '/Candidate:/ {print $2}')
