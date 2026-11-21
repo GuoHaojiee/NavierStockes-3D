@@ -13,12 +13,20 @@
 # sizes 8192, 65536, 262144 bytes per rank pair. Every srun ends with
 #     RESULT variant=<name> bytes=<size> status=OK|FAIL|SKIP rc=<exit code> a2a_us=... GBs_node_offnode=...
 # If the smallest size fails, the larger ones of that variant are skipped. A hung srun is killed after 200 s.
+# Files in logs/hello2_<job>.d/: <variant>.<bytes>.raw = full output of every srun; for a FAILED srun also
+# <variant>.<bytes>.txt = the "MPI startup"/PMI lines (I_MPI_DEBUG=5) and the last 20 error lines.
 #   0  discovery: PMI libraries on the host and inside the container, srun inside the container?
 #   R  reference: Open MPI (GCC container, srun --mpi=pmix) — the fallback if all Intel variants fail
-#   A  srun --mpi=pmi2 + I_MPI_PMI_LIBRARY=<each libpmi2.so found in the container>, and Intel MPI's built-in client
+#   A  srun --mpi=pmi2 (the host has no libpmi2.so):
+#        A_cont<i>_pmi2   I_MPI_PMI_LIBRARY=<each libpmi2.so found in the container>
+#        A1_pmi2          Intel MPI's own PMI-2 client (I_MPI_PMI=pmi2 I_MPI_PMI2=yes, no I_MPI_PMI_LIBRARY), shm:ofi
+#        A1_pmi2_ppn2     the same with 2 ranks per node (does the shm failure depend on the rank count?)
+#        A1_ofi_only      the same, I_MPI_FABRICS=ofi (no shared memory), FI_PROVIDER=mlx
 #   B1 srun --mpi=pmix + I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=<each libpmix.so found in the container>
-#   B2 srun --mpi=pmix + the HOST's libpmix.so.2.5.2 (the one Slurm's pmix plugin uses), mounted at /hostpmix
-#      together with its dependencies that the container does not have; FI_PROVIDER = mlx, then verbs
+#   B2 srun --mpi=pmix + the HOST's PMIx 3.2.3 (Slurm plugin pmix_v3): /opt/pmix-3.2.3 mounted at the same path
+#      (its MCA components are found at the compiled-in prefix); dependencies the container does not have are
+#      copied from the host to logs/hello2_<job>.d/hostpmix, mounted at /hostpmix; FI_PROVIDER = mlx, then verbs.
+#      (NOT /usr/mpi/gcc/openmpi-*/lib/libpmix.so: that one belongs to the host's Open MPI.)
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
@@ -41,7 +49,7 @@ FIRST_OK=""                                            # "<srun options>|<inner 
 T() {
     local v=$1 so=$2 cmd=$3 si sz it c rc st l f
     for si in $SIZES; do
-        sz=${si%:*}; it=${si#*:}; c=${cmd//@A@/$sz $it}; f=$TMP/$v.$sz.txt
+        sz=${si%:*}; it=${si#*:}; c=${cmd//@A@/$sz $it}; f=$TMP/$v.$sz.raw
         echo ">>> [$(date +%H:%M:%S)] $v bytes=$sz | srun $so ... | $c"
         timeout 200 srun $so --time=3 --kill-on-bad-exit=1 bash -c "$c" > $f 2>&1; rc=$?
         if [ $sz = 8192 ]; then   # launcher/fabric details once per variant
@@ -49,7 +57,17 @@ T() {
         else
             grep -E "HELLO_|rror|abort" $f | head -5
         fi
-        if grep -q "^HELLO_OK" $f && [ $rc = 0 ]; then st=OK; else st=FAIL; tail -5 $f; fi
+        if grep -q "^HELLO_OK" $f && [ $rc = 0 ]; then st=OK; else
+            st=FAIL; tail -5 $f
+            { echo "# $v bytes=$sz rc=$rc   srun $so ... | $c"
+              echo "# ---- MPI startup / PMI lines"
+              grep -E "MPI startup|PMI|pmi" $f | sort | uniq -c | sort -rn | head -60
+              echo "# ---- last 20 error lines"
+              grep -iE "error|fail|abort|unable|cannot|denied|not found|killed|signal" $f | tail -20
+              echo "# ---- last 20 lines"
+              tail -20 $f; } > $TMP/$v.$sz.txt
+            echo "    failure details: $TMP/$v.$sz.txt"
+        fi
         l=$(grep "^HELLO_OK" $f | tail -1)
         res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*')"; echo
         [ $st = OK ] || { [ "$si" != "${SIZES##* }" ] && echo "    (larger sizes of $v skipped)"; return 1; }
@@ -84,11 +102,18 @@ echo "=============== A) srun --mpi=pmi2"
 i=0
 for lib in $PMI2; do
   i=$((i+1)); e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$lib; unset I_MPI_HYDRA_BOOTSTRAP"
-  T A${i}_pmi2 "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+  T A_cont${i}_pmi2 "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
 done
-# without I_MPI_PMI_LIBRARY (Intel MPI's built-in PMI-2 client, if it has one)
-e="export I_MPI_PMI=pmi2; unset I_MPI_PMI_LIBRARY I_MPI_HYDRA_BOOTSTRAP"
-T A0_pmi2_builtin "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+# Intel MPI's own PMI-2 client: no I_MPI_PMI_LIBRARY. The last run (A0, I_MPI_PMI=pmi2 only) printed "PMI API: pmi"
+# and failed in MPIDU_Init_shm_init; I_MPI_PMI2=yes is the older switch for the same thing, set as well.
+# Check the "PMI API:" line in the log: it must say pmi2.
+e="export I_MPI_PMI=pmi2 I_MPI_PMI2=yes; unset I_MPI_PMI_LIBRARY I_MPI_HYDRA_BOOTSTRAP"
+T A1_pmi2 "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+# 2 ranks per node (not used as the launcher for F: F runs 128 per node)
+T A1_pmi2_ppn2 "--mpi=pmi2 -N 2 --ntasks-per-node=2 -c 1 --cpu-bind=cores $MI" "$IE; $e; export $IFAB; $HELLO"
+# no shared memory: OFI (mlx) also inside a node
+eo="$e; export I_MPI_FABRICS=ofi FI_PROVIDER=mlx"
+T A1_ofi_only "--mpi=pmi2 $SR2 $MI" "$IE; export $IFAB; $eo; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$eo"}
 
 # ---------------------------------------------------------------- B1) srun --mpi=pmix, libpmix of the container
 echo "=============== B1) srun --mpi=pmix, libpmix from the container"
@@ -100,49 +125,43 @@ done
 [ -z "$PMIX" ] && res "variant=B1_pmix_cont bytes=- status=SKIP rc=- (no libpmix.so inside the container)"
 
 # ---------------------------------------------------------------- B2) srun --mpi=pmix, libpmix of the HOST
-echo "=============== B2) srun --mpi=pmix, host libpmix mounted at /hostpmix"
-HPMIX=${HOST_PMIX:-/usr/lib/x86_64-linux-gnu/libpmix.so.2.5.2}
+echo "=============== B2) srun --mpi=pmix, host PMIx mounted at its own path"
+HPMIX=${HOST_PMIX:-/opt/pmix-3.2.3/lib/libpmix.so.2.2.33}
+HPROOT=$(dirname $(dirname $HPMIX))                    # /opt/pmix-3.2.3
 STG=$TMP/hostpmix
 if [ -f "$HPMIX" ]; then
   rm -rf $STG; mkdir -p $STG
-  cp -L $HPMIX $STG/; hp=$(basename $HPMIX)
-  so=$(objdump -p $HPMIX 2>/dev/null | awk '/SONAME/ {print $2}'); so=${so:-libpmix.so.2}
-  [ "$so" != "$hp" ] && ln -s $hp $STG/$so
-  echo "host $HPMIX -> $(readlink -f $HPMIX), SONAME $so"
-  # PMIx MCA components (dlopen'ed from the install prefix compiled into the library, which the container does not have)
-  HPENV=""
-  for d in $(dirname $(readlink -f $HPMIX))/pmix /usr/lib/x86_64-linux-gnu/pmix2/lib/pmix /usr/lib/x86_64-linux-gnu/pmix/lib/pmix; do
-    if ls $d/*.so >/dev/null 2>&1; then
-      mkdir -p $STG/mca; cp -L $d/*.so $STG/mca/; HPENV="PMIX_MCA_mca_base_component_path=/hostpmix/mca"
-      echo "PMIx components from $d: $(ls $STG/mca | wc -l) files"; break
-    fi
-  done
-  [ -z "$HPENV" ] && echo "no PMIx component directory found on the host (components built into libpmix?)"
-  # the existing --container-mounts of $MI plus the staging directory
-  if [[ "$MI" == *--container-mounts=* ]]; then MIH=$(echo "$MI" | sed "s|--container-mounts=\([^ ]*\)|--container-mounts=\1,$STG:/hostpmix:ro|")
-  else MIH="$MI --container-mounts=$STG:/hostpmix:ro"; fi
+  echo "host $HPMIX, prefix $HPROOT: $(ls $HPROOT/lib | tr '\n' ' ')"
+  echo "MCA components: $(ls $HPROOT/lib/pmix 2>/dev/null | wc -l) files in $HPROOT/lib/pmix"
+  # the existing --container-mounts of $MI, plus the PMIx prefix (same path) and the staging directory
+  ADD="$HPROOT:$HPROOT:ro,$STG:/hostpmix:ro"
+  if [[ "$MI" == *--container-mounts=* ]]; then MIH=$(echo "$MI" | sed "s|--container-mounts=\([^ ]*\)|--container-mounts=\1,$ADD|")
+  else MIH="$MI --container-mounts=$ADD"; fi
   echo "MIH = $MIH"
-  # dependencies the container cannot resolve -> copied from the host; repeated for the dependencies of those
-  cat > $TMP/chk_pmix.sh <<'EOF'
+  # dependencies (libevent, libhwloc, ...) the container cannot resolve -> copied from the host to /hostpmix;
+  # repeated for the dependencies of the copied libraries
+  cat > $TMP/chk_pmix.sh <<EOF
 source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1
-export LD_LIBRARY_PATH=/hostpmix:$LD_LIBRARY_PATH
-LDSO=/lib64/ld-linux-x86-64.so.2
-for f in /hostpmix/*.so* /hostpmix/mca/*.so; do
-  [ -f "$f" ] || continue
-  $LDSO --list "$f" 2>&1 | grep "not found" | awk '{print $1}'
+export LD_LIBRARY_PATH=/hostpmix:$HPROOT/lib:\$LD_LIBRARY_PATH
+for f in $HPMIX $HPROOT/lib/pmix/*.so /hostpmix/*.so*; do
+  [ -f "\$f" ] || continue
+  /lib64/ld-linux-x86-64.so.2 --list "\$f" 2>&1 | grep "=> not found" | awk '{print \$1}'
 done | sort -u
 EOF
+  # where the host itself finds a library: ldconfig cache, else what ldd of the host PMIx libraries says
+  hostlib() { ldconfig -p | awk -v s=$1 '$1 == s && /x86-64/ {print $NF; exit}' | grep . ||
+              ldd $HPMIX $HPROOT/lib/pmix/*.so 2>/dev/null | awk -v s=$1 '$1 == s && $3 ~ /^\// {print $3; exit}'; }
   for pass in 1 2 3 4; do
     miss=$(srun -N1 -n1 --time=3 $MIH bash $WTMP/chk_pmix.sh 2>/dev/null)
     [ -z "$miss" ] && { echo "pass $pass: all dependencies resolve inside the container"; break; }
     echo "pass $pass: missing in the container: $(echo $miss)"
     for s in $miss; do
-      p=$(ldconfig -p | awk -v s=$s '$1 == s && /x86-64/ {print $NF; exit}')
+      p=$(hostlib $s)
       if [ -n "$p" ]; then cp -L $p $STG/$s && echo "  + $s  <- $p"; else echo "  ! $s not on the host either"; fi
     done
   done
   echo "staged in /hostpmix: $(ls $STG | tr '\n' ' ')"
-  e="export I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=/hostpmix/$hp LD_LIBRARY_PATH=/hostpmix:\$LD_LIBRARY_PATH $HPENV; unset I_MPI_HYDRA_BOOTSTRAP"
+  e="export I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=$HPROOT/lib/libpmix.so.2 LD_LIBRARY_PATH=/hostpmix:$HPROOT/lib:\$LD_LIBRARY_PATH; unset I_MPI_HYDRA_BOOTSTRAP"
   for prov in mlx verbs; do
     T B2_pmix_host_$prov "--mpi=pmix $SR2 $MIH" "$IE; $e; export $IFAB FI_PROVIDER=$prov; $HELLO" \
       && FIRST_OK=${FIRST_OK:-"--mpi=pmix $SR2 $MIH|$e"}
@@ -167,7 +186,7 @@ for prov in auto mlx verbs tcp; do
   elif [ "$FIRST_OK" = hydra ]; then
     T F_$prov "-N 1 -n 1 -c 1 --overlap $MI" "$IE; $EH; export $IFAB; $fp; $HYD"
   else
-    T F_$prov "${FIRST_OK%%|*}" "$IE; ${FIRST_OK#*|}; export $IFAB; $fp; $HELLO"
+    T F_$prov "${FIRST_OK%%|*}" "$IE; export $IFAB; ${FIRST_OK#*|}; $fp; $HELLO"
   fi
 done
 [ -z "$FIRST_OK" ] && echo "no Intel MPI launcher worked; fallback: multi-node CPU runs with Open MPI (Intel MPI only helps FFTW)"

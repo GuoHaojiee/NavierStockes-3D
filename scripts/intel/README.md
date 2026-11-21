@@ -75,9 +75,12 @@ sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
 ```
 每个消息大小（每对进程 8192、65536、262144 字节）单独一次 srun；最小的失败，这个方式更大的就跳过。
 `RESULT variant=R_ompi_pmix bytes=... status=OK` 是 Open MPI 参照。Intel MPI 的方式：
-`A*`（srun --mpi=pmi2）、`B1_pmix_cont*`（容器里的 libpmix）、`B2_pmix_host_{mlx,verbs}`（宿主机的
-`libpmix.so.2.5.2` 和容器里缺的依赖库拷到 `logs/hello2_<job>.d/hostpmix/`，挂到容器 `/hostpmix`；日志里
-`pass N: missing in the container: ...` 和 `staged in /hostpmix:` 两行说明拷了什么）、`C_hydra_slurm`。
+`A1_pmi2`（srun --mpi=pmi2，Intel MPI 自带的 PMI-2 客户端；日志里 `PMI API:` 应为 pmi2）、`A1_pmi2_ppn2`（每节点 2 个进程）、
+`A1_ofi_only`（`I_MPI_FABRICS=ofi`，不用共享内存）、`B1_pmix_cont*`（容器里的 libpmix）、
+`B2_pmix_host_{mlx,verbs}`（宿主机 PMIx 3.2.3：`/opt/pmix-3.2.3` 原路径挂进容器，容器里缺的依赖拷到
+`logs/hello2_<job>.d/hostpmix/` 挂到 `/hostpmix`；日志里 `pass N: missing in the container: ...` 和 `staged in /hostpmix:`
+说明拷了什么）、`C_hydra_slurm`。失败的每次 srun 在 `logs/hello2_<job>.d/<variant>.<bytes>.txt` 里留下
+MPI startup/PMI 行和最后 20 行错误（完整输出在 `.raw`）。
 任何一个三种大小都 `status=OK`，就说明 Intel MPI 能跨节点；`F_*` 用第一个成功的方式扫 FI_PROVIDER。
 summary 最后的表：每个成功的方式、每个大小的 alltoall 时间（µs）/ 每节点跨节点带宽（GB/s），和 `R_ompi_pmix` 那行比。
 日志里 `MPI startup(): libfabric provider: ...` 说明实际用了哪个 provider。
