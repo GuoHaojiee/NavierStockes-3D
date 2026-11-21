@@ -16,6 +16,8 @@
 | `fb5_nodes.sbatch` | 8、16 节点上模型的预测是否成立 | 8 或 16 节点（拿到配额时再跑） |
 | `fb6_fftw_lit.sbatch` | 为什么 heFFTe 作者测出 heFFTe ≥ FFTW，而我们测出 FFTW 更快：按作者基准代码的方式调用 FFTW（自然顺序输出 = 两次转置，ESTIMATE） | 1 节点，约 20 分钟，需要先重新运行 `build_fb.sh` |
 
+`fftbench_backend.cpp`（2026‑11‑21）：单进程、无通信的本地后端比较（heFFTe-FFTW / heFFTe-MKL / 原生 FFTW / 原生 MKL），在 Intel 容器里编译和运行，见 `scripts/intel/README.md` 第 6 步。
+
 `fb_fftw` 新增环境变量 `FB_TRANSPOSED=0`：不用转置输出，每次变换两次全局转置。只作诊断，不是推荐配置。
 
 ## 使用

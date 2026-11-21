@@ -18,7 +18,14 @@
  *   - 所有频谱量均为 DFT（非归一化）表示，即 V_c = N * FFT_norm(V_phys)
  *   - heFFTe backward(scale::full) 自动处理归一化，无需手动除以 N
  *
- * 编译：参见 Makefile_heffte
+ * 本地 FFT 后端（编译时选择，启动时打印）：
+ *   -DNS_HEFFTE_BACKEND=fftw（默认）→ heffte::backend::fftw，链接 libfftw3_omp
+ *   -DNS_HEFFTE_BACKEND=mkl         → heffte::backend::mkl，heFFTe 需以 -DHeffte_ENABLE_MKL=ON 构建，
+ *                                      链接与 libheffte 相同的 MKL 库（mkl_intel_ilp64 + mkl_intel_thread）
+ *   两个后端的 use_reorder 默认值不同（heFFTe 2.4.1：fftw 为 1，mkl 为 0），启动时打印；
+ *   需要逐项对齐时用 NS_HEFFTE_REORDER 覆盖。
+ *
+ * 编译：参见 Makefile_heffte、scripts/intel/build_intel_solvers.sh
  */
 
 #include <algorithm>
@@ -33,8 +40,31 @@
 #include <mpi.h>
 #include <omp.h>
 #include <heffte.h>
-#include <fftw3.h>
 #include "common_mode.h"
+
+// ---- 本地 FFT 后端：NS_HEFFTE_BACKEND = fftw | mkl（编译时） ----
+#define NS_HB_fftw 1
+#define NS_HB_mkl  2
+#define NS_HB_CAT2(a, b) a##b
+#define NS_HB_CAT(a, b) NS_HB_CAT2(a, b)
+#define NS_HB_STR2(a) #a
+#define NS_HB_STR(a) NS_HB_STR2(a)
+#ifndef NS_HEFFTE_BACKEND
+#define NS_HEFFTE_BACKEND fftw
+#endif
+#if NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_fftw
+#include <fftw3.h>
+using FftBackend = heffte::backend::fftw;
+#elif NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_mkl
+#ifndef Heffte_ENABLE_MKL
+#error "NS_HEFFTE_BACKEND=mkl: this heFFTe was built without -DHeffte_ENABLE_MKL=ON"
+#endif
+#include <mkl_service.h>
+using FftBackend = heffte::backend::mkl;
+#else
+#error "NS_HEFFTE_BACKEND must be fftw or mkl"
+#endif
+static const char* const kBackendName = NS_HB_STR(NS_HEFFTE_BACKEND);
 
 using namespace std;
 
@@ -270,7 +300,7 @@ void compute_rot_and_viscous(Fields& F, int nx, int ny, const heffte::box3d<>& b
 }
 
 // RK4 的一个阶段：在当前阶段值 V 处计算 RHS，并把 V 推进到下一阶段值（阶段 4 之后为 V^{n+1}）。
-void rk4_stage(heffte::fft3d_r2c<heffte::backend::fftw>& fft, Fields& F,
+void rk4_stage(heffte::fft3d_r2c<FftBackend>& fft, Fields& F,
                int nx, int ny, const heffte::box3d<>& inbox_r, const heffte::box3d<>& outbox_c,
                double dt, double t, double dx, double dy, double dz, int stage) {
     // 1. 旋度 + 粘性项（谱空间）
@@ -371,7 +401,7 @@ void rk4_stage(heffte::fft3d_r2c<heffte::backend::fftw>& fft, Fields& F,
     g_timer.mark(PH_SPEC);
 }
 
-void rk4_step(heffte::fft3d_r2c<heffte::backend::fftw>& fft, Fields& F,
+void rk4_step(heffte::fft3d_r2c<FftBackend>& fft, Fields& F,
               int nx, int ny, const heffte::box3d<>& inbox_r, const heffte::box3d<>& outbox_c,
               double dt, double t, double dx, double dy, double dz) {
     // 保存 V^n
@@ -418,10 +448,15 @@ int main(int argc, char** argv) {
     int nt_run = atoi(argv[5]);
     int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
+#if NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_fftw
     // heFFTe 的 FFTW 后端在首次执行时才创建 FFTW 计划，并沿用全局的线程设置；
     // 不调用这两行，每个进程内的 FFT 只用 1 个线程。需链接 libfftw3_omp（原因见 FFTW 版）。
     fftw_init_threads();
     fftw_plan_with_nthreads(nthreads);
+#else
+    // MKL DFTI 的线程数：mkl_intel_thread 默认取 OMP_NUM_THREADS，这里显式设成与 FFTW 后端相同
+    mkl_set_num_threads(nthreads);
+#endif
     int max_threads = nthreads;
 
     // slab 在实空间切 x、在谱空间切 y
@@ -449,6 +484,7 @@ int main(int argc, char** argv) {
         cout << "Domain: [0, 2π]^3\n";
         cout << "MPI processes: " << nprocs << "\n";
         cout << "OpenMP threads/process: " << max_threads << "\n";
+        cout << "heFFTe backend: " << kBackendName << " (NS_HEFFTE_BACKEND, compile time)\n";
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
@@ -484,7 +520,7 @@ int main(int argc, char** argv) {
     // Library defaults for the fftw backend (alltoallv, use_reorder = true), unless
     // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER. use_pencils follows the decomposition
     // (brick keeps the library default).
-    auto options = heffte::default_options<heffte::backend::fftw>();
+    auto options = heffte::default_options<FftBackend>();
     nsmode::heffte_options_from_env(options, rank);
     if (decomp == nsmode::DECOMP_SLAB)   options.use_pencils = false;
     if (decomp == nsmode::DECOMP_PENCIL) options.use_pencils = true;
@@ -494,7 +530,7 @@ int main(int argc, char** argv) {
     int n_reshape = 0;
     {
         auto lplan = heffte::plan_operations(heffte::mpi::gather_boxes(inbox_r, outbox_c, MPI_COMM_WORLD), 2,
-                                             heffte::set_options<heffte::backend::fftw, true>(options), rank);
+                                             heffte::set_options<FftBackend, true>(options), rank);
         for (int i = 0; i < 4; ++i) if (!heffte::match(lplan.in_shape[i], lplan.out_shape[i])) ++n_reshape;
     }
     if (rank == 0) {
@@ -505,7 +541,7 @@ int main(int argc, char** argv) {
         nsmode::print_decomp(decomp, grid);
     }
 
-    heffte::fft3d_r2c<heffte::backend::fftw> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
+    heffte::fft3d_r2c<FftBackend> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
 
     size_t nr = inbox_r.count();
     size_t nc = outbox_c.count();
