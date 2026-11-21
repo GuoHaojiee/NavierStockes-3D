@@ -1,6 +1,11 @@
 # intel_env.sh — sourced INSIDE the Intel container (ns3d_intel.sqsh) by every scripts/intel/* script.
 # Paths can be overridden from the environment (that is also how the scripts were tested off-cluster).
-INTEL_ENV_FILE=${INTEL_ENV_FILE:-/etc/profile.d/ns3d_env.sh}       # container environment file (check_env.sh shows candidates)
+# container environment file (check_env.sh shows candidates); default: the first that exists.
+# build/build_intel.sh writes /etc/profile.d/ns3d_intel.sh.
+if [ -z "$INTEL_ENV_FILE" ]; then
+    for f in /etc/profile.d/ns3d_env.sh /etc/profile.d/ns3d_intel.sh; do [ -f $f ] && { INTEL_ENV_FILE=$f; break; }; done
+    INTEL_ENV_FILE=${INTEL_ENV_FILE:-/etc/profile.d/ns3d_env.sh}
+fi
 if [ -f "$INTEL_ENV_FILE" ]; then source "$INTEL_ENV_FILE"; else echo "WARNING: environment file $INTEL_ENV_FILE not found (set INTEL_ENV_FILE=...)"; fi
 export I_MPI_CC=${I_MPI_CC:-icx} I_MPI_CXX=${I_MPI_CXX:-icpx} I_MPI_F90=${I_MPI_F90:-ifx} I_MPI_FC=${I_MPI_FC:-ifx} I_MPI_F77=${I_MPI_F77:-ifx}
 SRC=${NS_SRC:-/work/src/NavierStockes-3D}

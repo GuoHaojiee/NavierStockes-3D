@@ -27,13 +27,26 @@
 #      (its MCA components are found at the compiled-in prefix); dependencies the container does not have are
 #      copied from the host to logs/hello2_<job>.d/hostpmix, mounted at /hostpmix; FI_PROVIDER = mlx, then verbs.
 #      (NOT /usr/mpi/gcc/openmpi-*/lib/libpmix.so: that one belongs to the host's Open MPI.)
+#   D  the PMI client libraries installed in the image by rebuild_container.sh (paths from /opt/ns3d_pmi_libs.txt):
+#        D1_pmi2lib_<prov>       srun --mpi=pmi2, I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=<libpmi2.so.0 of the image (Slurm client)>
+#        D2_pmixlib_<prov>       srun --mpi=pmix, I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=<libpmix.so.2 of the image>
+#        D3_pmi2lib_ppn2_<prov>  as D1 with 2 ranks per node
+#      I_MPI_FABRICS=shm:ofi, <prov> = FI_PROVIDER mlx, then verbs. Skipped when the image has no such library.
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
+# Every Intel variant also reports the PMI API Intel MPI really used ("MPI startup(): PMI API: ..." with I_MPI_DEBUG=5):
+#   RESULT ... pmi_api=<pmi|pmi2|pmix>; PMI_API_MISMATCH(expected=...) when it is not the one the variant asked for.
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
+# Argument: the Intel image (default: the one in $MI, i.e. ns3d_intel.sqsh); "v2" = containers/ns3d_intel_v2.sqsh.
+# HELLO_GROUPS selects the groups (default "R A B D C F"), e.g. only the new variants on the new image:
+#   sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch
 #   sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+[ -n "$1" ] && export INTEL_IMAGE=$1                   # image choice, see intel_common.sh
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
+GROUPS_=${HELLO_GROUPS:-"R A B D C F"}
+want() { [[ " $GROUPS_ " == *" $1 "* ]]; }
 IE="source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1"
 HB=/work/build/bin_intel/hello_a2a
 TMP=$SCR/logs/hello2_$SLURM_JOB_ID.d; mkdir -p $TMP     # = /work/logs/hello2_$SLURM_JOB_ID.d in the containers
@@ -69,7 +82,16 @@ T() {
             echo "    failure details: $TMP/$v.$sz.txt"
         fi
         l=$(grep "^HELLO_OK" $f | tail -1)
-        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*')"; echo
+        # PMI API actually used by Intel MPI (I_MPI_DEBUG >= 2 prints it); EXPECT_API = what the variant asked for
+        local api pa=""
+        api=$(grep -m1 -o "PMI API: *[A-Za-z0-9_]*" $f | awk '{print $NF}')
+        if [ -n "$EXPECT_API" ] || [ -n "$api" ]; then
+            pa="pmi_api=${api:-none}"
+            if [ -n "$EXPECT_API" ] && [ "$api" != "$EXPECT_API" ]; then
+                pa="$pa PMI_API_MISMATCH(expected=$EXPECT_API)"; echo "    WARNING: Intel MPI used PMI API '${api:-none}', not $EXPECT_API"
+            fi
+        fi
+        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa"; echo
         [ $st = OK ] || { [ "$si" != "${SIZES##* }" ] && echo "    (larger sizes of $v skipped)"; return 1; }
     done
     return 0
@@ -83,22 +105,32 @@ echo "=============== 0) discovery"
 echo "--- host $(hostname) ($(. /etc/os-release; echo $PRETTY_NAME)): srun $(srun --version 2>/dev/null); srun --mpi=list:"; srun --mpi=list 2>&1 | tr '\n' ' '; echo
 echo "--- PMI client libraries on the host:"
 find /usr/lib64 /usr/lib /usr/local/lib /opt/slurm* /usr/local/slurm* -maxdepth 4 \( -name 'libpmi2.so*' -o -name 'libpmix.so*' -o -name 'libpmi.so*' \) 2>/dev/null | sort -u
-echo "--- inside the Intel container:"
-srun -N1 -n1 --time=3 $MI bash -c "$IE; . /etc/os-release; echo \"\$PRETTY_NAME  I_MPI_ROOT=\$I_MPI_ROOT\"; ls -l $HB; command -v srun && srun --version || echo 'no srun inside the container'; \
+echo "--- inside the Intel container (${INTEL_IMAGE:-image of \$MI}):"
+srun -N1 -n1 --time=3 $MI bash -c "$IE; cat /opt/ns3d_pmi_libs.txt > $WTMP/manifest.txt 2>/dev/null; . /etc/os-release; echo \"\$PRETTY_NAME  I_MPI_ROOT=\$I_MPI_ROOT\"; ls -l $HB; command -v srun && srun --version || echo 'no srun inside the container'; \
     find / \( -path /proc -o -path /sys -o -path /dev -o -path /work -o -path /scratch \) -prune -o \( -name 'libpmi2.so*' -o -name 'libpmix.so*' -o -name 'libpmi.so*' \) -print 2>/dev/null | sort -u > $WTMP/pmilibs.txt; cat $WTMP/pmilibs.txt; \
     fi_info -l 2>/dev/null | grep -E '^[a-z]' | tr '\n' ' '; echo"
 [ -x $SCR/build/bin_intel/hello_a2a ] || { echo "ERROR: $SCR/build/bin_intel/hello_a2a missing — run build_intel_solvers.sh first"; }
 PMI2=$(grep -E 'libpmi2\.so' $TMP/pmilibs.txt 2>/dev/null | head -3)
 PMIX=$(grep -E 'libpmix\.so' $TMP/pmilibs.txt 2>/dev/null | head -3)
 echo "candidates pmi2: ${PMI2:-none}   pmix: ${PMIX:-none}"
+# libraries installed by rebuild_container.sh (manifest), else the usual Ubuntu paths if the search found them
+D_PMI2=$(sed -n 's/^PMI2_LIB=//p' $TMP/manifest.txt 2>/dev/null); D_PMIX=$(sed -n 's/^PMIX_LIB=//p' $TMP/manifest.txt 2>/dev/null)
+[ -z "$D_PMI2" ] && D_PMI2=$(grep -E '/libpmi2\.so\.0$' $TMP/pmilibs.txt 2>/dev/null | head -1)
+[ -z "$D_PMIX" ] && D_PMIX=$(grep -E '/libpmix\.so\.2$' $TMP/pmilibs.txt 2>/dev/null | head -1)
+echo "image manifest /opt/ns3d_pmi_libs.txt: $(tr '\n' ' ' < $TMP/manifest.txt 2>/dev/null || echo none)"
+echo "D variants: pmi2 lib ${D_PMI2:-none}   pmix lib ${D_PMIX:-none}"
 
+if want R; then
 # ---------------------------------------------------------------- R) Open MPI reference (GCC container)
 echo "=============== R) Open MPI reference, GCC container"
 srun -N1 -n1 --time=3 $M bash -c "source /etc/profile.d/ns3d_env.sh; mpicc -O2 /work/src/NavierStockes-3D/scripts/intel/hello_a2a.c -o /work/build/bin_gcc/hello_a2a_ompi" \
   && T R_ompi_pmix "--mpi=pmix $SR2 $M" "export NS_MODE=cpu; source /work/build/run_env.sh; /work/build/bin_gcc/hello_a2a_ompi @A@"
+fi   # group R
 
+if want A; then
 # ---------------------------------------------------------------- A) srun --mpi=pmi2
 echo "=============== A) srun --mpi=pmi2"
+EXPECT_API=pmi2
 i=0
 for lib in $PMI2; do
   i=$((i+1)); e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$lib; unset I_MPI_HYDRA_BOOTSTRAP"
@@ -114,9 +146,12 @@ T A1_pmi2_ppn2 "--mpi=pmi2 -N 2 --ntasks-per-node=2 -c 1 --cpu-bind=cores $MI" "
 # no shared memory: OFI (mlx) also inside a node
 eo="$e; export I_MPI_FABRICS=ofi FI_PROVIDER=mlx"
 T A1_ofi_only "--mpi=pmi2 $SR2 $MI" "$IE; export $IFAB; $eo; $HELLO" && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$eo"}
+fi   # group A
 
+if want B; then
 # ---------------------------------------------------------------- B1) srun --mpi=pmix, libpmix of the container
 echo "=============== B1) srun --mpi=pmix, libpmix from the container"
+EXPECT_API=pmix
 i=0
 for lib in $PMIX; do
   i=$((i+1)); e="export I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=$lib; unset I_MPI_HYDRA_BOOTSTRAP"
@@ -169,16 +204,51 @@ EOF
 else
   res "variant=B2_pmix_host bytes=- status=SKIP rc=- (no $HPMIX on the host; set HOST_PMIX=...)"
 fi
+fi   # group B
 
+if want D; then
+# ---------------------------------------------------------------- D) PMI libraries of the (rebuilt) image
+echo "=============== D) PMI client libraries of the image (rebuild_container.sh)"
+if [ -n "$D_PMI2" ]; then
+  e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$D_PMI2; unset I_MPI_HYDRA_BOOTSTRAP"
+  for prov in mlx verbs; do
+    EXPECT_API=pmi2 T D1_pmi2lib_$prov "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB FI_PROVIDER=$prov; $HELLO" \
+      && FIRST_OK=${FIRST_OK:-"--mpi=pmi2 $SR2 $MI|$e"}
+  done
+else
+  res "variant=D1_pmi2lib bytes=- status=SKIP rc=- (no libpmi2.so.0 in the image: use the image of rebuild_container.sh)"
+fi
+if [ -n "$D_PMIX" ]; then
+  e="export I_MPI_PMI=pmix I_MPI_PMI_LIBRARY=$D_PMIX; unset I_MPI_HYDRA_BOOTSTRAP"
+  for prov in mlx verbs; do
+    EXPECT_API=pmix T D2_pmixlib_$prov "--mpi=pmix $SR2 $MI" "$IE; $e; export $IFAB FI_PROVIDER=$prov; $HELLO" \
+      && FIRST_OK=${FIRST_OK:-"--mpi=pmix $SR2 $MI|$e"}
+  done
+else
+  res "variant=D2_pmixlib bytes=- status=SKIP rc=- (no libpmix.so.2 in the image: use the image of rebuild_container.sh)"
+fi
+if [ -n "$D_PMI2" ]; then   # 2 ranks per node: not used as the launcher for F (F runs 128 per node)
+  e="export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=$D_PMI2; unset I_MPI_HYDRA_BOOTSTRAP"
+  for prov in mlx verbs; do
+    EXPECT_API=pmi2 T D3_pmi2lib_ppn2_$prov "--mpi=pmi2 -N 2 --ntasks-per-node=2 -c 1 --cpu-bind=cores $MI" "$IE; $e; export $IFAB FI_PROVIDER=$prov; $HELLO"
+  done
+fi
+fi   # group D
+
+if want C; then
 # ---------------------------------------------------------------- C) mpirun -bootstrap slurm inside the container
 echo "=============== C) mpirun -bootstrap slurm (one launcher task, proxies via srun inside the container)"
+EXPECT_API=""
 EH="export I_MPI_HYDRA_BOOTSTRAP=slurm I_MPI_HYDRA_BOOTSTRAP_EXEC_EXTRA_ARGS='--overlap $MI'"
 HYD="mpirun -np 256 -ppn 128 $HB @A@"
 T C_hydra_slurm "-N 1 -n 1 -c 1 --overlap $MI" "$IE; command -v srun >/dev/null || { echo 'no srun inside the container'; exit 3; }; \
     $EH; export $IFAB; $HYD" && FIRST_OK=${FIRST_OK:-"hydra"}
+fi   # group C
 
+if want F; then
 # ---------------------------------------------------------------- F) fabrics, first working launcher
 echo "=============== F) fabrics (launcher: ${FIRST_OK%%|*})"
+case "$FIRST_OK" in *I_MPI_PMI=pmix*) EXPECT_API=pmix;; *I_MPI_PMI=pmi2*) EXPECT_API=pmi2;; *) EXPECT_API="";; esac
 for prov in auto mlx verbs tcp; do
   fp="export FI_PROVIDER=$prov"; [ $prov = auto ] && fp="unset FI_PROVIDER"
   if [ -z "$FIRST_OK" ]; then
@@ -190,6 +260,7 @@ for prov in auto mlx verbs tcp; do
   fi
 done
 [ -z "$FIRST_OK" ] && echo "no Intel MPI launcher worked; fallback: multi-node CPU runs with Open MPI (Intel MPI only helps FFTW)"
+fi   # group F
 
 echo "=============== summary"
 cat $RES

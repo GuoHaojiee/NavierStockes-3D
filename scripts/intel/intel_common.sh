@@ -8,13 +8,23 @@ if [ -z "$MI" ]; then
     MI=$(echo "$M" | sed 's/ns3d_gcc/ns3d_intel/g')
     if [ "$MI" = "$M" ]; then echo "intel_common.sh: \$M has no 'ns3d_gcc' ($M); set MI by hand (see the header of this file)"; MI=""; fi
 fi
-export MI
 SCR=/scratch/pr0208/guohaojie
+# INTEL_IMAGE=<.sqsh path> or v2 (= $SCR/containers/ns3d_intel_v2.sqsh, made by rebuild_container.sh): use another
+# Intel image. The pyxis container name becomes the image basename, so a container of the old image is not reused.
+INTEL_CNAME=ns3d_intel
+if [ -n "$INTEL_IMAGE" ]; then
+    [ "$INTEL_IMAGE" = v2 ] && INTEL_IMAGE=$SCR/containers/ns3d_intel_v2.sqsh
+    [ -f "$INTEL_IMAGE" ] || echo "intel_common.sh: WARNING: image $INTEL_IMAGE not found"
+    INTEL_CNAME=$(basename "$INTEL_IMAGE" .sqsh)
+    MI=$(echo "$MI" | sed -e "s|--container-image=[^ ]*|--container-image=$INTEL_IMAGE|" -e "s|--container-name=[^ ]*|--container-name=$INTEL_CNAME|")
+fi
+export MI INTEL_IMAGE INTEL_CNAME
 EXCL=cn34,cn18,cn25
 # remove the pyxis containers of this job on every node (GCC via common.sh's cleanup, Intel here)
 cleanup_all() {
     cleanup 2>/dev/null
-    srun --ntasks-per-node=1 --time=2 bash -c "enroot remove -f pyxis_ns3d_intel >/dev/null 2>&1; true" 2>/dev/null
+    srun --ntasks-per-node=1 --time=2 bash -c "for n in pyxis_ns3d_intel pyxis_$INTEL_CNAME; do enroot remove -f \$n >/dev/null 2>&1; done; true" 2>/dev/null
 }
 echo "M  = $M"
 echo "MI = $MI"
+[ -n "$INTEL_IMAGE" ] && echo "   (INTEL_IMAGE=$INTEL_IMAGE)"

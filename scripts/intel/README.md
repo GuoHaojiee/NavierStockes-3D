@@ -12,6 +12,8 @@ FFTW 快约 20%，AccFFT 无差别。这里补上 P3DFFT 和 heFFTe，并比较 
 | `build_intel_libs.sh` | Intel 容器内 | P3DFFT 2.x（ifx，MEASURE，无 stride1），heFFTe 2.4.1 ×2（FFTW / MKL 后端） |
 | `build_intel_solvers.sh` | Intel 容器内 | 4 个求解器（heFFTe 两个后端）、`fb_backend_{fftw,mkl}`、`hello_a2a` |
 | `hello_2node.sbatch` + `hello_a2a.c` | 2 节点 | Intel MPI 多节点启动方式（含宿主机 libpmix）+ fabric 扫描；Open MPI 参照 |
+| `rebuild_container.sh` + `rebuild_inside.sh` | 计算节点（宿主机，不在容器里） | 在旧镜像基础上用 apt 装 rdma-core/libibverbs、UCX、libpmi2-0、libpmix2，生成 `containers/ns3d_intel_v2.sqsh` |
+| `check_fabric.sbatch` | 1 节点 | 新镜像里的 ibv_devinfo、ucx_info、`fi_info -p mlx`、`fi_info -p verbs` |
 | `cmp_toolchain.sbatch` + `ct_parse.sh` | 1 节点 | 每个库 gcc vs intel，512³，128×1 / 64×2，各 3 次 |
 | `backend_1proc.sbatch` + `backend_parse.sh` | 1 节点 | 单进程单线程：heFFTe-FFTW / heFFTe-MKL / 原生 FFTW / 原生 MKL |
 
@@ -109,3 +111,88 @@ bash backend_parse.sh $(ls -t ~/guohaojie/logs/be1_*.out | head -1)
 `heFFTe-MKL / heFFTe-FFTW`（导师要的数）和 `native MKL / FFTW MEASURE`。
 本地（笔记本 CPU，128³，仅供参考）：heFFTe-MKL / heFFTe-FFTW ≈ 0.5，native MKL / FFTW ≈ 1.07，
 heFFTe-FFTW 比原生 FFTW 慢 ~3.8 倍——集群上的数字以 EPYC 为准。
+
+## Intel MPI 跨节点：新镜像 ns3d_intel_v2
+
+### 为什么要新镜像
+
+旧镜像不能跨节点，有三个原因：
+
+- 容器里没有 libpmi2.so。设了 `I_MPI_PMI=pmi2`，Intel MPI 仍然用 PMI-1（日志里是 `PMI API: pmi`）。
+- 挂载宿主机的 PMIx 3.2.3 后，libpmix.so.2 加载不了。
+- 没有 UCX 和 libibverbs，所以 `fi_getinfo()` 失败，mlx 和 verbs 两种 provider 都用不了。
+
+`rebuild_container.sh` 以旧镜像为基础（不重装 oneAPI），用 apt 安装以下包：
+
+- `rdma-core libibverbs1 ibverbs-providers ibverbs-utils librdmacm1`
+- `libucx0 ucx-utils`
+- `libpmi2-0`：Slurm 21.08 的 PMI-2 客户端，提供 `libpmi2.so.0`
+- `libpmix2`：PMIx 4.1.2，提供 `libpmix.so.2`
+
+装完写 `/opt/ns3d_pmi_libs.txt`，里面是这两个库的路径；`hello_2node.sbatch` 的 D 组读它。旧镜像不动。
+
+### 本机测过的部分
+
+- 在本机 Docker 的 Ubuntu 22.04 镜像里跑了 `rebuild_inside.sh`：9 个包都能装上，4 个库都能找到，`/opt/ns3d_pmi_libs.txt` 也写出来了。
+- `rebuild_container.sh` 的保护检查都测过：旧镜像不存在、输出等于输入、新镜像已存在、没有 enroot，这几种情况都会报 FAIL 并停下。
+- `hello_2node.sbatch v2` 用假 srun 跑通了：镜像切换、manifest 读取、D 组、PMI API 检查、分组选择。
+- `check_fabric` 的检查脚本在本机跑通了流程。本机没有 InfiniBand，所以 4 项都是 FAIL。
+
+**没测**：enroot 和 pyxis 生成镜像（需要计算节点能上网用 apt）、真实的 PMI-2/PMIx 握手、InfiniBand。
+
+### 运行顺序
+
+**1. 生成新镜像**（约 15–30 分钟）
+
+在计算节点的宿主机上运行，不在容器里：
+
+```bash
+srun -p batch --exclude=cn34,cn18,cn25 -N1 -n1 -c16 --time=01:00:00 bash ~/guohaojie/src/NavierStockes-3D/scripts/intel/rebuild_container.sh
+```
+
+成功时应看到：
+
+- 每个包一行版本号；没有的包打印 `SKIP <包>: ...`；
+- `OK libpmi2.so … libpmi2.so.0`、`OK libpmix.so … libpmix.so.2`、`OK libibverbs.so …`、`OK libucp.so …`；
+- `OK /etc/profile.d/ns3d_intel.sh still there`；
+- 最后一行 `OK /scratch/…/containers/ns3d_intel_v2.sqsh (N min)`。
+
+日志在 `~/guohaojie/logs/rebuild_container_*.log`。如果 enroot 失败（比如节点本地空间不够），从登录节点改用 pyxis 方法：`RC_METHOD=pyxis bash …/rebuild_container.sh`。
+
+**2. 检查网络栈**（约 2 分钟）
+
+```bash
+sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/check_fabric.sbatch
+grep -E "^CHECK|^image|^manifest" $(ls -t ~/guohaojie/logs/cfab_*.out | head -1)
+```
+
+4 行都应是 `OK`：
+
+- `CHECK ibv_devinfo OK`：列出 `hca_id: mlx5_*`；
+- `CHECK ucx_transports OK`：有 rc、dc、ud 等传输；
+- `CHECK fi_info_mlx OK`；
+- `CHECK fi_info_verbs OK`。
+
+加参数 `old` 可以看旧镜像的对比结果，那边应该全是 FAIL。
+
+**3. 跨节点**（约 10–20 分钟）
+
+```bash
+sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1)
+```
+
+不加 `HELLO_GROUPS` 时会跑全部组（R A B D C F）。
+
+成功时应看到：
+
+- `D variants: pmi2 lib /usr/lib/x86_64-linux-gnu/libpmi2.so.0   pmix lib /usr/lib/x86_64-linux-gnu/libpmix.so.2`；
+- `R_ompi_pmix` 三个大小都是 OK；
+- D1 或 D2 至少有一个三个大小都是 `status=OK`，并且 `pmi_api=pmi2`（D1）或 `pmi_api=pmix`（D2），没有 `PMI_API_MISMATCH`；
+- summary 表里 D 和 F 行的 `GBs_node_offnode` 和 `R_ompi_pmix` 同一个数量级。
+
+如果失败：
+
+- 看 `logs/hello2_<job>.d/D*_*.8192.txt`：里面有 MPI startup/PMI 行和最后 20 行错误；
+- D3（每节点 2 个进程）成功而 D1 失败：问题和每节点进程数有关；
+- D2 失败而 D1 成功：多半是 PMIx 4.1.2 客户端和 Slurm 的 PMIx 3.2.3 服务端不兼容。
