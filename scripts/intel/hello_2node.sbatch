@@ -11,7 +11,9 @@
 # hello_2node — can Intel MPI in the Intel container run on 2 nodes x 128 ranks? Tries several launchers
 # and fabrics, one after another. Every message size is a SEPARATE srun (MPI_Init only once per process);
 # sizes 8192, 65536, 262144 bytes per rank pair. Every srun ends with
-#     RESULT variant=<name> bytes=<size> status=OK|FAIL|SKIP rc=<exit code> a2a_us=... GBs_node_offnode=...
+#     RESULT variant=<name> func=alltoall|alltoallv bytes=<size> status=OK|FAIL|SKIP rc=<exit code> a2a_us=... GBs_node_offnode=...
+# Sizes per rank pair: 8 KB, 64 KB, 256 KB, 512 KB, 1 MB. hello_a2a measures MPI_Alltoall or, with mode a2av,
+# MPI_Alltoallv with uniform counts (as P3DFFT / heFFTe / AccFFT call it); HFUNC=a2a|a2av per variant.
 # If the smallest size fails, the larger ones of that variant are skipped. A hung srun is killed after 200 s.
 # Files in logs/hello2_<job>.d/: <variant>.<bytes>.raw = full output of every srun; for a FAILED srun also
 # <variant>.<bytes>.txt = the "MPI startup"/PMI lines (I_MPI_DEBUG=5), the libfabric log (FI_LOG_LEVEL=warn, E group)
@@ -60,8 +62,20 @@
 #      HPC-X libucp (missing stage, dependency or version problem), E6b-f fall back to the image's UCX 1.12.1.
 # Every RESULT line ends with ucx_version=<version printed by ucx_info -v> (R: Open MPI's ucx_info) and, when
 # hello_a2a printed it, ucx_lib=<directory of the libucp really loaded>.
-# Summary: bandwidth relative to R_ompi_pmix per size; PASS when >= 0.8x Open MPI at all three sizes
-# (at 262144 that is ~25 GB/s/node for Open MPI's 30.8).
+# Summary: one row per (variant, function, size), then per (function, size) the best Open MPI setting (R*, RT*) and
+# the best Intel setting (all other groups) and their ratio (target >= 0.8).
+#   RT Open MPI tuning (GCC container, srun --mpi=pmix, run_env.sh CPU mode). Before the runs: ucx_info -v, all
+#      UCX_* and OMPI_MCA_* variables, and the coll components hcoll / ucc / tuned from ompi_info.
+#        RT_<func>_def_<dev>   no coll setting (Open MPI default; for a2a the same as R_ompi_pmix)
+#        RT_a2a_t<k>_<dev>     OMPI_MCA_coll_tuned_use_dynamic_rules=1, coll_tuned_alltoall_algorithm = 0, 2, 3, 4
+#        RT_a2av_t<k>_<dev>    the same with coll_tuned_alltoallv_algorithm = 0, 1, 2
+#      For the t<k> variants hcoll and ucc are switched off (OMPI_MCA_coll_hcoll_enable=0 OMPI_MCA_coll_ucc_enable=0),
+#      otherwise a higher-priority component would take the collective and the tuned algorithm would never run;
+#      RT_HCOLL_OFF=0 keeps them. <dev>: d = UCX default devices, 8h = the 8 HCAs of E5d/E6 (RT_DEVS="d 8h").
+#   E7 Intel, E6d settings (intel_mn_env.sh: pmi2, mlx, HPC-X UCX 1.17, I_MPI_ADJUST_ALLTOALL=3):
+#        E7_a2a_e6d            MPI_Alltoall (E6d at the new sizes)
+#        E7_a2av_def           MPI_Alltoallv, I_MPI_ADJUST_ALLTOALLV unset
+#        E7_a2av_1, E7_a2av_2  MPI_Alltoallv, I_MPI_ADJUST_ALLTOALLV=1 / 2
 #   C  mpirun -bootstrap slurm inside the container (hydra starts its proxies with srun; needs srun in the container)
 #   F  fabrics, with the first launcher that worked: I_MPI_FABRICS=shm:ofi with FI_PROVIDER = (auto) mlx verbs tcp
 # Every Intel variant also reports the PMI API Intel MPI really used ("MPI startup(): PMI API: ..." with I_MPI_DEBUG=5):
@@ -69,6 +83,7 @@
 # hello_a2a: MPI_Alltoall, data checked; build it with build_intel_solvers.sh.
 # Argument: the Intel image (default: the one in $MI, i.e. ns3d_intel.sqsh); "v2" = containers/ns3d_intel_v2.sqsh.
 # HELLO_GROUPS selects the groups (default "R A B D E E5 E6 C F"; "R E5 E6" = reference, E5d for comparison, HPC-X UCX), e.g. only the reference and the E group on the new image:
+#   sbatch --export=ALL,HELLO_GROUPS="R RT E6 E7" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch --export=ALL,HELLO_GROUPS="R E" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch --export=ALL,HELLO_GROUPS="R D F" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
 #   sbatch ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch
@@ -76,13 +91,13 @@
 [ -n "$1" ] && export INTEL_IMAGE=$1                   # image choice, see intel_common.sh
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
 precheck
-GROUPS_=${HELLO_GROUPS:-"R A B D E E5 E6 C F"}
+GROUPS_=${HELLO_GROUPS:-"R RT A B D E E5 E6 E7 C F"}
 want() { [[ " $GROUPS_ " == *" $1 "* ]]; }
 IE="source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1"
 HB=/work/build/bin_intel/hello_a2a
 TMP=$SCR/logs/hello2_$SLURM_JOB_ID.d; mkdir -p $TMP     # = /work/logs/hello2_$SLURM_JOB_ID.d in the containers
 WTMP=/work/logs/hello2_$SLURM_JOB_ID.d
-SIZES="8192:20 65536:10 262144:5"                      # bytes per pair : iterations
+SIZES="8192:20 65536:10 262144:5 524288:4 1048576:3"   # bytes per pair : iterations (1 MB: 512 MB buffers per rank)
 RES=$TMP/results.txt; : > $RES                         # RESULT lines (the job's .out file is stdout: grep cannot read it)
 res() { echo "RESULT $*" | tee -a $RES; }
 FIRST_OK=""                                            # "<srun options>|<inner environment>" of the first launcher that worked
@@ -93,7 +108,7 @@ FIRST_OK=""                                            # "<srun options>|<inner 
 T() {
     local v=$1 so=$2 cmd=$3 si sz it c rc st l f
     for si in $SIZES; do
-        sz=${si%:*}; it=${si#*:}; c=${cmd//@A@/$sz $it}; f=$TMP/$v.$sz.raw
+        sz=${si%:*}; it=${si#*:}; c=${cmd//@A@/$sz $it ${HFUNC:-a2a}}; f=$TMP/$v.$sz.raw
         echo ">>> [$(date +%H:%M:%S)] $v bytes=$sz | srun $so ... | $c"
         timeout 200 srun $so --time=3 --kill-on-bad-exit=1 bash -c "$c" > $f 2>&1; rc=$?
         if [ $sz = 8192 ]; then   # launcher/fabric details once per variant
@@ -148,7 +163,8 @@ T() {
         uv=$(grep -m1 -oE "(Library version: *|UCT version=)[0-9]+\.[0-9]+(\.[0-9]+)?" $f | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?$")
         ul=$(grep -m1 -E "^MAPS .*/libucp\.so" $f | awk '{print $2}')
         uf="ucx_version=${uv:-${UCXV_FALLBACK:-unknown}}"; [ -n "$ul" ] && uf="$uf ucx_lib=$(dirname $ul)"
-        res "variant=$v bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa $ux $uf"; echo
+        local fn; fn=$(echo "$l" | grep -o 'func=[^ ]*' | cut -d= -f2); [ -z "$fn" ] && { [ "${HFUNC:-a2a}" = a2av ] && fn=alltoallv || fn=alltoall; }
+        res "variant=$v func=$fn bytes=$sz status=$st rc=$rc $(echo "$l" | grep -o 'a2a_us=[^ ]*') $(echo "$l" | grep -o 'GBs_node_offnode=[^ ]*') $pa $ux $uf"; echo
         [ $st = OK ] || { [ "$si" != "${SIZES##* }" ] && echo "    (larger sizes of $v skipped)"; return 1; }
     done
     return 0
@@ -182,6 +198,14 @@ D_PMI2=$(sed -n 's/^PMI2_LIB=//p' $TMP/manifest.txt 2>/dev/null); D_PMIX=$(sed -
 echo "image manifest /opt/ns3d_pmi_libs.txt: $(tr '\n' ' ' < $TMP/manifest.txt 2>/dev/null || echo none)"
 echo "D variants: pmi2 lib ${D_PMI2:-none}   pmix lib ${D_PMIX:-none}"
 
+# Open MPI hello_a2a (GCC container), built once per job
+build_ompi_hello() {
+    [ -n "$OMPI_HELLO_OK" ] && return 0
+    srun -N1 -n1 --time=3 $M bash -c "source /etc/profile.d/ns3d_env.sh; mpicc -O2 /work/src/NavierStockes-3D/scripts/intel/hello_a2a.c -o /work/build/bin_gcc/hello_a2a_ompi" \
+        && OMPI_HELLO_OK=1
+}
+HBO=/work/build/bin_gcc/hello_a2a_ompi
+
 if want R; then
 # ---------------------------------------------------------------- R) Open MPI reference (GCC container)
 echo "=============== R) Open MPI reference, GCC container"
@@ -191,9 +215,37 @@ srun -N1 -n1 --time=3 $M bash -c "export NS_MODE=cpu; source /work/build/run_env
     env | grep -E '^UCX_' | sort" > $TMP/ompi_ucx.txt 2>&1
 echo "--- Open MPI (GCC container) UCX:"; sed 's/^/    /' $TMP/ompi_ucx.txt
 OMPI_UCXV=$(grep -m1 -oE "(Library version: *|UCT version=)[0-9]+\.[0-9]+(\.[0-9]+)?" $TMP/ompi_ucx.txt | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?$")
-srun -N1 -n1 --time=3 $M bash -c "source /etc/profile.d/ns3d_env.sh; mpicc -O2 /work/src/NavierStockes-3D/scripts/intel/hello_a2a.c -o /work/build/bin_gcc/hello_a2a_ompi" \
+build_ompi_hello \
   && UCXV_FALLBACK=$OMPI_UCXV T R_ompi_pmix "--mpi=pmix $SR2 $M" "export NS_MODE=cpu; source /work/build/run_env.sh; /work/build/bin_gcc/hello_a2a_ompi @A@"
 fi   # group R
+
+if want RT; then
+# ---------------------------------------------------------------- RT) Open MPI coll tuning (GCC container)
+echo "=============== RT) Open MPI: coll tuned algorithms for alltoall / alltoallv, UCX devices"
+srun -N1 -n1 --time=3 $M bash -c "export NS_MODE=cpu; source /work/build/run_env.sh; \
+    echo '--- ucx_info -v'; ucx_info -v; \
+    echo '--- UCX_* and OMPI_MCA_* (run_env.sh, CPU mode)'; env | grep -E '^(UCX_|OMPI_MCA_)' | sort; \
+    echo '--- coll components (ompi_info)'; ompi_info | grep -E 'MCA coll'; \
+    for c in hcoll ucc tuned; do echo \"--- coll \$c: enable / priority / algorithm parameters\"; \
+        ompi_info --param coll \$c --level 9 2>/dev/null | grep -E \"coll_\${c}_(enable|priority)|coll_tuned_(use_dynamic_rules|alltoallv?_algorithm)\\\"\" | sed 's/^ *//'; done" \
+    > $TMP/ompi_coll.txt 2>&1
+sed 's/^/    /' $TMP/ompi_coll.txt
+[ -z "$OMPI_UCXV" ] && OMPI_UCXV=$(grep -m1 -oE "(Library version: *|UCT version=)[0-9]+\.[0-9]+(\.[0-9]+)?" $TMP/ompi_coll.txt | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?$")
+RTOFF="OMPI_MCA_coll_hcoll_enable=0 OMPI_MCA_coll_ucc_enable=0"; [ "${RT_HCOLL_OFF:-1}" = 0 ] && RTOFF=""
+echo "tuned variants: dynamic rules on${RTOFF:+, hcoll and ucc off ($RTOFF)}"
+build_ompi_hello || echo "ERROR: could not build $HBO"
+for dev in ${RT_DEVS:-d 8h}; do
+  dv=""; [ $dev = 8h ] && dv="export UCX_NET_DEVICES=$E5DEV;"
+  for spec in "a2a|def|" "a2a|t0|0" "a2a|t2|2" "a2a|t3|3" "a2a|t4|4" "a2av|def|" "a2av|t0|0" "a2av|t1|1" "a2av|t2|2"; do
+    fn=${spec%%|*}; tag=$(echo $spec | cut -d'|' -f2); alg=${spec##*|}
+    if [ -z "$alg" ]; then mca=""
+    elif [ $fn = a2a ]; then mca="export OMPI_MCA_coll_tuned_use_dynamic_rules=1 OMPI_MCA_coll_tuned_alltoall_algorithm=$alg $RTOFF;"
+    else mca="export OMPI_MCA_coll_tuned_use_dynamic_rules=1 OMPI_MCA_coll_tuned_alltoallv_algorithm=$alg $RTOFF;"; fi
+    HFUNC=$fn UCXV_FALLBACK=$OMPI_UCXV T RT_${fn}_${tag}_$dev "--mpi=pmix $SR2 $M" \
+      "export NS_MODE=cpu; source /work/build/run_env.sh; $mca $dv [ \${SLURM_PROCID:-0} = 0 ] && env | grep -E '^(OMPI_MCA_coll|UCX_NET)' | sort | tr '\\n' ' ' && echo; $HBO @A@"
+  done
+done
+fi   # group RT
 
 if want A; then
 # ---------------------------------------------------------------- A) srun --mpi=pmi2
@@ -339,14 +391,16 @@ for v in "E5a_mlx5tls|export UCX_TLS=rc_mlx5,ud_mlx5,sm,self; unset UCX_NET_DEVI
 done
 fi   # group E5
 
-if want E6; then
-# ---------------------------------------------------------------- E6) E5d_alldev + UCX of HPC-X 2.19
-echo "=============== E6) E5d_alldev settings with the UCX of HPC-X (stage_hpcx_ucx.sh -> /work/opt_ucx/hpcx)"
+# ---- shared by E6 and E7: E5d_alldev settings + HPC-X UCX
 HUCX=/work/opt_ucx/hpcx
 e5d="export FI_PROVIDER=mlx UCX_LOG_LEVEL=info UCX_TLS=rc_mlx5,ud_mlx5,sm,self UCX_NET_DEVICES=$E5DEV"
 uh="export LD_LIBRARY_PATH=$HUCX/lib:\$LD_LIBRARY_PATH UCX_MODULE_DIR=$HUCX/lib/ucx PATH=$HUCX/bin:\$PATH"
 # rank 0: version of the ucx_info first in PATH (HPC-X when staged) and the libucp it loads
 uinfo="[ \${SLURM_PROCID:-0} = 0 ] && { echo \"ucx_info: \$(command -v ucx_info)\"; ucx_info -v; }"
+
+if want E6; then
+# ---------------------------------------------------------------- E6) E5d_alldev + UCX of HPC-X 2.19
+echo "=============== E6) E5d_alldev settings with the UCX of HPC-X (stage_hpcx_ucx.sh -> /work/opt_ucx/hpcx)"
 if [ -f $SCR/opt_ucx/hpcx/lib/libucp.so.0 ]; then
   echo "staged: $(grep -m1 -E 'version' $SCR/opt_ucx/hpcx/VERSION.txt)   check: $(grep -E '^(OK|FAIL)' $SCR/opt_ucx/hpcx/CHECK.txt 2>/dev/null | tr '\n' ' ' || echo 'not run')"
   UCXLOG=1 EXPECT_API=pmi2 T E6a_hpcxucx "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $e5d; $uh; $uinfo; $pinfo; $HELLO"
@@ -370,6 +424,18 @@ for v in "E6b_hpcxucx_relax|export UCX_IB_PCI_RELAXED_ORDERING=on" \
   UCXLOG=1 EXPECT_API=pmi2 T $name "--mpi=pmi2 $SR2 $MI" "$IE; $e; export $IFAB; $e5d; $uh; $pe; $uinfo; $pinfo; $HELLO"
 done
 fi   # group E6
+
+if want E7; then
+# ---------------------------------------------------------------- E7) E6d settings, MPI_Alltoallv algorithms
+echo "=============== E7) E6d settings (HPC-X UCX, I_MPI_ADJUST_ALLTOALL=3), MPI_Alltoallv with I_MPI_ADJUST_ALLTOALLV"
+uh7=$uh; [ -f $SCR/opt_ucx/hpcx/lib/libucp.so.0 ] || { uh7=true; echo "WARNING: HPC-X UCX not staged: E7 uses the image's UCX"; }
+e6d="$IE; $e; export $IFAB; $e5d; $uh7; export I_MPI_ADJUST_ALLTOALL=3"
+for spec in "E7_a2a_e6d|a2a|unset I_MPI_ADJUST_ALLTOALLV" "E7_a2av_def|a2av|unset I_MPI_ADJUST_ALLTOALLV" \
+            "E7_a2av_1|a2av|export I_MPI_ADJUST_ALLTOALLV=1" "E7_a2av_2|a2av|export I_MPI_ADJUST_ALLTOALLV=2"; do
+  name=${spec%%|*}; fn=$(echo "$spec" | cut -d'|' -f2); pe=${spec##*|}
+  HFUNC=$fn UCXLOG=1 EXPECT_API=pmi2 T $name "--mpi=pmi2 $SR2 $MI" "$e6d; $pe; $uinfo; $pinfo; $HELLO"
+done
+fi   # group E7
 
 if want C; then
 # ---------------------------------------------------------------- C) mpirun -bootstrap slurm inside the container
@@ -400,36 +466,34 @@ fi   # group F
 
 echo "=============== summary"
 cat $RES
-echo "--- working variants: alltoall time [us] / off-node bandwidth per node [GB/s] for 8192 65536 262144 bytes per pair"
+echo "--- per (variant, function, size); side: ompi = R*/RT* (GCC container, Open MPI), intel = the other groups"
 awk '
-  { v=""; b=""; s=""; t="-"; g="-"
-    for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1]=="variant") v=kv[2]; else if (kv[1]=="bytes") b=kv[2];
-      else if (kv[1]=="status") s=kv[2]; else if (kv[1]=="a2a_us") t=kv[2]; else if (kv[1]=="GBs_node_offnode") g=kv[2] }
-    if (!(v in seen)) { seen[v]=1; order[++n]=v }
-    if (s=="OK") { r[v, b]=sprintf("%9s / %-6s", t, g); ok[v]++ } }
-  END { printf "%-22s %20s %20s %20s\n", "variant", "8192", "65536", "262144"
-        for (k = 1; k <= n; k++) { v=order[k]; if (!ok[v]) continue
-          printf "%-22s", v; split("8192 65536 262144", B, " ")
-          for (j = 1; j <= 3; j++) printf " %20s", ((v, B[j]) in r) ? r[v, B[j]] : "FAIL"; printf "\n" } }' $RES
-echo "--- off-node bandwidth relative to R_ompi_pmix (PASS: >= 0.8x Open MPI at 8192, 65536 and 262144; 0.8 x 30.8 = ~25 GB/s/node at 262144)"
+  function kv(name,   i, a) { for (i = 2; i <= NF; i++) { split($i, a, "="); if (a[1] == name) return a[2] } return "" }
+  { v = kv("variant"); f = kv("func"); b = kv("bytes"); s = kv("status"); if (f == "") f = "alltoall"
+    if (b == "-" || b == "") next
+    side = (v ~ /^R/) ? "ompi" : "intel"
+    printf "%-24s %-6s %-10s %8s %-5s %10s %8s %s\n", v, side, f, b, s, kv("a2a_us"), kv("GBs_node_offnode"), kv("ucx_version") }
+  BEGIN { printf "%-24s %-6s %-10s %8s %-5s %10s %8s %s\n", "variant", "side", "func", "bytes", "stat", "a2a_us", "GB/s/node", "ucx" }' $RES
+echo
+echo "--- best setting per side for every (function, size) (lowest alltoall time = highest off-node GB/s/node); intel/ompi >= 0.8 is the target"
 awk '
-  { v=""; b=""; s=""; g=""; u="-"
-    for (i = 2; i <= NF; i++) { split($i, kv, "="); if (kv[1]=="variant") v=kv[2]; else if (kv[1]=="bytes") b=kv[2];
-      else if (kv[1]=="status") s=kv[2]; else if (kv[1]=="GBs_node_offnode") g=kv[2]; else if (kv[1]=="ucx_version") u=kv[2] }
-    if (!(v in seen)) { seen[v]=1; order[++n]=v }
-    if (s=="OK" && g != "") { bw[v, b]=g; ok[v]++; uv[v]=u } }
+  function kv(name,   i, a) { for (i = 2; i <= NF; i++) { split($i, a, "="); if (a[1] == name) return a[2] } return "" }
+  { v = kv("variant"); f = kv("func"); b = kv("bytes"); s = kv("status"); g = kv("GBs_node_offnode"); u = kv("a2a_us"); if (f == "") f = "alltoall"
+    if (s != "OK" || u == "") next
+    side = (v ~ /^R/) ? "ompi" : "intel"; k = f SUBSEP b
+    if (!(k in seen)) { seen[k] = 1; keys[++n] = k }
+    if (!((k, side) in tus) || u + 0 < tus[k, side]) { tus[k, side] = u + 0; best[k, side] = g + 0; bv[k, side] = v } }
   END {
-    split("8192 65536 262144", B, " ")
-    if (!(("R_ompi_pmix", "262144") in bw)) { print "  (no complete R_ompi_pmix reference in this job)"; exit }
-    printf "%-22s %-10s %9s %9s %9s %12s  %s\n", "variant", "ucx", "8192", "65536", "262144", "GB/s@256K", "verdict"
-    for (k = 1; k <= n; k++) { v=order[k]; if (!ok[v]) continue
-      line=sprintf("%-22s %-10s", v, uv[v]); pass=1
-      for (j = 1; j <= 3; j++) {
-        ref=bw["R_ompi_pmix", B[j]]
-        if (((v, B[j]) in bw) && ref > 0) { q=bw[v, B[j]] / ref; line=line sprintf(" %9.2f", q); if (q < 0.8) pass=0 }
-        else { line=line sprintf(" %9s", "FAIL"); pass=0 }
-      }
-      g256=((v, "262144") in bw) ? bw[v, "262144"] : 0
-      if (v == "R_ompi_pmix") verdict="reference"; else verdict=(pass ? "PASS" : "below target")
-      printf "%s %12.2f  %s\n", line, g256, verdict } }' $RES
+    printf "%-10s %8s   %-24s %9s   %-24s %9s  %s\n", "func", "bytes", "best Open MPI", "GB/s", "best Intel", "GB/s", "intel/ompi"
+    # sort keys by function, then size
+    for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) {
+      split(keys[i], x, SUBSEP); split(keys[j], y, SUBSEP)
+      if (x[1] > y[1] || (x[1] == y[1] && x[2] + 0 > y[2] + 0)) { t = keys[i]; keys[i] = keys[j]; keys[j] = t } }
+    for (i = 1; i <= n; i++) { k = keys[i]; split(k, x, SUBSEP)
+      ho = ((k, "ompi") in tus); ht = ((k, "intel") in tus)
+      r = (ho && ht) ? tus[k, "ompi"] / tus[k, "intel"] : 0      # = GB/s intel / GB/s ompi
+      printf "%-10s %8s   %-24s %9s   %-24s %9s  %s\n", x[1], x[2],
+        (ho ? bv[k, "ompi"] : "-"), (ho ? sprintf("%.2f", best[k, "ompi"]) : "-"),
+        (ht ? bv[k, "intel"] : "-"), (ht ? sprintf("%.2f", best[k, "intel"]) : "-"),
+        (r ? sprintf("%.2f%s", r, (r < 0.8 ? "  below 0.8" : "")) : "-") } }' $RES
 cleanup_all

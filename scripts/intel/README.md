@@ -421,3 +421,73 @@ ct4_parse.sh 的输出依次是：
 - `IMN_ALLTOALLV=2` 能传到每个 rank，非法值 7 被忽略。
 
 没测：v2 镜像里真实的 4 节点运行、各库的 Intel 程序、带宽和耗时。
+
+## 对等调优的 4 节点对比
+
+ct4_512 的结果不可比，原因有三：
+
+- Intel 用的是 hello 调出来的 E6d 设置，Open MPI 一边没有调过；
+- FFTW Intel 64×2 异常慢而且不稳定（2.83–4.68 s）；
+- GCC 的 P3DFFT 在 4 节点上几乎不加速。
+
+下面的改动让两边可以用同样的办法调优，再做对比。
+
+### 1. hello_2node：Alltoallv、更大的消息、Open MPI 调优（RT）和 Intel Alltoallv（E7）
+
+- **hello_a2a** 多了第三个参数 `a2a|a2av`。`a2av` 用均匀计数调用 MPI_Alltoallv，和 P3DFFT、heFFTe、AccFFT 的调用方式一样。HELLO_OK 行多了 `func=`。
+- **消息大小**：每对进程 8 KB、64 KB、256 KB、512 KB、1 MB。1 MB 时每个进程的两个缓冲区共 512 MB，每节点约 64 GB。
+- **RT 组**（GCC 容器，Open MPI）：
+  - 运行前打印 `ucx_info -v`、所有 `UCX_*` 和 `OMPI_MCA_*` 变量，以及 ompi_info 里 hcoll、ucc、tuned 三个 coll 组件的 enable、priority 和算法参数（写在 `hello2_<job>.d/ompi_coll.txt`）。
+  - 变体名为 `RT_<a2a|a2av>_<def|t<k>>_<d|8h>`：
+    - `def`：不设任何 coll 参数；
+    - `t<k>`：`OMPI_MCA_coll_tuned_use_dynamic_rules=1`，alltoall 用算法 0、2、3、4，alltoallv 用算法 0、1、2；
+    - `d`：UCX 默认网卡；`8h`：和 E5d/E6 一样的 8 块网卡。`RT_DEVS` 选择跑哪一种或两种。
+  - **我自己加的一项**：`t<k>` 变体同时设了 `OMPI_MCA_coll_hcoll_enable=0 OMPI_MCA_coll_ucc_enable=0`。否则优先级更高的 hcoll 或 ucc 会接管这个集合操作，tuned 的算法设置根本不生效。`RT_HCOLL_OFF=0` 可以保留 hcoll 和 ucc。`def` 变体保持 Open MPI 的原样。
+- **E7 组**（Intel，E6d 设置）：`E7_a2a_e6d`（Alltoall，用来在新的消息大小上和 RT 对比）、`E7_a2av_def`、`E7_a2av_1`、`E7_a2av_2`（Alltoallv，`I_MPI_ADJUST_ALLTOALLV` 分别为不设、1、2）。
+- **summary**：
+  - 先按 (变体, 函数, 大小) 逐行列出；
+  - 再对每个 (函数, 大小) 给出 Open MPI 一边（R*、RT*）的最佳设置和 Intel 一边的最佳设置，以及 intel/ompi 带宽比，低于 0.8 时标出。
+
+```bash
+sbatch --export=ALL,HELLO_GROUPS="R RT E6 E7" ~/guohaojie/src/NavierStockes-3D/scripts/intel/hello_2node.sbatch v2
+sed -n '/=== summary/,$p' $(ls -t ~/guohaojie/logs/hello2_*.out | head -1) | grep -v "^RESULT"
+cat ~/guohaojie/logs/hello2_<job>.d/ompi_coll.txt
+```
+
+### 2. FFTW 求解器：NS_PRINT_PLAN=1
+
+设了 `NS_PRINT_PLAN=1` 时，rank 0 在建完 plan 后把正、逆 plan 打印出来，每行前缀 `FFTW PLAN:`。从中能看到 FFTW 选了哪种 MPI 转置：`mpi-transpose-alltoall`、`-pairwise` 或 `-recurse`。
+
+- 用的是 `fftw_sprint_plan`；FFTW 版本太旧没有这个函数时，编译加 `-DNS_FFTW_NO_SPRINT`，改用 `fftw_fprint_plan`；
+- 不设这个变量时行为不变。
+
+需要重编两边的 ns_fftw：GCC 用 `scripts/compile_all.sh`，Intel 用 `build_intel_solvers.sh`。
+
+### 3. cmp_toolchain_4n.sbatch
+
+- **GCC 一边**：sbatch 环境里所有 `OMPI_MCA_*` 变量在 `run_env.sh` 之后原样传给各进程；`CT4_GCC_ENV="UCX_NET_DEVICES=…"` 可以再加别的变量。日志开头打印 `GCC env (after run_env.sh): …`，rank 0 也会打印它实际看到的 `OMPI_MCA_coll*` 和 `UCX_NET*`。
+- **Intel 一边**：`CT4_INTEL_A2A="3 def"` 会让 Intel 一边按每种 `I_MPI_ADJUST_ALLTOALL` 设置各跑一次，标签为 `intel-a3`、`intel-def`；不设时只跑一种，标签为 `intel`。
+- **步数和参考动能**：步数改为 10。512³ 的参考动能为 1.7950250065e+08，1024³ 仍为 1.4360200052e+09。
+- **UCX 版本**：每次运行都用 `scripts/cpu_final/ucx_probe.c` 记录 rank 0 实际加载的 UCX，日志里一行 `UCX: <标签> rep=<r> version=<v>`。Intel 多节点运行不是 1.17.0 时，打印 `WARNING: UCX <v> loaded, expected 1.17.0`。
+- **ct4_parse.sh**：
+  - 最佳配置表现在每个工具链一行，带 `range (min-max)`、相对 gcc 的倍数，以及 `ranges overlap`（与 gcc 最佳配置的 min–max 是否重叠；重叠说明差别在运行间波动之内）；
+  - 新增 UCX 版本一节；
+  - 日志里有 FFTW plan 时，每次运行输出一行：step 时间和正、逆 plan 的转置方式。
+
+### 4. ct4_fftw_diag.sbatch
+
+只测 FFTW，512³，4 节点。gcc 和 Intel 各跑 128×1 和 64×2；Intel 一边分 `I_MPI_ADJUST_ALLTOALL=3` 和 Intel 默认两种。每组 3 次，`NS_PRINT_PLAN=1`。共 18 次运行，约 20–30 分钟。实际上就是用 `CT4_LIBS=fftw CT4_REP=3 CT4_INTEL_A2A="3 def" CT4_PRINT_PLAN=1` 运行 `cmp_toolchain_4n.sbatch 512`。
+
+```bash
+cd ~/guohaojie/src/NavierStockes-3D/scripts/intel && sbatch ct4_fftw_diag.sbatch
+bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4fd_*.out | head -1)
+```
+
+### 本机测过的部分
+
+- hello_a2a 的 a2a 和 a2av 两种模式，1 MB 时数据校验都通过；
+- `NS_PRINT_PLAN`：`sprint` 和 `fprint` 两种实现都打印出 `mpi-transpose-pairwise`，默认不打印；
+- hello_2node 的 R、RT、E7 三组用假 srun 跑通。本机的 ompi_info 能列出 coll 组件和 tuned 的参数（本机没有 hcoll 和 ucc），summary 两张表都正常；
+- cmp_toolchain_4n 用假 srun 跑通（FFTW、两种 Intel ALLTOALL 设置、打印 plan、OMPI_MCA 透传），ct4_parse 各节都正常。
+
+没测：真实的 2 节点和 4 节点运行、hcoll 和 ucc 的实际状态、带宽和耗时。

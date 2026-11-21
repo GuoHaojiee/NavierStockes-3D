@@ -1,5 +1,7 @@
 /* hello_a2a.c — multi-node MPI launch test: rank/host map, MPI_Alltoall, check of the received data.
- * Usage: hello_a2a [bytes_per_pair=8192] [iters=20]
+ * Usage: hello_a2a [bytes_per_pair=8192] [iters=20] [a2a|a2av]
+ *   a2a  = MPI_Alltoall (default); a2av = MPI_Alltoallv with uniform counts and displacements (as P3DFFT, heFFTe and
+ *   AccFFT call it), same data and check.
  * Rank 0 first prints "MAPS <path>" for every UCX / libfabric / MPI library mapped into the process.
  * Prints one line "HELLO_OK ranks=... nodes=... a2a_us=... GBs_node=... lib=..." on success,
  * "HELLO_FAIL ..." if the received data are wrong. */
@@ -39,6 +41,7 @@ int main(int argc, char** argv) {
     }
     long bytes = argc > 1 ? atol(argv[1]) : 8192;
     int iters = argc > 2 ? atoi(argv[2]) : 20;
+    int use_v = argc > 3 && !strcmp(argv[3], "a2av");
     long n = bytes / 8; if (n < 1) n = 1;
 
     /* number of nodes = number of distinct host names */
@@ -51,26 +54,35 @@ int main(int argc, char** argv) {
 
     double* sb = malloc(sizeof(double) * n * p);
     double* rb = malloc(sizeof(double) * n * p);
+    int* cnt = malloc(sizeof(int) * p);
+    int* dsp = malloc(sizeof(int) * p);
+    if (!sb || !rb || !cnt || !dsp || (long)n * p > 2147483647L) {
+        fprintf(stderr, "hello_a2a: rank %d: cannot allocate %ld bytes per buffer (or counts exceed int)\n", r, (long)(8 * n * p));
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+    for (i = 0; i < p; ++i) { cnt[i] = (int)n; dsp[i] = (int)(n * i); }
+#define A2A() (use_v ? MPI_Alltoallv(sb, cnt, dsp, MPI_DOUBLE, rb, cnt, dsp, MPI_DOUBLE, MPI_COMM_WORLD) \
+                     : MPI_Alltoall(sb, n, MPI_DOUBLE, rb, n, MPI_DOUBLE, MPI_COMM_WORLD))
     long j;
     for (i = 0; i < p; ++i) for (j = 0; j < n; ++j) sb[(long)i * n + j] = r * 1e6 + i + j * 1e-3;
-    MPI_Alltoall(sb, n, MPI_DOUBLE, rb, n, MPI_DOUBLE, MPI_COMM_WORLD);
+    A2A();
     int bad = 0, allbad;
     for (i = 0; i < p; ++i) for (j = 0; j < n; ++j) if (rb[(long)i * n + j] != i * 1e6 + r + j * 1e-3) bad = 1;
     MPI_Allreduce(&bad, &allbad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
     double t0 = MPI_Wtime();
-    for (it = 0; it < iters; ++it) MPI_Alltoall(sb, n, MPI_DOUBLE, rb, n, MPI_DOUBLE, MPI_COMM_WORLD);
+    for (it = 0; it < iters; ++it) A2A();
     double t = (MPI_Wtime() - t0) / iters, tm;
     MPI_Allreduce(&t, &tm, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (r == 0) {
         /* data leaving one node per alltoall: ranks_on_node * (ranks off node) * bytes */
         double rpn = (double)p / nnodes, off = (double)p - rpn;
         double gbs = nnodes > 1 ? rpn * off * n * 8.0 / tm / 1e9 : 0.0;
-        printf("%s ranks=%d nodes=%d bytes_per_pair=%ld a2a_us=%.1f GBs_node_offnode=%.2f lib=\"%s\"\n",
-               allbad ? "HELLO_FAIL(data)" : "HELLO_OK", p, nnodes, n * 8, tm * 1e6, gbs, lib);
+        printf("%s ranks=%d nodes=%d func=%s bytes_per_pair=%ld a2a_us=%.1f GBs_node_offnode=%.2f lib=\"%s\"\n",
+               allbad ? "HELLO_FAIL(data)" : "HELLO_OK", p, nnodes, use_v ? "alltoallv" : "alltoall", n * 8, tm * 1e6, gbs, lib);
         fflush(stdout);
     }
-    free(sb); free(rb);
+    free(sb); free(rb); free(cnt); free(dsp);
     MPI_Comm_free(&node);
     MPI_Finalize();
     return allbad;

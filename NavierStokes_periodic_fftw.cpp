@@ -532,6 +532,28 @@ int main(int argc, char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
         cout << "FFTW planning time: " << MPI_Wtime() - t_plan_start << " s" << endl;
+    // NS_PRINT_PLAN=1：rank 0 打印正、逆 plan（FFTW 选中的 MPI 转置方式，如 mpi-transpose-alltoall / -pairwise）。
+    // 默认不打印。FFTW 3.3.5 之前没有 fftw_sprint_plan：编译时加 -DNS_FFTW_NO_SPRINT 改用 fftw_fprint_plan。
+    if (rank == 0 && getenv("NS_PRINT_PLAN") && !strcmp(getenv("NS_PRINT_PLAN"), "1")) {
+        const fftw_plan plans[2] = {plan_r2c, plan_c2r};
+        const char* names[2] = {"forward r2c", "backward c2r"};
+        for (int k = 0; k < 2; ++k) {
+            cout << "FFTW PLAN: ---- " << names[k] << " (rank 0)" << endl;
+#ifndef NS_FFTW_NO_SPRINT
+            char* txt = fftw_sprint_plan(plans[k]);
+#else
+            char* txt = nullptr; size_t len = 0;
+            FILE* ms = open_memstream(&txt, &len);
+            if (ms) { fftw_fprint_plan(plans[k], ms); fclose(ms); }
+#endif
+            if (txt) {
+                for (char* line = strtok(txt, "\n"); line; line = strtok(nullptr, "\n"))
+                    cout << "FFTW PLAN: " << line << "\n";
+                free(txt);
+            }
+            cout << flush;
+        }
+    }
 
     // ------------------------------------------------------------------
     // 初始条件（t=0）

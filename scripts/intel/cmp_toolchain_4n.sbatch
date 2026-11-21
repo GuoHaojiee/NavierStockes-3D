@@ -11,18 +11,27 @@
 # cmp_toolchain_4n — GCC toolchain (GCC container, Open MPI, srun --mpi=pmix) vs Intel toolchain (v2 image, Intel MPI
 #   started by irun_mn = hello_2node E6d_a2a3 settings, KMP_BLOCKTIME=0), 4 nodes, the CPU solvers.
 #   Libraries: FFTW, AccFFT, P3DFFT, heFFTe; NS_DECOMP=slab, NS_FFTW_PLAN=measure; per node 128x1 and 64x2
-#   (512 ranks x 1 thread, 256 ranks x 2 threads); bench mode; 2 repetitions, repetition = OUTER loop, the two
+#   (512 ranks x 1 thread, 256 ranks x 2 threads); bench mode; 2 repetitions, repetition = OUTER loop, the
 #   toolchains alternate (gcc, intel, gcc, intel ...).
 #     gcc    /work/build/bin_gcc/{ns_fftw,ns_accfft,ns_heffte_v2}, /work/build/bin_p3d/gcc/ns_p3dfft
 #     intel  /work/build/bin_intel/{ns_fftw,ns_accfft}, ns_heffte_v2_mkl + NS_HEFFTE_REORDER=1,
 #            /work/build/bin_p3d/intel/ns_p3dfft
+#   Both sides can be tuned the same way (results of hello_2node R/RT/E6/E7):
+#     GCC    every OMPI_MCA_* variable of the sbatch environment is passed to the ranks unchanged, AFTER run_env.sh
+#            (e.g. --export=ALL,OMPI_MCA_coll_tuned_use_dynamic_rules=1,OMPI_MCA_coll_tuned_alltoall_algorithm=2);
+#            CT4_GCC_ENV="UCX_NET_DEVICES=..." adds other variables. All of them are printed at the start.
+#     Intel  intel_mn_env.sh switches IMN_ALLTOALL (3), IMN_ALLTOALLV (unset), ...; CT4_INTEL_A2A="3 def" runs the
+#            Intel side once per I_MPI_ADJUST_ALLTOALL setting (labels intel-a3, intel-def; one setting: label intel).
 #   Argument = grid (one grid per job, the parser needs one reference energy per log):
 #     dry    64^3, dt=5e-5, 10 steps, energy 3.3526466678e+05, one run per library and toolchain, 4 nodes x 16x8
 #            (slab needs ranks <= N: 64 ranks)  — run this first
-#     512    512^3, dt=1e-6, 20 steps, energy 1.7933833444e+08
+#     512    512^3, dt=1e-6, 10 steps, energy 1.7950250065e+08
 #     1024   1024^3, dt=1e-6, 10 steps, energy 1.4360200052e+09
+#   UCX: MPI rank 0 of every run prints the UCX it really loaded (scripts/cpu_final/ucx_probe.c via LD_PRELOAD); the
+#   log gets "UCX: <label> rep=<r> version=<v>" and, for Intel on more than one node without 1.17.0,
+#   "WARNING: UCX <v> loaded, expected 1.17.0".
 # Estimate: 4 libraries x 2 toolchains x 2 layouts x 2 repetitions = 32 runs per grid.
-#   512^3 : ~1-1.5 min per run (container start on 4 nodes, MEASURE planning, 20 short steps) -> 35-50 min
+#   512^3 : ~1-1.5 min per run (container start on 4 nodes, MEASURE planning, 10 short steps) -> 35-50 min
 #   1024^3: ~2-4 min per run (planning and memory 8x larger, steps ~1-2 s)                   -> 65-130 min
 #   together 1.7-3 h, too close to 3 h: one job per grid.
 #     sbatch -J ct4dry   -t 00:30:00 cmp_toolchain_4n.sbatch dry
@@ -30,7 +39,8 @@
 #     sbatch -J ct4_1024 -t 03:00:00 cmp_toolchain_4n.sbatch 1024
 # Results:  bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4_512_*.out | head -1)
 # Options (environment at sbatch time): CT4_REP (2), CT4_LAYOUTS ("128x1 64x2"), CT4_LIBS ("fftw accfft p3dfft heffte"),
-#   CT4_IMAGE (v2), CT4_STEPS, and the irun_mn switches IMN_ALLTOALLV (1|2), IMN_ALLTOALL (3), IMN_PIN (slurm|intel).
+#   CT4_IMAGE (v2), CT4_STEPS, CT4_INTEL_A2A, CT4_GCC_ENV, CT4_PRINT_PLAN=1 (FFTW prints its plans, NS_PRINT_PLAN=1),
+#   the irun_mn switches IMN_ALLTOALLV (1|2), IMN_ALLTOALL (3), IMN_PIN (slurm|intel), and OMPI_MCA_*.
 GRID=${1:?usage: sbatch cmp_toolchain_4n.sbatch dry|512|1024}
 export INTEL_IMAGE=${CT4_IMAGE:-v2}
 source ~/guohaojie/src/NavierStockes-3D/scripts/intel/intel_common.sh
@@ -38,51 +48,84 @@ precheck
 NN=${SLURM_JOB_NUM_NODES:-4}
 case $GRID in
 dry)  N=64;   DT=5e-5; NS=${CT4_STEPS:-10}; EREF=3.3526466678e+05; REP=1;             LAYOUTS=${CT4_LAYOUTS:-"16x8"} ;;
-512)  N=512;  DT=1e-6; NS=${CT4_STEPS:-20}; EREF=1.7933833444e+08; REP=${CT4_REP:-2}; LAYOUTS=${CT4_LAYOUTS:-"128x1 64x2"} ;;
+512)  N=512;  DT=1e-6; NS=${CT4_STEPS:-10}; EREF=1.7950250065e+08; REP=${CT4_REP:-2}; LAYOUTS=${CT4_LAYOUTS:-"128x1 64x2"} ;;
 1024) N=1024; DT=1e-6; NS=${CT4_STEPS:-10}; EREF=1.4360200052e+09; REP=${CT4_REP:-2}; LAYOUTS=${CT4_LAYOUTS:-"128x1 64x2"} ;;
 *) echo "unknown grid $GRID (dry|512|1024)"; exit 1 ;;
 esac
+[ "$NS" != 10 ] && [ $GRID != dry ] && echo "WARNING: CT4_STEPS=$NS: the reference energy $EREF is for 10 steps"
 LIBS=${CT4_LIBS:-"fftw accfft p3dfft heffte"}
+INTEL_A2A=${CT4_INTEL_A2A:-""}          # "" = one Intel run with intel_mn_env.sh defaults (label intel)
 GBIN=/work/build/bin_gcc; IBIN=/work/build/bin_intel; PBIN=/work/build/bin_p3d
-COMMON="NS_FFTW_PLAN=measure NS_DECOMP=slab"
-KEEP="^decomposition:|process grid|MPI reshapes|heFFTe backend|heFFTe plan options|planner flag|P3DFFT library|planning time|plan time|\(planning\) time|Kinetic energy|Avg per step:|FFT \(incl|rror|abort|intel_mn_env:|BIND |MPI startup\(\): +(Rank|Intel|libfabric provider|[0-9]+ )"
+COMMON="NS_FFTW_PLAN=measure NS_DECOMP=slab"; [ "$CT4_PRINT_PLAN" = 1 ] && COMMON="$COMMON NS_PRINT_PLAN=1"
+KEEP="^decomposition:|process grid|MPI reshapes|heFFTe backend|heFFTe plan options|planner flag|P3DFFT library|Running on|Threads \(runtime\)|planning time|plan time|\(planning\) time|Kinetic energy|Avg per step:|FFT \(incl|rror|abort|intel_mn_env:|BIND |UCXPROBE|OMPI_MCA_|FFTW PLAN: (----|.*mpi-)|MPI startup\(\): +(Rank|Intel|libfabric provider|[0-9]+ )"
 TL=$([ $GRID = 1024 ] && echo 30 || echo 15)          # srun time limit per run, minutes
+TMP=$SCR/logs/ct4_$SLURM_JOB_ID.d; WTMP=/work/logs/ct4_$SLURM_JOB_ID.d; mkdir -p $TMP
+# GCC side: OMPI_MCA_* of the sbatch environment (+ CT4_GCC_ENV), exported after run_env.sh
+GENV="$(env | grep -E '^OMPI_MCA_' | sort | tr '\n' ' ') ${CT4_GCC_ENV:-}"
 
+# UCX probe (rank 0 prints the libucp it mapped): one build per container
+srun -N1 -n1 --time=3 $M  bash -c "gcc -O2 -shared -fPIC /work/src/NavierStockes-3D/scripts/cpu_final/ucx_probe.c -o $WTMP/ucx_probe_gcc.so -ldl" || echo "WARNING: no UCX probe for the GCC side"
+srun -N1 -n1 --time=3 $MI bash -c "source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1; icx -O2 -shared -fPIC /work/src/NavierStockes-3D/scripts/cpu_final/ucx_probe.c -o $WTMP/ucx_probe_intel.so -ldl" || echo "WARNING: no UCX probe for the Intel side"
+PG=""; [ -f $TMP/ucx_probe_gcc.so ] && PG="export LD_PRELOAD=$WTMP/ucx_probe_gcc.so;"
+PI=""; [ -f $TMP/ucx_probe_intel.so ] && PI="LD_PRELOAD=$WTMP/ucx_probe_intel.so"
+
+# ucx_check <label> <side> <raw file>
+ucx_check() {
+    local v; v=$(grep -m1 -oE "UCXPROBE version=[^ ]+" $3 | cut -d= -f2)
+    echo "UCX: $1 rep=$rep version=${v:-unknown}"
+    if [ $2 = intel ] && [ $NN -gt 1 ] && [ "$v" != 1.17.0 ]; then echo "WARNING: UCX ${v:-unknown} loaded, expected 1.17.0 ($1 rep=$rep)"; fi
+}
 # G <label> <ranks/node> <threads> "<extra env>" <binary>    GCC container, Open MPI, srun --mpi=pmix
 G() {
-    local label=$1 ppn=$2 nt=$3 envs="$COMMON $4" bin=$5
-    echo ">>> [$(date +%H:%M:%S)] ${label} ranks=$((NN * ppn)) threads=$nt plan=measure | nodes=$NN ppn=$ppn $envs $bin $N $N $N $DT $NS $nt bench"
+    local label=$1 ppn=$2 nt=$3 envs="$COMMON $4" bin=$5 raw=$TMP/$1.r$rep.raw rc
+    echo ">>> [$(date +%H:%M:%S)] ${label} ranks=$((NN * ppn)) threads=$nt plan=measure | nodes=$NN ppn=$ppn $envs ${GENV:+[$GENV]} $bin $N $N $N $DT $NS $nt bench"
     srun --mpi=pmix --cpu-bind=cores --time=$TL -N $NN --ntasks-per-node=$ppn -c $nt $M bash -c "export NS_MODE=cpu; source /work/build/run_env.sh; \
-        export OMP_NUM_THREADS=$nt OMP_PLACES=cores OMP_PROC_BIND=close $envs; exec $bin $N $N $N $DT $NS $nt bench" 2>&1 | grep -E "$KEEP"
-    echo "<<< exit=${PIPESTATUS[0]}"; echo
+        export OMP_NUM_THREADS=$nt OMP_PLACES=cores OMP_PROC_BIND=close $envs $GENV; \
+        [ \${SLURM_PROCID:-0} = 0 ] && env | grep -E '^OMPI_MCA_coll|^UCX_NET' | sort | tr '\\n' ' ' && echo; \
+        $PG exec $bin $N $N $N $DT $NS $nt bench" > $raw 2>&1
+    rc=$?
+    grep -E "$KEEP" $raw; ucx_check $label gcc $raw
+    echo "<<< exit=$rc"; echo
 }
-# I <label> <ranks/node> <threads> "<extra env>" <binary>    v2 image, Intel MPI, irun_mn (E6d settings)
+# I <label> <ranks/node> <threads> "<extra env>" <binary> [I_MPI_ADJUST_ALLTOALL: 3|def]    v2 image, irun_mn
 I() {
-    local label=$1 ppn=$2 nt=$3 envs="$COMMON $4" bin=$5
-    echo ">>> [$(date +%H:%M:%S)] ${label} ranks=$((NN * ppn)) threads=$nt plan=measure | nodes=$NN ppn=$ppn KMP_BLOCKTIME=0 $envs $bin $N $N $N $DT $NS $nt bench"
+    local label=$1 ppn=$2 nt=$3 envs="$COMMON $4" bin=$5 a2a=$6 raw=$TMP/$1.r$rep.raw rc imn
+    case "$a2a" in "") imn=${IMN_ALLTOALL-3};; def) imn="";; *) imn=$a2a;; esac
+    echo ">>> [$(date +%H:%M:%S)] ${label} ranks=$((NN * ppn)) threads=$nt plan=measure | nodes=$NN ppn=$ppn KMP_BLOCKTIME=0 IMN_ALLTOALL=${imn:-default} $envs $bin $N $N $N $DT $NS $nt bench"
     local first=""; [ -z "$IFIRST_DONE" ] && { first=1; IFIRST_DONE=1; }
-    IRUN_SRUN_OPTS="--time=$TL" IMN_DEBUG=${first:+4} IMN_SHOWBIND=$first \
-    irun_mn $NN $ppn $nt "export KMP_BLOCKTIME=0 MKL_NUM_THREADS=$nt $envs; exec $bin $N $N $N $DT $NS $nt bench" 2>&1 \
-        | grep -E "$KEEP" | awk '/MPI startup\(\): +[0-9]/ { if (++k > 4) next } 1'
-    echo "<<< exit=${PIPESTATUS[0]}"; echo
+    IMN_ALLTOALL=$imn IRUN_SRUN_OPTS="--time=$TL" IMN_DEBUG=${first:+4} IMN_SHOWBIND=$first \
+    irun_mn $NN $ppn $nt "export KMP_BLOCKTIME=0 MKL_NUM_THREADS=$nt $envs $PI; exec $bin $N $N $N $DT $NS $nt bench" > $raw 2>&1
+    rc=$?
+    grep -E "$KEEP" $raw | awk '/MPI startup\(\): +[0-9]/ { if (++k > 4) next } 1'; ucx_check $label intel $raw
+    echo "<<< exit=$rc"; echo
 }
-# R <lib> <layout> — one gcc run and one intel run of a library; label <Lib>-<N>_<toolchain>_<layout>
+# II <Lib> <layout> <ppn> <nt> "<extra env>" <binary> — the Intel side, once per CT4_INTEL_A2A setting
+II() {
+    local s
+    if [ -z "$INTEL_A2A" ]; then I $1-${N}_intel_$2 $3 $4 "$5" $6
+    else for s in $INTEL_A2A; do
+             if [ $s = def ]; then I $1-${N}_intel-def_$2 $3 $4 "$5" $6 def; else I $1-${N}_intel-a${s}_$2 $3 $4 "$5" $6 $s; fi
+         done; fi
+}
+# R <lib> <layout> — one gcc run and the Intel run(s) of a library; label <Lib>-<N>_<toolchain>_<layout>
 R() {
     local lib=$1 L=$2 ppn=${2%x*} nt=${2#*x}
     case $lib in
     fftw)   G FFTW-${N}_gcc_$L     $ppn $nt "" $GBIN/ns_fftw
-            I FFTW-${N}_intel_$L   $ppn $nt "" $IBIN/ns_fftw ;;
+            II FFTW   $L $ppn $nt "" $IBIN/ns_fftw ;;
     accfft) G AccFFT-${N}_gcc_$L   $ppn $nt "" $GBIN/ns_accfft
-            I AccFFT-${N}_intel_$L $ppn $nt "" $IBIN/ns_accfft ;;
+            II AccFFT $L $ppn $nt "" $IBIN/ns_accfft ;;
     p3dfft) G P3DFFT-${N}_gcc_$L   $ppn $nt "" $PBIN/gcc/ns_p3dfft
-            I P3DFFT-${N}_intel_$L $ppn $nt "" $PBIN/intel/ns_p3dfft ;;
+            II P3DFFT $L $ppn $nt "" $PBIN/intel/ns_p3dfft ;;
     heffte) G heFFTe-${N}_gcc_$L   $ppn $nt "" $GBIN/ns_heffte_v2
-            I heFFTe-${N}_intel_$L $ppn $nt "NS_HEFFTE_REORDER=1" $IBIN/ns_heffte_v2_mkl ;;
+            II heFFTe $L $ppn $nt "NS_HEFFTE_REORDER=1" $IBIN/ns_heffte_v2_mkl ;;
     esac
 }
 
 echo "grid=$GRID N=$N dt=$DT steps=$NS energy_ref=$EREF reps=$REP layouts(per node)=$LAYOUTS libs=$LIBS nodes=$NN ($SLURM_JOB_NODELIST)"
-echo "IMN: ALLTOALL=${IMN_ALLTOALL-3} ALLTOALLV=${IMN_ALLTOALLV:-default} PIN=${IMN_PIN:-slurm}"
+echo "IMN: ALLTOALL=${IMN_ALLTOALL-3} ALLTOALLV=${IMN_ALLTOALLV:-default} PIN=${IMN_PIN:-slurm} CT4_INTEL_A2A=${INTEL_A2A:-<intel_mn_env default>}"
+echo "GCC env (after run_env.sh): ${GENV:-<none: Open MPI defaults of run_env.sh>}"
+echo "UCX probe: gcc ${PG:-none} intel ${PI:-none}"
 for b in $SCR/build/bin_gcc/ns_fftw $SCR/build/bin_gcc/ns_accfft $SCR/build/bin_gcc/ns_heffte_v2 $SCR/build/bin_p3d/gcc/ns_p3dfft \
          $SCR/build/bin_intel/ns_fftw $SCR/build/bin_intel/ns_accfft $SCR/build/bin_intel/ns_heffte_v2_mkl $SCR/build/bin_p3d/intel/ns_p3dfft; do
     [ -x $b ] && echo "  $(ls -l --time-style=+%F_%R $b | awk '{print $6, $7}')" || echo "  MISSING $b"

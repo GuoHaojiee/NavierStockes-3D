@@ -2,7 +2,7 @@
  * really loaded (the solvers themselves are not changed):
  *     UCXPROBE version=<x.y.z|none> lib=<path of libucp|-> uct=<path of libuct|->
  * "none": no libucp was mapped (single node with I_MPI_FABRICS=shm does not load libfabric/UCX).
- * Rank: PMI_RANK (Intel MPI hydra / PMI-2) if set, otherwise SLURM_PROCID. Processes without a rank (mpirun,
+ * Rank: the first set of PMI_RANK (Intel MPI hydra / PMI-2), PMIX_RANK, OMPI_COMM_WORLD_RANK, SLURM_PROCID. Processes without a rank (mpirun,
  * hydra proxies) print nothing — single-node runs pass the library with mpirun -genv, so they never see it.
  * The version comes from ucp_get_version() of the libucp already in the process (dlopen RTLD_NOLOAD).
  * Build:  icx -O2 -shared -fPIC ucx_probe.c -o ucx_probe.so -ldl                                        */
@@ -13,8 +13,9 @@
 #include <string.h>
 
 static int is_rank0(void) {
-    const char* r = getenv("PMI_RANK");
-    if (!r || !*r) r = getenv("SLURM_PROCID");
+    const char* names[] = {"PMI_RANK", "PMIX_RANK", "OMPI_COMM_WORLD_RANK", "SLURM_PROCID", 0};
+    const char* r = 0;
+    for (int i = 0; names[i] && !(r && *r); ++i) r = getenv(names[i]);
     return r && !strcmp(r, "0");
 }
 
