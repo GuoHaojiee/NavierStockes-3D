@@ -280,6 +280,75 @@ inline void heffte_options_from_env(heffte::plan_options& opt, int rank, MPI_Com
         std::fflush(stdout);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Slab layouts of the multi-GPU heFFTe solvers (heffte_mgpu, heffte_multigpu)
+//   NS_HEFFTE_LAYOUT = zslab (default) | xslab
+//   heFFTe box index 0 = x = fastest-varying, 2 = z = slowest (the solvers' real arrays: x fastest).
+//   zslab: real space split along z {1,1,P}, r2c along x (dim 0, contiguous), spectral split along y {1,P,1}
+//          -> complex box (NX/2+1) x NY x NZ, kx = 0..NX/2.  Needs NY, NZ >= P.  (cuFFTMp-like)
+//   xslab: real space split along x {P,1,1}, r2c along z (dim 2), spectral split along y {1,P,1}
+//          -> complex box NX x NY x (NZ/2+1), kz = 0..NZ/2.  Needs NX, NY >= P.  (the earlier layout)
+//   Both need one MPI reshape per transform. The spectral kernels fold all three indices
+//   (g <= N/2 ? g : g - N), which is the identity on the halved r2c dimension, so they are the
+//   same for both layouts.
+// Read on rank 0 and broadcast; an unknown value or a too small grid aborts.
+// -----------------------------------------------------------------------------
+struct HeffteSlab {
+    std::string name;
+    std::array<int, 3> pg, pg_c;        // processor grids: real space, spectral space
+    int r2c;                            // r2c direction (heFFTe dimension)
+    heffte::box3d<> world_r, world_c;
+};
+inline HeffteSlab heffte_slab_from_env(int NX, int NY, int NZ, int P, int rank, MPI_Comm comm = MPI_COMM_WORLD) {
+    int v[2] = {0, 0};                  // v[0]: 0 zslab, 1 xslab; v[1]: 1 = invalid value
+    if (rank == 0) {
+        const char* s = std::getenv("NS_HEFFTE_LAYOUT");
+        if (!s || !std::strcmp(s, "zslab")) v[0] = 0;
+        else if (!std::strcmp(s, "xslab"))  v[0] = 1;
+        else { std::fprintf(stderr, "Error: NS_HEFFTE_LAYOUT=%s (expected zslab|xslab)\n", s); v[1] = 1; }
+    }
+    MPI_Bcast(v, 2, MPI_INT, 0, comm);
+    if (v[1]) MPI_Abort(comm, 1);
+    const heffte::box3d<> world_r({0, 0, 0}, {NX - 1, NY - 1, NZ - 1});
+    if (v[0] == 0) {
+        if (NZ < P || NY < P) {
+            if (rank == 0) std::fprintf(stderr, "Error: zslab needs NZ (%d) and NY (%d) >= number of ranks (%d)\n", NZ, NY, P);
+            MPI_Abort(comm, 1);
+        }
+        return HeffteSlab{"zslab", {1, 1, P}, {1, P, 1}, 0, world_r,
+                          heffte::box3d<>({0, 0, 0}, {NX / 2, NY - 1, NZ - 1})};
+    }
+    if (NX < P || NY < P) {
+        if (rank == 0) std::fprintf(stderr, "Error: xslab needs NX (%d) and NY (%d) >= number of ranks (%d)\n", NX, NY, P);
+        MPI_Abort(comm, 1);
+    }
+    return HeffteSlab{"xslab", {P, 1, 1}, {1, P, 1}, 2, world_r,
+                      heffte::box3d<>({0, 0, 0}, {NX - 1, NY - 1, NZ / 2})};
+}
+// MPI reshapes per transform of the plan heFFTe builds for these boxes (as in heFFTe's
+// benchmarks/speed3d.h): a stage whose processor grid differs from the previous one is a reshape.
+inline int heffte_reshapes_per_fft(const std::vector<heffte::box3d<>>& in, const std::vector<heffte::box3d<>>& out,
+                                   int r2c, const heffte::plan_options& opt, int rank) {
+    heffte::logic_plan3d<int> lp = heffte::plan_operations<int>({in, out}, r2c, opt, rank);
+    std::vector<std::array<int, 3>> grids = heffte::compute_grids(lp);
+    int n = 0;
+    for (size_t i = 1; i < grids.size(); ++i) if (grids[i] != grids[i - 1]) ++n;
+    return n;
+}
+// One line for people and one for scripts (grep "^HEFFTE_PLAN").
+inline void heffte_print_plan(const char* layout, const std::array<int, 3>& pg, const std::array<int, 3>& pg_c, int r2c,
+                              const heffte::plan_options& opt, int reshapes, int rank) {
+    if (rank != 0) return;
+    static const char* dn[3] = {"x", "y", "z"};
+    std::printf("heFFTe layout: %s, real %dx%dx%d, spectral %dx%dx%d, r2c along %s (dim %d), reorder = %d, "
+                "algorithm = %s, MPI reshapes per FFT = %d\n",
+                layout, pg[0], pg[1], pg[2], pg_c[0], pg_c[1], pg_c[2], dn[r2c], r2c, opt.use_reorder ? 1 : 0,
+                heffte_algo_name(opt.algorithm), reshapes);
+    std::printf("HEFFTE_PLAN layout=%s r2c_dir=%d reorder=%d algo=%s reshapes=%d\n",
+                layout, r2c, opt.use_reorder ? 1 : 0, heffte_algo_name(opt.algorithm), reshapes);
+    std::fflush(stdout);
+}
 } // namespace nsmode
 #endif
 

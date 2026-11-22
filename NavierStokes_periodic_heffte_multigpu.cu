@@ -6,8 +6,15 @@
  * GPU assignment: MPI_Comm_split_type(MPI_COMM_TYPE_SHARED) gives each rank its
  * local index within the node; cudaSetDevice(local_rank).
  *
- * heFFTe manages 2D pencil decomposition and GPU-to-GPU MPI communication
+ * heFFTe manages the slab decomposition and GPU-to-GPU MPI communication
  * across nodes. Requires CUDA-aware MPI (NCCL-backed or UCX CUDA).
+ *
+ * Data layout (NS_HEFFTE_LAYOUT, default zslab):
+ *   zslab: real space in z slabs, r2c along x (the contiguous dimension), spectral space in y slabs;
+ *          complex box (NX/2+1) x NY x NZ.  One MPI reshape per FFT.  Needs NY, NZ >= ranks.
+ *   xslab: the earlier layout: x slabs, r2c along z, y slabs; NX x NY x (NZ/2+1).  Needs NX, NY >= ranks.
+ *   Defaults NS_HEFFTE_ALGO=p2p_plined, NS_HEFFTE_REORDER=0.  Rank 0 prints the layout, the r2c
+ *   direction, reorder, the algorithm and the reshapes per FFT ("heFFTe layout:" / "HEFFTE_PLAN").
  *
  * Run (example: 2 nodes × 4 GPUs each):
  *   mpirun -np 8 --map-by ppr:4:node ./navier_stokes_heffte_multigpu
@@ -48,7 +55,7 @@ typedef cufftDoubleComplex GCplx;
 static int    NX, NY, NZ, NT_TOTAL, NT_RUN;
 static double LX, LY, LZ, DX, DY, DZ, TAU;
 
-__device__ __constant__ int    d_NX, d_NY;
+__device__ __constant__ int    d_NX, d_NY, d_NZ;
 __device__ __constant__ double d_DX, d_DY, d_DZ;
 
 constexpr int BLOCK = 256;
@@ -107,8 +114,12 @@ __global__ void kernel_error_sq(const GReal* V1,const GReal* V2,const GReal* V3,
 __global__ void kernel_energy_sq(const GReal* V1,const GReal* V2,const GReal* V3,GReal* out,long long n){
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
     double v1=V1[idx],v2=V2[idx],v3=V3[idx];out[idx]=v1*v1+v2*v2+v3*v3;}
+// Wavenumber of a global spectral index: g <= N/2 ? g : g - N in all three dimensions. On the halved
+// r2c dimension (x for zslab, z for xslab; indices 0..N/2) this is the identity, so the same
+// kernels serve both layouts (NS_HEFFTE_LAYOUT, see common_mode.h). Nyquist modes get +N/2.
 static __device__ __forceinline__ double kx_fold(int gi){return gi<=d_NX/2?(double)gi:(double)(gi-d_NX);}
 static __device__ __forceinline__ double ky_fold(int gj){return gj<=d_NY/2?(double)gj:(double)(gj-d_NY);}
+static __device__ __forceinline__ double kz_fold(int gk){return gk<=d_NZ/2?(double)gk:(double)(gk-d_NZ);}
 // Kernel A: rot = ik × V and rhs = -k² V in one pass (outbox layout, x fastest)
 __global__ void kernel_rot_and_viscous(const GCplx* V1, const GCplx* V2, const GCplx* V3,
     GCplx* R1, GCplx* R2, GCplx* R3, GCplx* H1, GCplx* H2, GCplx* H3,
@@ -117,7 +128,7 @@ __global__ void kernel_rot_and_viscous(const GCplx* V1, const GCplx* V2, const G
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
+    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=kz_fold(lk+lo2);
     double k2=kx*kx+ky*ky+kz*kz;
     GCplx v1=V1[idx],v2=V2[idx],v3=V3[idx];
     R1[idx].x=-(ky*v3.y-kz*v2.y); R1[idx].y=ky*v3.x-kz*v2.x;
@@ -149,7 +160,7 @@ __global__ void kernel_rk4_stage(GCplx* V1, GCplx* V2, GCplx* V3,
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;
     if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
+    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=kz_fold(lk+lo2);
     double k2=kx*kx+ky*ky+kz*kz;
     double s1x=h1[idx].x, s1y=h1[idx].y, s2x=h2[idx].x, s2y=h2[idx].y, s3x=h3[idx].x, s3y=h3[idx].y;
     if(f1){ s1x+=f1[idx].x; s1y+=f1[idx].y; s2x+=f2[idx].x; s2y+=f2[idx].y; s3x+=f3[idx].x; s3y+=f3[idx].y; }
@@ -181,7 +192,7 @@ __global__ void kernel_rk4_stage(GCplx* V1, GCplx* V2, GCplx* V3,
 __global__ void kernel_make_div_free(GCplx* V1,GCplx* V2,GCplx* V3,int lo0,int lo1,int lo2,int s0,int s1,int s2,long long n){
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
+    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=kz_fold(lk+lo2);
     double k2=kx*kx+ky*ky+kz*kz;if(k2<1e-10)return;
     double dr=-(kx*V1[idx].y+ky*V2[idx].y+kz*V3[idx].y),di=kx*V1[idx].x+ky*V2[idx].x+kz*V3[idx].x;
     double pr=dr/(-k2),pi=di/(-k2);
@@ -189,7 +200,7 @@ __global__ void kernel_make_div_free(GCplx* V1,GCplx* V2,GCplx* V3,int lo0,int l
 __global__ void kernel_div_abs(const GCplx* V1,const GCplx* V2,const GCplx* V3,GReal* out,int lo0,int lo1,int lo2,int s0,int s1,int s2,long long n){
     long long idx=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(idx>=n)return;
     int li=(int)(idx%s0),lj=(int)((idx/s0)%s1),lk=(int)(idx/((long long)s0*s1));
-    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=(double)(lk+lo2);
+    double kx=kx_fold(li+lo0),ky=ky_fold(lj+lo1),kz=kz_fold(lk+lo2);
     double dr=-(kx*V1[idx].y+ky*V2[idx].y+kz*V3[idx].y),di=kx*V1[idx].x+ky*V2[idx].x+kz*V3[idx].x;
     out[idx]=sqrt(dr*dr+di*di);}
 
@@ -362,6 +373,7 @@ int main(int argc, char** argv) {
 
     CUDA_CHECK(cudaMemcpyToSymbol(d_NX,&NX,sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_NY,&NY,sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_NZ,&NZ,sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_DX,&DX,sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_DY,&DY,sizeof(double)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_DZ,&DZ,sizeof(double)));
@@ -382,30 +394,29 @@ int main(int argc, char** argv) {
     if (rank==0) cout << "============================================================\n";
 
     {
-    heffte::box3d<> world_r={{0,0,0},{NX-1,NY-1,NZ-1}};
-    heffte::box3d<> world_c={{0,0,0},{NX-1,NY-1,NZ/2}};
-    // Real space: slabs along X (Nx1x1). Spectral space: slabs along Y (1xNx1), the
-    // same layout as cuFFTMp. heFFTe then needs one reshape per transform instead of
-    // two (checked with heffte::plan_operations). The spectral kernels take their
-    // ranges from outbox_c (BoxGPU bc), so they do not depend on the split.
-    if (NX < nprocs || NY < nprocs) {
-        if (rank==0) fprintf(stderr,"Error: slab decomposition needs NX (%d) and NY (%d) >= number of ranks (%d)\n",NX,NY,nprocs);
-        MPI_Abort(MPI_COMM_WORLD,1);
-    }
-    std::array<int,3> pg = {nprocs, 1, 1}, pg_c = {1, nprocs, 1};
-    auto inboxes=heffte::split_world(world_r,pg);
-    auto outboxes=heffte::split_world(world_c,pg_c);
+    // Slab layout (NS_HEFFTE_LAYOUT, default zslab; see common_mode.h):
+    //   zslab: real slabs along z {1,1,P}, r2c along x (contiguous), spectral slabs along y {1,P,1}
+    //          (the cuFFTMp layout)
+    //   xslab: real slabs along x {P,1,1}, r2c along z,               spectral slabs along y {1,P,1}
+    // One MPI reshape per transform in both. The real arrays keep x fastest in both layouts; the
+    // spectral kernels take their ranges from outbox_c (BoxGPU bc) and fold all three indices,
+    // so they do not depend on the layout.
+    nsmode::HeffteSlab lay = nsmode::heffte_slab_from_env(NX, NY, NZ, nprocs, rank);
+    auto inboxes=heffte::split_world(lay.world_r,lay.pg);
+    auto outboxes=heffte::split_world(lay.world_c,lay.pg_c);
     heffte::box3d<> inbox_r=inboxes[rank],outbox_c=outboxes[rank];
-    if(rank==0) cout<<"heFFTe slab grid: real "<<pg[0]<<"x"<<pg[1]<<"x"<<pg[2]
-                    <<", spectral "<<pg_c[0]<<"x"<<pg_c[1]<<"x"<<pg_c[2]<<"\n";
 
-    // Force GPU-aware MPI path; skip data reordering; use alltoallv collective.
+    // Defaults: GPU-aware MPI, point-to-point pipelined reshape, no reorder (both chosen with
+    // bench_fft/fb2: 1024^3 on 4 nodes 20.6 -> 13.6 ms per FFT together with zslab);
+    // NS_HEFFTE_ALGO / NS_HEFFTE_REORDER override them.
     auto options = heffte::default_options<heffte::backend::cufft>();
     options.use_gpu_aware = true;
     options.use_reorder   = false;
-    options.algorithm     = heffte::reshape_algorithm::alltoallv; 
-    nsmode::heffte_options_from_env(options, rank);   // NS_HEFFTE_ALGO / NS_HEFFTE_REORDER
-    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,2,MPI_COMM_WORLD,options);
+    options.algorithm     = heffte::reshape_algorithm::p2p_plined;
+    nsmode::heffte_options_from_env(options, rank);
+    nsmode::heffte_print_plan(lay.name.c_str(), lay.pg, lay.pg_c, lay.r2c, options,
+        nsmode::heffte_reshapes_per_fft(inboxes, outboxes, lay.r2c, options, rank), rank);
+    heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r,outbox_c,lay.r2c,MPI_COMM_WORLD,options);
     BoxGPU br=make_box(inbox_r),bc=make_box(outbox_c);
     long long nr=br.n(),nc=bc.n();
     GPUArrays g;alloc_arrays(g,nr,nc);

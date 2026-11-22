@@ -496,10 +496,15 @@ int main(int argc, char** argv) {
 
     if (rank==0) cout << "heFFTe pencil grid: " << pg[0] << "x" << pg[1] << "x" << pg[2] << "\n";
 
-    // Library defaults for the cufft backend (alltoallv, use_reorder = false), unless
-    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER.
+    // alltoallv and use_reorder = 0 unless NS_HEFFTE_ALGO / NS_HEFFTE_REORDER say otherwise.
+    // reorder is set explicitly (not left to the heFFTe build's default): on one A100 at 512^3,
+    // bench_fft/fb2 measured 7.3 ms per FFT with reorder 0 and 26.4 ms with reorder 1.
     auto options = heffte::default_options<heffte::backend::cufft>();
+    options.use_reorder = false;
+    options.algorithm   = heffte::reshape_algorithm::alltoallv;
     nsmode::heffte_options_from_env(options, rank);
+    nsmode::heffte_print_plan("min_surface", pg, pg, 2, options,
+        nsmode::heffte_reshapes_per_fft(inboxes, outboxes, 2, options, rank), rank);
     heffte::fft3d_r2c<heffte::backend::cufft> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
 
     BoxGPU br = make_box(inbox_r);
