@@ -11,6 +11,7 @@
 #include <omp.h>
 #include <sched.h>
 #include "common_mode.h"
+#include "fftlib/ns_fft_fftw.h"   // plan / execute code shared with scripts/fftbench
 
 using namespace std;
 
@@ -26,11 +27,9 @@ using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode
 // 使用FFTW MPI进行3D R2C/C2R变换
 // ==============================================================================
 
-// 全局FFTW计划（仅 2 个，通过 fftw_mpi_execute_dft_r2c/c2r 新执行 API 复用）
-// FFTW plan 描述"变换几何"（网格大小、类型、布局），与具体数组无关；
-// 只要所有数组均由 fftw_alloc_real/complex 分配（对齐保证），即可在执行时换指针。
-fftw_plan plan_r2c;  // 所有正变换（R2C）共用
-fftw_plan plan_c2r;  // 所有逆变换（C2R）共用
+// FFTW MPI 3D r2c/c2r: 2 plans (r2c, c2r) reused for all arrays via the new-array execute API
+// (fftw_mpi_execute_dft_r2c/c2r); see fftlib/ns_fft_fftw.h
+static nsfft::Fftw g_fft;
 
 // ==============================================================================
 // 解析解与强迫项（与 heFFTe/p3dfft 版本完全一致）
@@ -123,32 +122,7 @@ double func_f3(double x, double y, double z, double t) {
 // FFT 初始化和辅助函数
 // ==============================================================================
 
-/**
- * 初始化 FFTW MPI 3D 计划（仅创建 2 个）
- *
- * plan_r2c / plan_c2r 描述"变换几何"（nx×ny×nz，R2C/C2R，MPI 分解），
- * 与具体数组无关。执行时通过 fftw_mpi_execute_dft_r2c / _c2r 传入实际指针，
- * 前提：所有数组均由 fftw_alloc_real / fftw_alloc_complex 分配（对齐一致）。
- *
- * 对比旧方案：15 个 plan × FFTW_MEASURE 预计算 → 2 个，初始化开销显著降低。
- *
- * any_r : 任意一个已分配的实数组（大小 2*alloc_local），用于 plan 创建
- * any_c : 任意一个已分配的复数组（大小 alloc_local），用于 plan 创建
- * rigor : FFTW_ESTIMATE / FFTW_MEASURE / FFTW_PATIENT / FFTW_EXHAUSTIVE（由 NS_FFTW_PLAN 选择）
- */
-void initialize_fftw_3d(ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz,
-                        double *any_r, fftw_complex *any_c, unsigned rigor) {
-    // 谱空间保持转置布局 [y][x][z]（y 分布），省去正变换末尾和逆变换开头的全局转置
-    plan_r2c = fftw_mpi_plan_dft_r2c_3d(nx, ny, nz, any_r, any_c,
-                                         MPI_COMM_WORLD, rigor | FFTW_MPI_TRANSPOSED_OUT);
-    plan_c2r = fftw_mpi_plan_dft_c2r_3d(nx, ny, nz, any_c, any_r,
-                                         MPI_COMM_WORLD, rigor | FFTW_MPI_TRANSPOSED_IN);
-}
-
-void finalize_fft_plans() {
-    fftw_destroy_plan(plan_r2c);
-    fftw_destroy_plan(plan_c2r);
-}
+// FFT initialisation and plans: fftlib/ns_fft_fftw.h (nsfft::Fftw)
 
 // ==============================================================================
 // 频谱空间操作（谱空间为转置布局 [y_local][x][z]，y 按进程分布）
@@ -285,8 +259,8 @@ void rk4_stage(Fields& F, const Grid& g, double tau, double t, int stage) {
     g_timer.mark(PH_SPEC);
 
     // 2. 逆变换：V、rot → 实空间（之后 V 与 rot 的谱空间内容都不再使用）
-    for (int c = 0; c < 3; ++c) fftw_mpi_execute_dft_c2r(plan_c2r, F.V[c],   F.Vr[c]);
-    for (int c = 0; c < 3; ++c) fftw_mpi_execute_dft_c2r(plan_c2r, F.rot[c], F.rotr[c]);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.V[c],   F.Vr[c]);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.rot[c], F.rotr[c]);
     g_timer.mark(PH_FFT);
 
     // 3. 实空间叉乘 v × rot(v)，覆盖 rotr
@@ -306,7 +280,7 @@ void rk4_stage(Fields& F, const Grid& g, double tau, double t, int stage) {
     g_timer.mark(PH_PHYS);
 
     // 4. 正变换：叉乘 → rot（存放 nl，未归一化）
-    for (int c = 0; c < 3; ++c) fftw_mpi_execute_dft_r2c(plan_r2c, F.rotr[c], F.rot[c]);
+    for (int c = 0; c < 3; ++c) g_fft.forward(F.rotr[c], F.rot[c]);
     g_timer.mark(PH_FFT);
 
     // 5. 外力 [仅 verify]：填入空闲的 Vr，正变换到 V（未归一化，阶段循环中除以 N）
@@ -324,7 +298,7 @@ void rk4_stage(Fields& F, const Grid& g, double tau, double t, int stage) {
                 }
             }
         }
-        for (int c = 0; c < 3; ++c) fftw_mpi_execute_dft_r2c(plan_r2c, F.Vr[c], F.V[c]);
+        for (int c = 0; c < 3; ++c) g_fft.forward(F.Vr[c], F.V[c]);
         g_timer.mark(PH_FORCE);
     }
 
@@ -436,9 +410,7 @@ int main(int argc, char **argv) {
     // 工作线程继承主线程的 CPU 亲和性；设置 OMP_PROC_BIND/OMP_PLACES 时 libgomp 在启动时
     // 就把主线程绑到第一个 place，所有 FFTW 工作线程挤在同一个 place 上，FFT 退化为串行。
     // _omp 版直接使用 OpenMP 线程组，与逐点循环的线程绑定方式相同。
-    fftw_init_threads();
-    fftw_plan_with_nthreads(max_threads);
-    fftw_mpi_init();
+    g_fft.init(max_threads);      // fftw_init_threads, fftw_plan_with_nthreads, fftw_mpi_init
 
     if (rank == 0) {
         cout << "============================================================" << endl;
@@ -469,18 +441,16 @@ int main(int argc, char **argv) {
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << endl;
         // FFTW MPI 只有 slab（x 切分）；NS_DECOMP 不起作用，只打印出来便于核对
-        char pgrid[96];
-        snprintf(pgrid, sizeof pgrid, "%dx1 (x slabs; FFTW MPI is slab only, NS_DECOMP ignored)", size);
-        nsmode::print_decomp(nsmode::DECOMP_SLAB, pgrid);
+        g_fft.print_decomp();
         cout << "============================================================" << endl;
     }
 
     // 获取本地分配大小（FFTW MPI 1D slab 分解）
     // 实空间：x 分布 [x_local][y][z]；谱空间（转置输出）：y 分布 [y_local][x][z]
-    ptrdiff_t alloc_local, local_n0, local_0_start, local_n1, local_1_start;
-    alloc_local = fftw_mpi_local_size_3d_transposed(nx, ny, nz/2+1, MPI_COMM_WORLD,
-                                                    &local_n0, &local_0_start,
-                                                    &local_n1, &local_1_start);
+    g_fft.decompose(nx, ny, nz);
+    g_fft.setup();
+    const ptrdiff_t alloc_local = g_fft.alloc_local, local_n0 = g_fft.local_n0, local_0_start = g_fft.local_0_start,
+                    local_n1 = g_fft.local_n1, local_1_start = g_fft.local_1_start;
 
     // ------------------------------------------------------------------
     // 预分配所有内存（热循环中零动态分配）
@@ -513,47 +483,9 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     // 初始化所有 FFTW 计划（所有数组已预分配，指针固定）
     // ------------------------------------------------------------------
-    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient | exhaustive
-    const int rigor_id = nsmode::plan_rigor_from_env();
-    if (rigor_id == nsmode::PLAN_INVALID) {
-        if (rank == 0) cerr << "Error: NS_FFTW_PLAN must be estimate|measure|patient|exhaustive" << endl;
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    const unsigned rigor_flags[] = { FFTW_ESTIMATE, FFTW_MEASURE, FFTW_PATIENT, FFTW_EXHAUSTIVE };
-    if (rank == 0) cout << "FFTW planner flag: FFTW_" << nsmode::plan_rigor_name(rigor_id)
-                        << " (NS_FFTW_PLAN)" << endl;
-    if (rank == 0) cout << "Initializing FFTW plans..." << endl;
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_plan_start = MPI_Wtime();
-
-    // 只需任意一对合法缓冲区创建 plan；执行时通过 fftw_mpi_execute_* 换指针
-    initialize_fftw_3d(nx, ny, nz, V1_r, V1_c, rigor_flags[rigor_id]);
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (rank == 0)
-        cout << "FFTW planning time: " << MPI_Wtime() - t_plan_start << " s" << endl;
-    // NS_PRINT_PLAN=1：rank 0 打印正、逆 plan（FFTW 选中的 MPI 转置方式，如 mpi-transpose-alltoall / -pairwise）。
-    // 默认不打印。FFTW 3.3.5 之前没有 fftw_sprint_plan：编译时加 -DNS_FFTW_NO_SPRINT 改用 fftw_fprint_plan。
-    if (rank == 0 && getenv("NS_PRINT_PLAN") && !strcmp(getenv("NS_PRINT_PLAN"), "1")) {
-        const fftw_plan plans[2] = {plan_r2c, plan_c2r};
-        const char* names[2] = {"forward r2c", "backward c2r"};
-        for (int k = 0; k < 2; ++k) {
-            cout << "FFTW PLAN: ---- " << names[k] << " (rank 0)" << endl;
-#ifndef NS_FFTW_NO_SPRINT
-            char* txt = fftw_sprint_plan(plans[k]);
-#else
-            char* txt = nullptr; size_t len = 0;
-            FILE* ms = open_memstream(&txt, &len);
-            if (ms) { fftw_fprint_plan(plans[k], ms); fclose(ms); }
-#endif
-            if (txt) {
-                for (char* line = strtok(txt, "\n"); line; line = strtok(nullptr, "\n"))
-                    cout << "FFTW PLAN: " << line << "\n";
-                free(txt);
-            }
-            cout << flush;
-        }
-    }
+    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient | exhaustive；NS_PRINT_PLAN=1 打印 plan
+    // 只需任意一对合法缓冲区创建 plan；执行时通过 fftw_mpi_execute_* 换指针（fftlib/ns_fft_fftw.h）
+    g_fft.plan(V1_r, V1_c);
 
     // ------------------------------------------------------------------
     // 初始条件（t=0）
@@ -575,9 +507,9 @@ int main(int argc, char **argv) {
     }
 
     // 正变换 → 归一化（V_c = DFT(V_r)/N）
-    fftw_mpi_execute_dft_r2c(plan_r2c, V1_r, V1_c);
-    fftw_mpi_execute_dft_r2c(plan_r2c, V2_r, V2_c);
-    fftw_mpi_execute_dft_r2c(plan_r2c, V3_r, V3_c);
+    g_fft.forward(V1_r, V1_c);
+    g_fft.forward(V2_r, V2_c);
+    g_fft.forward(V3_r, V3_c);
 
     double norm_factor = (double)(nx * ny * nz);
     ptrdiff_t nz_c = nz/2+1;
@@ -619,9 +551,9 @@ int main(int argc, char **argv) {
         double t_final = nt_run * tau;
         // 散度须在 c2r 之前计算（多维 c2r 可能破坏输入 V_c）
         double max_div = compute_div_max(V1_c, V2_c, V3_c, nx, ny, nz, local_n1, local_1_start);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V1_c, V1_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V2_c, V2_r);
-        fftw_mpi_execute_dft_c2r(plan_c2r, V3_c, V3_r);
+        g_fft.backward(V1_c, V1_r);
+        g_fft.backward(V2_c, V2_r);
+        g_fft.backward(V3_c, V3_r);
         double local_err = 0.0, local_e = 0.0;
         if (mode == nsmode::MODE_VERIFY) {
             #pragma omp parallel for collapse(3) reduction(+:local_err)
@@ -679,7 +611,7 @@ int main(int argc, char **argv) {
     // ------------------------------------------------------------------
     // 清理
     // ------------------------------------------------------------------
-    finalize_fft_plans();
+    g_fft.destroy();
 
     for (int c = 0; c < 3; ++c) {
         fftw_free(F.V[c]);  fftw_free(F.rot[c]);  fftw_free(F.rhs[c]);

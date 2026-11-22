@@ -32,8 +32,9 @@
 #include <mpi.h>
 #include <omp.h>
 #include <fftw3.h>
-#include <p3dfft.h>
+// <p3dfft.h> comes with fftlib/ns_fft_p3dfft.h (it has no include guard: include it only once)
 #include "common_mode.h"
+#include "fftlib/ns_fft_p3dfft.h"   // setup / execute code shared with scripts/fftbench
 
 using namespace std;
 
@@ -136,6 +137,9 @@ double func_f3(double x, double y, double z, double t) {
 // ==============================================================================
 // p3dfft 上下文与索引工具
 // ==============================================================================
+
+// P3DFFT setup, decomposition and execute calls: fftlib/ns_fft_p3dfft.h
+static nsfft::P3dfft g_fft;
 
 struct P3DCtx {
     int istart[3], iend[3], isize[3];   // 实空间本地范围（1-based 全局索引）
@@ -310,8 +314,6 @@ void compute_rot_and_viscous(const P3DCtx& ctx, Fields& F) {
 // btran 前不再复制输入：之后不再使用 V 与 rot 的谱空间内容。
 void rk4_stage(const P3DCtx& ctx, Fields& F,
                double dt, double t, double dx, double dy, double dz, int stage) {
-    unsigned char op_f[] = "fft";
-    unsigned char op_b[] = "tff";
     int ny = ctx.ny, nz = ctx.nz;
 
     // 1. 旋度 + 粘性项（谱空间）
@@ -319,8 +321,8 @@ void rk4_stage(const P3DCtx& ctx, Fields& F,
     g_timer.mark(PH_SPEC);
 
     // 2. 逆变换 V、rot → 实空间（结果为 N * 物理值）
-    for (int c = 0; c < 3; ++c) Cp3dfft_btran_c2r(reinterpret_cast<double*>(F.V[c].data()),   F.Vr[c].data(),   op_b);
-    for (int c = 0; c < 3; ++c) Cp3dfft_btran_c2r(reinterpret_cast<double*>(F.rot[c].data()), F.rotr[c].data(), op_b);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.V[c].data(), F.Vr[c].data());
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.rot[c].data(), F.rotr[c].data());
     g_timer.mark(PH_FFT);
 
     // 3. 除以 N 得到物理值 + 实空间叉乘 v × rot(v)，覆盖 rotr
@@ -347,7 +349,7 @@ void rk4_stage(const P3DCtx& ctx, Fields& F,
     g_timer.mark(PH_PHYS);
 
     // 4. 正变换：叉乘 → rot（存放 nl，不归一化）
-    for (int c = 0; c < 3; ++c) Cp3dfft_ftran_r2c(F.rotr[c].data(), reinterpret_cast<double*>(F.rot[c].data()), op_f);
+    for (int c = 0; c < 3; ++c) g_fft.forward(F.rotr[c].data(), F.rot[c].data());
     g_timer.mark(PH_FFT);
 
     // 5. 外力 [仅 verify]：填入空闲的 Vr，正变换到 V（不归一化）
@@ -366,7 +368,7 @@ void rk4_stage(const P3DCtx& ctx, Fields& F,
                 }
             }
         }
-        for (int c = 0; c < 3; ++c) Cp3dfft_ftran_r2c(F.Vr[c].data(), reinterpret_cast<double*>(F.V[c].data()), op_f);
+        for (int c = 0; c < 3; ++c) g_fft.forward(F.Vr[c].data(), F.V[c].data());
         g_timer.mark(PH_FORCE);
     }
 
@@ -482,30 +484,12 @@ int main(int argc, char** argv) {
     P3DCtx ctx;
     ctx.nx = nx; ctx.ny = ny; ctx.nz = nz;
 
-    // slab {1,p} 在实空间切 z（Fortran 顺序中最慢的方向）、在谱空间切 y
-    const int decomp = nsmode::decomp_from_env(nprocs, min(ny, nz));
-    if (decomp != nsmode::DECOMP_SLAB && decomp != nsmode::DECOMP_PENCIL) {
-        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
-                            << " (P3DFFT: expected auto|slab|pencil)\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(ny, nz)) {
-        if (rank == 0) cerr << "Error: slab needs nprocs <= min(ny, nz) = " << min(ny, nz)
-                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    int dims[2] = {0, 0};
-    if (decomp == nsmode::DECOMP_SLAB) { dims[0] = 1; dims[1] = nprocs; }
-    else                               MPI_Dims_create(nprocs, 2, dims);
-
-    // ------------------------------------------------------------------
-    // FFTW 多线程初始化（必须在 Cp3dfft_setup 之前调用，使 p3dfft 内部的
-    // FFTW 计划创建时使用多线程，与 FFTW / AccFFT 版本保持一致）
-    // ------------------------------------------------------------------
-    omp_set_num_threads(nthreads);
+    // NS_DECOMP 检查与 dims（slab {1,p}：实空间切 z、谱空间切 y；pencil：MPI_Dims_create）；
+    // FFTW 多线程初始化在 Cp3dfft_setup 之前（P3DFFT 内部的 FFTW 计划使用多线程）。见 fftlib/ns_fft_p3dfft.h
     int max_threads = nthreads;
-    fftw_init_threads();
-    fftw_plan_with_nthreads(max_threads);
+    g_fft.init(max_threads);
+    g_fft.decompose(nx, ny, nz);
+    const int decomp = g_fft.decomp();
 
     if (rank == 0) {
         cout << "============================================================\n";
@@ -530,63 +514,20 @@ int main(int argc, char** argv) {
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
-        char grid[160];
-        snprintf(grid, sizeof grid, "%dx%d (dims = P1 x P2)%s", dims[0], dims[1],
-                 (decomp == nsmode::DECOMP_PENCIL && (dims[0] == 1 || dims[1] == 1))
-                     ? " -- MPI_Dims_create gave a 1D grid" : "");
-        nsmode::print_decomp(decomp, grid);
+        g_fft.print_decomp();
     }
 
-    // P3DFFT 的 FFTW 规划强度在编译库时决定（configure --enable-estimate / measure / patient），
-    // 运行时无法更改。build 脚本通过 -DNS_P3DFFT_PLAN="..." 把所链接库的设置写进程序。
-#ifndef NS_P3DFFT_PLAN
-#define NS_P3DFFT_PLAN "unknown (library default is MEASURE)"
-#endif
-    if (rank == 0) cout << "P3DFFT planner flag (fixed at library build): " << NS_P3DFFT_PLAN << "\n";
-    // 所链接的 libp3dfft.a（静态库，路径是编译时的）及其编译选项，scripts/p3dfft/build_p3dfft_opt.sh 用 -DNS_P3DFFT_LIB 写入
-#ifndef NS_P3DFFT_LIB
-#define NS_P3DFFT_LIB "not recorded (built without -DNS_P3DFFT_LIB)"
-#endif
-    if (rank == 0) cout << "P3DFFT library: " << NS_P3DFFT_LIB << "\n";
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_setup = MPI_Wtime();
-
-    int memsize[3];
-    Cp3dfft_setup(dims, nx, ny, nz,
-                  MPI_Comm_c2f(MPI_COMM_WORLD),
-                  nx, ny, nz,
-                  1,       // OW=1: btran_c2r 允许覆盖输入（我们始终复制，此处设为1）
-                  memsize);
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (rank == 0) cout << "P3DFFT setup (planning) time: " << MPI_Wtime() - t_setup << " s\n";
-
-    ctx.memsize[0] = memsize[0];
-    ctx.memsize[1] = memsize[1];
-    ctx.memsize[2] = memsize[2];
-
-    // 获取实空间（conf=1）和频谱空间（conf=2）本地范围（1-based 全局索引）
-    int conf = 1;
-    Cp3dfft_get_dims(ctx.istart, ctx.iend, ctx.isize, conf);
-    conf = 2;
-    Cp3dfft_get_dims(ctx.fstart, ctx.fend, ctx.fsize, conf);
-
-    // 确定索引偏移（0-based 或 1-based）
-    ctx.idx_offset = (ctx.istart[0] == 0) ? 0 : 1;
-
+    // P3DFFT 的 FFTW 规划强度在编译库时决定（-DNS_P3DFFT_PLAN 记录），Cp3dfft_setup 即规划；
+    // 之后 Cp3dfft_get_dims 给出实空间（conf=1）与谱空间（conf=2）本地范围（1-based 全局索引）
+    g_fft.setup();
+    for (int d = 0; d < 3; ++d) {
+        ctx.istart[d] = g_fft.istart[d]; ctx.iend[d] = g_fft.iend[d]; ctx.isize[d] = g_fft.isize[d];
+        ctx.fstart[d] = g_fft.fstart[d]; ctx.fend[d] = g_fft.fend[d]; ctx.fsize[d] = g_fft.fsize[d];
+        ctx.memsize[d] = g_fft.memsize[d];
+    }
+    ctx.idx_offset = g_fft.idx_offset;
     // 归一化因子（逆变换后除以 N）
     ctx.norm_inv = 1.0 / (static_cast<double>(nx) * ny * nz);
-
-    if (rank == 0) {
-        cout << "idx_offset = " << ctx.idx_offset << "\n";
-        cout << "Real space:     ["
-             << ctx.istart[0] << "," << ctx.iend[0] << "] x ["
-             << ctx.istart[1] << "," << ctx.iend[1] << "] x ["
-             << ctx.istart[2] << "," << ctx.iend[2] << "]\n";
-        cout << "Spectral space: ["
-             << ctx.fstart[0] << "," << ctx.fend[0] << "] x ["
-             << ctx.fstart[1] << "," << ctx.fend[1] << "] x ["
-             << ctx.fstart[2] << "," << ctx.fend[2] << "]\n";
-    }
 
     // ------------------------------------------------------------------
     // 分配内存
@@ -636,10 +577,9 @@ int main(int argc, char** argv) {
     }
 
     // 正变换（不归一化：V_c = DFT(V_r) = N * FFT_norm(V_phys)）
-    unsigned char op_f[] = "fft";
-    Cp3dfft_ftran_r2c(V1_r.data(), reinterpret_cast<double*>(V1_c.data()), op_f);
-    Cp3dfft_ftran_r2c(V2_r.data(), reinterpret_cast<double*>(V2_c.data()), op_f);
-    Cp3dfft_ftran_r2c(V3_r.data(), reinterpret_cast<double*>(V3_c.data()), op_f);
+    g_fft.forward(V1_r.data(), V1_c.data());
+    g_fft.forward(V2_r.data(), V2_c.data());
+    g_fft.forward(V3_r.data(), V3_c.data());
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space...\n";
@@ -652,10 +592,9 @@ int main(int argc, char** argv) {
     auto to_physical = [&]() {
         vector<complex<double>> &c1 = F.rhs[0], &c2 = F.rhs[1], &c3 = F.rhs[2];
         c1 = V1_c; c2 = V2_c; c3 = V3_c;
-        unsigned char op_b[] = "tff";
-        Cp3dfft_btran_c2r(reinterpret_cast<double*>(c1.data()), V1_r.data(), op_b);
-        Cp3dfft_btran_c2r(reinterpret_cast<double*>(c2.data()), V2_r.data(), op_b);
-        Cp3dfft_btran_c2r(reinterpret_cast<double*>(c3.data()), V3_r.data(), op_b);
+        g_fft.backward(c1.data(), V1_r.data());
+        g_fft.backward(c2.data(), V2_r.data());
+        g_fft.backward(c3.data(), V3_r.data());
 
         // 除以 N 得到物理值
         double inv_n = ctx.norm_inv;

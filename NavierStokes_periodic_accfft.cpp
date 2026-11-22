@@ -33,6 +33,7 @@
 #include <omp.h>
 #include <accfft.h>
 #include "common_mode.h"
+#include "fftlib/ns_fft_accfft.h"   // plan / execute code shared with scripts/fftbench
 
 using namespace std;
 
@@ -46,6 +47,9 @@ using nsmode::PH_FFT; using nsmode::PH_SPEC; using nsmode::PH_PHYS; using nsmode
 // ==============================================================================
 // AccFFT 上下文结构体
 // ==============================================================================
+
+// AccFFT plan, decomposition and execute calls: fftlib/ns_fft_accfft.h
+static nsfft::Accfft g_fft;
 
 struct AccCtx {
     int isize[3], istart[3];  // 实空间本地大小和全局起始（0-based）
@@ -291,8 +295,8 @@ void rk4_stage(const AccCtx& ctx, accfft_plan* plan, Fields& F,
     g_timer.mark(PH_SPEC);
 
     // 2. 逆变换 V、rot → 实空间
-    for (int c = 0; c < 3; ++c) accfft_execute_c2r(plan, F.V[c],   F.Vr[c]);
-    for (int c = 0; c < 3; ++c) accfft_execute_c2r(plan, F.rot[c], F.rotr[c]);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.V[c],   F.Vr[c]);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.rot[c], F.rotr[c]);
     g_timer.mark(PH_FFT);
 
     // 3. 归一化（除以 N 得到物理值）+ 实空间叉乘 v × rot(v)，覆盖 rotr
@@ -311,7 +315,7 @@ void rk4_stage(const AccCtx& ctx, accfft_plan* plan, Fields& F,
     g_timer.mark(PH_PHYS);
 
     // 4. 正变换：叉乘 → rot（存放 nl，不归一化）
-    for (int c = 0; c < 3; ++c) accfft_execute_r2c(plan, F.rotr[c], F.rot[c]);
+    for (int c = 0; c < 3; ++c) g_fft.forward(F.rotr[c], F.rot[c]);
     g_timer.mark(PH_FFT);
 
     // 5. 外力 [仅 verify]：填入空闲的 Vr，正变换到 V（f_c = DFT(f)，不归一化）
@@ -330,7 +334,7 @@ void rk4_stage(const AccCtx& ctx, accfft_plan* plan, Fields& F,
                 }
             }
         }
-        for (int c = 0; c < 3; ++c) accfft_execute_r2c(plan, F.Vr[c], F.V[c]);
+        for (int c = 0; c < 3; ++c) g_fft.forward(F.Vr[c], F.V[c]);
         g_timer.mark(PH_FORCE);
     }
 
@@ -442,48 +446,18 @@ int main(int argc, char** argv) {
     ctx.nx = nx;  ctx.ny = ny;  ctx.nz = nz;
     ctx.norm_inv = 1.0 / (static_cast<double>(nx) * ny * nz);
 
-    // slab 在实空间切 x、在谱空间切 y，两者都不能少于 p 个点
-    const int decomp = nsmode::decomp_from_env(nprocs, min(nx, ny));
-    if (decomp != nsmode::DECOMP_SLAB && decomp != nsmode::DECOMP_PENCIL) {
-        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
-                            << " (AccFFT: expected auto|slab|pencil)\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+    // NS_DECOMP 检查、c_dims、accfft_create_comm、accfft_local_size_dft_r2c、int 溢出检查、accfft_init
+    g_fft.init(max_threads);
+    g_fft.decompose(nx, ny, nz);
+    g_fft.setup();
+    const int decomp = g_fft.decomp();
+    const int alloc_max = g_fft.alloc_max;
+    for (int d = 0; d < 3; ++d) {
+        ctx.isize[d] = g_fft.isize[d]; ctx.istart[d] = g_fft.istart[d];
+        ctx.osize[d] = g_fft.osize[d]; ctx.ostart[d] = g_fft.ostart[d];
     }
-    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(nx, ny)) {
-        if (rank == 0) cerr << "Error: slab needs nprocs <= min(nx, ny) = " << min(nx, ny)
-                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    // slab：{p,1} → np[1]==1，AccFFT 内部 oneD=true；pencil：{0,0} 让 AccFFT 自动选择进程网格
-    int c_dims[2] = {0, 0};
-    if (decomp == nsmode::DECOMP_SLAB) { c_dims[0] = nprocs; c_dims[1] = 1; }
-    MPI_Comm c_comm;
-    accfft_create_comm(MPI_COMM_WORLD, c_dims, &c_comm);
-
-    int n[3] = {nx, ny, nz};
-    int alloc_max = accfft_local_size_dft_r2c(n, ctx.isize, ctx.istart,
-                                               ctx.osize, ctx.ostart, c_comm);
-
-    ctx.local_size_r = (long)ctx.isize[0] * ctx.isize[1] * nz;
-    ctx.local_size_c = (long)ctx.osize[0] * ctx.osize[1] * ctx.osize[2];
-
-    // AccFFT 内部用 int 保存缓冲区字节数（alloc_max / alloc_local），单进程超过 2 GB 就会溢出，
-    // 属于库的限制。这里提前报错，避免分配错误大小后内存越界或得到错误结果。
-    {
-        const long avg_bytes = (long)nx * ny * (nz / 2 + 1) * (long)sizeof(Complex) / nprocs;
-        const long local_bytes = ctx.local_size_c * (long)sizeof(Complex);
-        int bad_local = (avg_bytes >= 2147483647L || (long)alloc_max < local_bytes) ? 1 : 0, bad = 0;
-        MPI_Allreduce(&bad_local, &bad, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-        if (bad) {
-            if (rank == 0)
-                cerr << "Error: AccFFT stores buffer sizes in int; this grid needs about "
-                     << avg_bytes / 1048576L << " MB of FFT buffer per rank (limit 2048 MB). "
-                     << "Use more MPI ranks.\n";
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-    }
-
-    accfft_init(max_threads);
+    ctx.local_size_r = g_fft.local_size_r;
+    ctx.local_size_c = g_fft.local_size_c;
 
     if (rank == 0) {
         cout << "============================================================\n";
@@ -508,18 +482,7 @@ int main(int argc, char** argv) {
         cout << "Run mode: " << nsmode::mode_name(mode)
              << (mode == nsmode::MODE_BENCH ? "  (f = 0, 36 FFT/step)" : "  (analytic f, 48 FFT/step)") << "\n";
         cout << "============================================================\n";
-        char grid[160];
-        snprintf(grid, sizeof grid, "%dx%d (c_dims)%s", c_dims[0], c_dims[1],
-                 (decomp == nsmode::DECOMP_PENCIL && (c_dims[0] == 1 || c_dims[1] == 1))
-                     ? " -- MPI_Dims_create gave a 1D grid, AccFFT runs it as slab" : "");
-        nsmode::print_decomp(decomp, grid);
-        cout << "Real space local:     ["
-             << ctx.istart[0] << "+" << ctx.isize[0] << "] x ["
-             << ctx.istart[1] << "+" << ctx.isize[1] << "] x [0+" << ctx.isize[2] << "]\n";
-        cout << "Spectral space local: ["
-             << ctx.ostart[0] << "+" << ctx.osize[0] << "] x ["
-             << ctx.ostart[1] << "+" << ctx.osize[1] << "] x ["
-             << ctx.ostart[2] << "+" << ctx.osize[2] << "]\n";
+        g_fft.print_decomp();   // decomposition line, real and spectral local ranges
     }
 
     // ------------------------------------------------------------------
@@ -559,31 +522,10 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // 创建 FFT 计划（一个计划可用于所有相同大小的变换）
     // ------------------------------------------------------------------
-    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient
-    // 注意：原版 AccFFT（src/accfft.cpp）只区分 ESTIMATE 与"其他"，ACCFFT_PATIENT 会被当成
-    // FFTW_MEASURE。要真正用 PATIENT，必须链接打过补丁的库（scripts/build_planner_libs.sh）。
-    const int rigor_id = nsmode::plan_rigor_from_env();
-    if (rigor_id == nsmode::PLAN_INVALID || rigor_id == nsmode::PLAN_EXHAUSTIVE) {
-        if (rank == 0) cerr << "Error: NS_FFTW_PLAN must be estimate|measure|patient for AccFFT\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    const unsigned acc_flags[] = { ACCFFT_ESTIMATE, ACCFFT_MEASURE, ACCFFT_PATIENT };
-#ifdef NS_ACCFFT_PATCHED
-    const char* acc_lib = "patched AccFFT: PATIENT -> FFTW_PATIENT";
-#else
-    const char* acc_lib = "stock AccFFT: PATIENT is treated as FFTW_MEASURE";
-#endif
-    if (rank == 0) cout << "AccFFT planner flag: ACCFFT_" << nsmode::plan_rigor_name(rigor_id)
-                        << " (NS_FFTW_PLAN; " << acc_lib << ")\n";
-    if (rank == 0) cout << "Creating AccFFT plan...\n";
-    MPI_Barrier(c_comm);
-    double t_plan = MPI_Wtime();
-
-    accfft_plan* plan = accfft_plan_dft_3d_r2c(n, V1_r, (double*)V1_c,
-                                                c_comm, acc_flags[rigor_id]);
-    MPI_Barrier(c_comm);
-    if (rank == 0)
-        cout << "AccFFT plan time: " << MPI_Wtime() - t_plan << " s\n";
+    // 规划强度：NS_FFTW_PLAN = estimate | measure（默认）| patient（原版 AccFFT 把 PATIENT 当 MEASURE，
+    // 见 fftlib/ns_fft_accfft.h）
+    g_fft.plan(V1_r, V1_c);
+    accfft_plan* plan = g_fft.p;
 
     // ------------------------------------------------------------------
     // 初始条件（t=0）
@@ -605,9 +547,9 @@ int main(int argc, char** argv) {
     }
 
     // 正变换（不归一化：V_c = DFT(V_r) = N * FFT_norm(V_phys)）
-    accfft_execute_r2c(plan, V1_r, V1_c);
-    accfft_execute_r2c(plan, V2_r, V2_c);
-    accfft_execute_r2c(plan, V3_r, V3_c);
+    g_fft.forward(V1_r, V1_c);
+    g_fft.forward(V2_r, V2_c);
+    g_fft.forward(V3_r, V3_c);
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space...\n";
@@ -619,11 +561,11 @@ int main(int argc, char** argv) {
     // V_c → V_r（物理值，保护 V_c）
     auto to_physical = [&]() {
         memcpy(tmp_c, V1_c, ctx.local_size_c * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V1_r);
+        g_fft.backward(tmp_c, V1_r);
         memcpy(tmp_c, V2_c, ctx.local_size_c * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V2_r);
+        g_fft.backward(tmp_c, V2_r);
         memcpy(tmp_c, V3_c, ctx.local_size_c * sizeof(Complex));
-        accfft_execute_c2r(plan, tmp_c, V3_r);
+        g_fft.backward(tmp_c, V3_r);
 
         // 除以 N 得到物理值
         double inv_n = ctx.norm_inv;
@@ -733,10 +675,8 @@ int main(int argc, char** argv) {
         accfft_free(F.Vr[c]);   accfft_free(F.rotr[c]);
     }
 
-    accfft_destroy_plan(plan);
-    MPI_Comm_free(&c_comm);
+    g_fft.destroy();        // accfft_destroy_plan, MPI_Comm_free(c_comm), accfft_cleanup
     MPI_Barrier(MPI_COMM_WORLD);
-    accfft_cleanup();
     MPI_Finalize();
     return 0;
 }

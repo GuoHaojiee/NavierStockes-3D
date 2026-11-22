@@ -12,3 +12,4 @@ test_spectral_derivative_p3dfft
 *.log
 slurm-*.out
 __pycache__/
+!fftlib/ns_fft_*.h

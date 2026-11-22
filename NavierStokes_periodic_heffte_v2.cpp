@@ -42,29 +42,10 @@
 #include <heffte.h>
 #include "common_mode.h"
 
-// ---- 本地 FFT 后端：NS_HEFFTE_BACKEND = fftw | mkl（编译时） ----
-#define NS_HB_fftw 1
-#define NS_HB_mkl  2
-#define NS_HB_CAT2(a, b) a##b
-#define NS_HB_CAT(a, b) NS_HB_CAT2(a, b)
-#define NS_HB_STR2(a) #a
-#define NS_HB_STR(a) NS_HB_STR2(a)
-#ifndef NS_HEFFTE_BACKEND
-#define NS_HEFFTE_BACKEND fftw
-#endif
-#if NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_fftw
-#include <fftw3.h>
-using FftBackend = heffte::backend::fftw;
-#elif NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_mkl
-#ifndef Heffte_ENABLE_MKL
-#error "NS_HEFFTE_BACKEND=mkl: this heFFTe was built without -DHeffte_ENABLE_MKL=ON"
-#endif
-#include <mkl_service.h>
-using FftBackend = heffte::backend::mkl;
-#else
-#error "NS_HEFFTE_BACKEND must be fftw or mkl"
-#endif
-static const char* const kBackendName = NS_HB_STR(NS_HEFFTE_BACKEND);
+// 本地 FFT 后端（NS_HEFFTE_BACKEND = fftw | mkl，编译时）、分解、plan 与正逆变换：fftlib/ns_fft_heffte.h
+// （与 scripts/fftbench 共用）
+#include "fftlib/ns_fft_heffte.h"
+static nsfft::Heffte g_fft;
 
 using namespace std;
 
@@ -79,7 +60,6 @@ using Rvec = vector<double>;
 
 // heFFTe 常驻工作区（main 中分配一次，所有正/逆变换共用）。不传工作区时，heFFTe 每次调用都会
 // 新建并清零一个 size_workspace() 大小的缓冲区，在单进程多线程时占 FFT 时间的很大一部分。
-static complex<double>* g_fft_ws = nullptr;
 
 // ==============================================================================
 // 解析解与强迫项（与 FFTW 版本完全一致）
@@ -308,8 +288,8 @@ void rk4_stage(heffte::fft3d_r2c<FftBackend>& fft, Fields& F,
     g_timer.mark(PH_SPEC);
 
     // 2. 逆变换到实空间（scale::full 自动除以 N，得到物理值）
-    for (int c = 0; c < 3; ++c) fft.backward(F.V[c].data(),   F.Vr[c].data(),   g_fft_ws, heffte::scale::full);
-    for (int c = 0; c < 3; ++c) fft.backward(F.rot[c].data(), F.rotr[c].data(), g_fft_ws, heffte::scale::full);
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.V[c].data(), F.Vr[c].data());
+    for (int c = 0; c < 3; ++c) g_fft.backward(F.rot[c].data(), F.rotr[c].data());
     g_timer.mark(PH_FFT);
 
     // 3. 实空间叉乘 v × rot(v)，覆盖 rotr
@@ -325,7 +305,7 @@ void rk4_stage(heffte::fft3d_r2c<FftBackend>& fft, Fields& F,
     g_timer.mark(PH_PHYS);
 
     // 4. 正变换：叉乘 → rot（scale::none，nl = DFT，与 V_c 一致）
-    for (int c = 0; c < 3; ++c) fft.forward(F.rotr[c].data(), F.rot[c].data(), g_fft_ws, heffte::scale::none);
+    for (int c = 0; c < 3; ++c) g_fft.forward(F.rotr[c].data(), F.rot[c].data());
     g_timer.mark(PH_FFT);
 
     // 5. 外力 [仅 verify]：填入空闲的 Vr，正变换到 V（scale::none）
@@ -341,7 +321,7 @@ void rk4_stage(heffte::fft3d_r2c<FftBackend>& fft, Fields& F,
                 }
             }
         }
-        for (int c = 0; c < 3; ++c) fft.forward(F.Vr[c].data(), F.V[c].data(), g_fft_ws, heffte::scale::none);
+        for (int c = 0; c < 3; ++c) g_fft.forward(F.Vr[c].data(), F.V[c].data());
         g_timer.mark(PH_FORCE);
     }
 
@@ -448,29 +428,12 @@ int main(int argc, char** argv) {
     int nt_run = atoi(argv[5]);
     int nthreads = (rargs.omp_threads > 0) ? rargs.omp_threads : omp_get_max_threads();
     omp_set_num_threads(nthreads);
-#if NS_HB_CAT(NS_HB_, NS_HEFFTE_BACKEND) == NS_HB_fftw
-    // heFFTe 的 FFTW 后端在首次执行时才创建 FFTW 计划，并沿用全局的线程设置；
-    // 不调用这两行，每个进程内的 FFT 只用 1 个线程。需链接 libfftw3_omp（原因见 FFTW 版）。
-    fftw_init_threads();
-    fftw_plan_with_nthreads(nthreads);
-#else
-    // MKL DFTI 的线程数：mkl_intel_thread 默认取 OMP_NUM_THREADS，这里显式设成与 FFTW 后端相同
-    mkl_set_num_threads(nthreads);
-#endif
+    // FFT 线程（FFTW 后端：fftw_init_threads + fftw_plan_with_nthreads；MKL：mkl_set_num_threads），
+    // NS_DECOMP 检查（slab 在实空间切 x、在谱空间切 y）：fftlib/ns_fft_heffte.h
+    g_fft.init(nthreads);
+    g_fft.decompose(nx, ny, nz);
+    const int decomp = g_fft.decomp();
     int max_threads = nthreads;
-
-    // slab 在实空间切 x、在谱空间切 y
-    const int decomp = nsmode::decomp_from_env(nprocs, min(nx, ny));
-    if (decomp == nsmode::DECOMP_INVALID) {
-        if (rank == 0) cerr << "Error: NS_DECOMP=" << nsmode::decomp_env_value()
-                            << " (heFFTe: expected auto|slab|pencil|brick)\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    if (decomp == nsmode::DECOMP_SLAB && nprocs > min(nx, ny)) {
-        if (rank == 0) cerr << "Error: slab needs nprocs <= min(nx, ny) = " << min(nx, ny)
-                            << ", got " << nprocs << "; use NS_DECOMP=pencil or auto\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
 
     const double Lx = 2 * M_PI, Ly = 2 * M_PI, Lz = 2 * M_PI;
     double dx = Lx / nx, dy = Ly / ny, dz = Lz / nz;
@@ -510,62 +473,16 @@ int main(int argc, char** argv) {
     // 注意：heFFTe fft 对象析构时会释放内部 MPI 通信子，
     //       必须在 MPI_Finalize() 之前完成析构，故用块作用域包围。
     {
-    heffte::box3d<> world_r = {{0, 0, 0}, {nx - 1, ny - 1, nz - 1}};
-    heffte::box3d<> world_c = {{0, 0, 0}, {nx - 1, ny - 1, nz / 2}};  // R2C 压缩 z
-
-    std::array<int, 3> grid_in, grid_out;
-    if (decomp == nsmode::DECOMP_SLAB) {
-        grid_in  = {nprocs, 1, 1};
-        grid_out = {1, nprocs, 1};
-    } else if (decomp == nsmode::DECOMP_PENCIL) {
-        std::array<int, 2> pg = heffte::make_procgrid(nprocs);   // p1*p2 = p，面积最小 = 最接近正方形
-        grid_in  = {pg[0], pg[1], 1};
-        grid_out = {1, pg[0], pg[1]};
-    } else {
-        grid_in = grid_out = heffte::proc_setup_min_surface(world_r, nprocs);
-    }
-    auto all_inboxes  = heffte::split_world(world_r, grid_in);
-    auto all_outboxes = heffte::split_world(world_c, grid_out);
-
-    heffte::box3d<> inbox_r  = all_inboxes[rank];
-    heffte::box3d<> outbox_c = all_outboxes[rank];
-
-    // 创建 FFT 引擎（使用 FFTW 后端，R2C 沿 dim=2 即 z 方向）
-    // Library defaults for the fftw backend (alltoallv, use_reorder = true), unless
-    // overridden by NS_HEFFTE_ALGO / NS_HEFFTE_REORDER. use_pencils follows the decomposition
-    // (brick keeps the library default).
-    auto options = heffte::default_options<FftBackend>();
-    nsmode::heffte_options_from_env(options, rank);
-    if (decomp == nsmode::DECOMP_SLAB)   options.use_pencils = false;
-    if (decomp == nsmode::DECOMP_PENCIL) options.use_pencils = true;
-
-    // 与 fft3d_r2c 构造函数内部完全相同的规划（集体操作），用来数出每次 FFT 的 MPI 重排次数：
-    // 某一阶段的输入输出 box 几何不同（box3d 的 == 忽略 order）才需要通信
-    int n_reshape = 0;
-    {
-        auto lplan = heffte::plan_operations(heffte::mpi::gather_boxes(inbox_r, outbox_c, MPI_COMM_WORLD), 2,
-                                             heffte::set_options<FftBackend, true>(options), rank);
-        for (int i = 0; i < 4; ++i) if (!heffte::match(lplan.in_shape[i], lplan.out_shape[i])) ++n_reshape;
-    }
-    if (rank == 0) {
-        char grid[160];
-        snprintf(grid, sizeof grid, "in %dx%dx%d, out %dx%dx%d, use_pencils=%d, MPI reshapes per FFT = %d",
-                 grid_in[0], grid_in[1], grid_in[2], grid_out[0], grid_out[1], grid_out[2],
-                 options.use_pencils ? 1 : 0, n_reshape);
-        nsmode::print_decomp(decomp, grid);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-    double t_plan = MPI_Wtime();
-    heffte::fft3d_r2c<FftBackend> fft(inbox_r, outbox_c, 2, MPI_COMM_WORLD, options);
-    MPI_Barrier(MPI_COMM_WORLD);
-    // fft3d_r2c 构造：重排计划 + 本地 FFT 计划（MKL 在这里提交 DFTI 描述符；FFTW 后端的计划在首次执行时才建，不计在内）
-    if (rank == 0) cout << "heFFTe plan time: " << MPI_Wtime() - t_plan << " s\n";
+    // 进程网格与 box（NS_DECOMP）、plan 选项（NS_HEFFTE_ALGO / NS_HEFFTE_REORDER；use_pencils 随分解）、
+    // MPI 重排次数（plan_operations）并打印分解行；然后建 fft3d_r2c（R2C 沿 dim=2 即 z）与工作区
+    g_fft.print_decomp();
+    g_fft.plan();
+    heffte::fft3d_r2c<FftBackend>& fft = *g_fft.fft;
+    const heffte::box3d<>& inbox_r  = g_fft.inbox();
+    const heffte::box3d<>& outbox_c = g_fft.outbox();
 
     size_t nr = inbox_r.count();
     size_t nc = outbox_c.count();
-    vector<complex<double>> fft_ws(fft.size_workspace());
-    g_fft_ws = fft_ws.data();
 
     // ------------------------------------------------------------------
     // 分配内存
@@ -611,9 +528,9 @@ int main(int argc, char** argv) {
     }
 
     // 正变换：scale::none → V_c = DFT(V_r) = N × FFT_norm(V_phys)
-    fft.forward(V1_r.data(), V1_c.data(), g_fft_ws, heffte::scale::none);
-    fft.forward(V2_r.data(), V2_c.data(), g_fft_ws, heffte::scale::none);
-    fft.forward(V3_r.data(), V3_c.data(), g_fft_ws, heffte::scale::none);
+    g_fft.forward(V1_r.data(), V1_c.data());
+    g_fft.forward(V2_r.data(), V2_c.data());
+    g_fft.forward(V3_r.data(), V3_c.data());
 
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space...\n";
@@ -624,9 +541,9 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------
     // V_c → V_r：backward(scale::full) 自动除以 N，得到物理值（不破坏 V_c）
     auto to_physical = [&]() {
-        fft.backward(V1_c.data(), V1_r.data(), g_fft_ws, heffte::scale::full);
-        fft.backward(V2_c.data(), V2_r.data(), g_fft_ws, heffte::scale::full);
-        fft.backward(V3_c.data(), V3_r.data(), g_fft_ws, heffte::scale::full);
+        g_fft.backward(V1_c.data(), V1_r.data());
+        g_fft.backward(V2_c.data(), V2_r.data());
+        g_fft.backward(V3_c.data(), V3_r.data());
     };
 
     auto compute_error = [&](double time) -> pair<double, double> {
@@ -717,6 +634,7 @@ int main(int argc, char** argv) {
         nsmode::print_phase_summary(phase_max, t_wall_total, nt_run, mode);
         cout << "============================================================\n";
     }
+    g_fft.destroy();
     }  // heFFTe fft 对象在此析构（MPI_Finalize 之前）
 
     MPI_Finalize();
