@@ -12,7 +12,9 @@
 #   (v2 image, Intel MPI), the four CPU solvers, slab, FFTW MEASURE. The job must have that many nodes:
 #   sbatch -N <nodes> ... cmp_toolchain_mn.sbatch <nodes> <grid>
 #   gcc    srun --mpi=pmix; /work/build/bin_gcc/{ns_fftw,ns_accfft,ns_heffte_v2}, /work/build/bin_p3d/gcc/ns_p3dfft;
-#          Open MPI settings: GCC_COLL=def|t4 (t4 = tuned alltoall algorithm 4 with dynamic rules, ucc and hcoll off;
+#          Open MPI settings: GCC_COLL = one or a list of def|t4, e.g. GCC_COLL="def t4" runs the GCC side once per
+#          setting (labels <Lib>-<N>_gcc-<setting>_..., CSV settings "GCC_COLL=<setting>")
+#          (t4 = tuned alltoall algorithm 4 with dynamic rules, ucc and hcoll off;
 #          alltoallv stays default) and CTM_GCC_ENV="VAR=val ..." (e.g. UCX_NET_DEVICES=...)
 #   intel  1 node: mpirun inside the image (fork + shm); 2, 4 nodes: irun_mn (intel_mn_env.sh, E6d: pmi2, mlx,
 #          HPC-X UCX 1.17); settings from IMN_* (IMN_ALLTOALL, IMN_ALLTOALLV, IMN_UCX_TLS, IMN_EXTRA, IMN_PIN ...);
@@ -47,7 +49,8 @@
 #   sbatch -N 1 -J ctmn_dry1 -t 00:30:00 cmp_toolchain_mn.sbatch 1 dry
 #   sbatch -N 4 -J ctmn_1024_4 -t 06:30:00 cmp_toolchain_mn.sbatch 4 1024
 #   bash toolchain_mn_parse.sh ; python3 plot_toolchain_mn.py
-# Options: CTM_LIBS, CTM_LAYOUTS, CTM_REP (3), CTM_CSV, CTM_IMAGE (v2), CTM_TIMEOUT_FACTOR (3), GCC_COLL (def), CTM_GCC_ENV.
+# Options: CTM_LIBS ("fftw accfft p3dfft heffte"), CTM_LAYOUTS ("128x1 64x2"; e.g. "128x1"), CTM_REP (3), CTM_CSV,
+#   CTM_IMAGE (v2), CTM_TIMEOUT_FACTOR (3), GCC_COLL ("def"; list allowed: "def t4"), CTM_GCC_ENV.
 #   e.g. sbatch -N 4 -J ctmn_1024_4 -t 08:00:00 --export=ALL,CTM_TIMEOUT_FACTOR=6 cmp_toolchain_mn.sbatch 4 1024
 NODES=${1:?usage: sbatch -N <n> cmp_toolchain_mn.sbatch <1|2|4> <512|1024|dry>}
 GRID=${2:?usage: sbatch -N <n> cmp_toolchain_mn.sbatch <1|2|4> <512|1024|dry>}
@@ -66,11 +69,11 @@ dry)  N=64;   DT=5e-5; NS=10; EREF=3.3526466678e+05; REP=1
 esac
 LAYOUTS=${CTM_LAYOUTS:-$LAY}
 LIBS=${CTM_LIBS:-"fftw accfft p3dfft heffte"}
-GCC_COLL=${GCC_COLL:-def}
-GENV="$(mn_gcc_coll $GCC_COLL) ${CTM_GCC_ENV:-}"
-[[ "$GENV" == *BAD_GCC_COLL* ]] && { echo "ERROR: GCC_COLL=$GCC_COLL (def|t4)"; exit 1; }
+GCC_COLLS=${GCC_COLL:-def}
+for gc in $GCC_COLLS; do [[ "$(mn_gcc_coll $gc)" == *BAD_GCC_COLL* ]] && { echo "ERROR: GCC_COLL=$gc (def|t4)"; exit 1; }; done
+NGC=$(echo $GCC_COLLS | wc -w)
 COMMON="NS_FFTW_PLAN=measure NS_DECOMP=slab"
-GSET="GCC_COLL=$GCC_COLL${CTM_GCC_ENV:+ $CTM_GCC_ENV}"
+gset() { echo "GCC_COLL=$1${CTM_GCC_ENV:+ $CTM_GCC_ENV}"; }
 if [ $NODES = 1 ]; then ISET="single-node mpirun fork+shm"
 else ISET="E6d$(for v in IMN_ALLTOALL IMN_ALLTOALLV IMN_UCX_TLS IMN_EXTRA IMN_PIN IMN_UCX_DIR IMN_NET_DEVICES; do [ -n "${!v+x}" ] && printf ' %s=%s' $v "${!v}"; done)"; fi
 TMP=$SCR/logs/ctmn_$SLURM_JOB_ID.d; mkdir -p $TMP "$(dirname "$CSV")"
@@ -83,7 +86,7 @@ head -1 "$CSV" | grep -q ',status' || sed -i '1s/$/,status/' "$CSV"
 
 echo "cmp_toolchain_mn: nodes=$NODES ($SLURM_JOB_NODELIST) grid=$GRID N=$N dt=$DT steps=$NS energy_ref=$EREF reps=$REP layouts(per node)=$LAYOUTS libs=$LIBS"
 echo "commit $COMMIT   csv $CSV   time limit per run: ${CTM_TIMEOUT_FACTOR:-3} x expected (>= 180 s)"
-echo "gcc settings:   $GSET   -> env: ${GENV:-<run_env.sh only>}"
+for gc in $GCC_COLLS; do echo "gcc settings:   $(gset $gc)   -> env: $(mn_gcc_coll $gc) ${CTM_GCC_ENV:-}"; done
 echo "intel settings: $ISET"
 for b in bin_gcc/ns_fftw bin_gcc/ns_accfft bin_gcc/ns_heffte_v2 bin_p3d/gcc/ns_p3dfft bin_intel/ns_fftw bin_intel/ns_accfft bin_intel/ns_heffte_v2_mkl bin_p3d/intel/ns_p3dfft; do
     [ -x $SCR/build/$b ] && echo "  $(ls -l --time-style=+%F_%R $SCR/build/$b | awk '{print $6, $7}')" || echo "  MISSING $SCR/build/$b"
@@ -103,13 +106,14 @@ bin_of() {   # <toolchain> <lib>
 name_of() { case $1 in fftw) echo FFTW;; accfft) echo AccFFT;; p3dfft) echo P3DFFT;; heffte) echo heFFTe;; esac; }
 
 # X <toolchain> <lib> <layout>
+# X <gcc|intel> <lib> <layout> [GCC_COLL setting]
 X() {
-    local tc=$1 lib=$2 L=$3 ppn=${3%x*} nt=${3#*x} bin envs label raw tmo tl set
+    local tc=$1 lib=$2 L=$3 ppn=${3%x*} nt=${3#*x} gc=$4 bin envs label raw tmo tl set
     bin=$(bin_of $tc $lib); envs=$COMMON
     [ $tc = intel ] && [ $lib = heffte ] && envs="$envs NS_HEFFTE_REORDER=1"
-    label="$(name_of $lib)-${N}_${tc}_n${NODES}_$L"; raw=$TMP/$label.r$rep.raw
+    label="$(name_of $lib)-${N}_${tc}${gc:+-$gc}_n${NODES}_$L"; raw=$TMP/$label.r$rep.raw
     tmo=$(mn_timeout $GRID $NODES $L); tl=$(( tmo / 60 + 2 ))
-    if [ $tc = gcc ]; then set=$GSET; envs="$envs $GENV"; else set=$ISET; fi
+    if [ $tc = gcc ]; then set=$(gset $gc); envs="$envs $(mn_gcc_coll $gc) ${CTM_GCC_ENV:-}"; else set=$ISET; fi
     echo ">>> [$(date +%H:%M:%S)] $label ranks=$((NODES * ppn)) threads=$nt plan=measure | rep=$rep limit=${tmo}s $set | $envs $bin $N $N $N $DT $NS $nt bench"
     mn_run $label $raw $tmo mn_$tc $NODES $ppn $nt $tl "$envs" $bin $N $N $N $DT $NS $nt bench
     grep -E "$KEEP" $raw | awk '!/UCXPROBE/ || !u++'
@@ -126,7 +130,10 @@ X() {
 for rep in $(seq 1 $REP); do
     echo "=============== repetition $rep"
     for L in $LAYOUTS; do
-        for lib in $LIBS; do X gcc $lib $L; X intel $lib $L; done
+        for lib in $LIBS; do
+            for gc in $GCC_COLLS; do X gcc $lib $L $gc; done
+            X intel $lib $L
+        done
     done
 done
 echo "=============== this job's CSV lines: $(grep -c ",$SLURM_JOB_ID," "$CSV")   retries: $(grep -c '^RETRY' $SCR/logs/ctmn_${SLURM_JOB_NAME}_$SLURM_JOB_ID.out 2>/dev/null)"

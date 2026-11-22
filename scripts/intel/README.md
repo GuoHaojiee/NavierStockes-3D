@@ -582,3 +582,35 @@ cmp_toolchain_mn、p256_diag、cmp_toolchain_4n 和 cpu_final 都改用 `mn_lib.
 - 解析脚本和图用虚构数据测过。
 
 没测：pyxis 和 enroot 的真实行为（容器名、`enroot list` 的输出格式、预建容器）、多节点的真实性能。
+
+### cmp_toolchain_mn 的选项：CTM_LAYOUTS、CTM_LIBS、GCC_COLL 列表
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CTM_LAYOUTS` | `"128x1 64x2"`（dry 时按节点数用 64x2、32x4 或 16x8） | 每节点布局，例如只跑 `"128x1"` |
+| `CTM_LIBS` | `"fftw accfft p3dfft heffte"` | 只跑其中几个库，也可以用来把一个作业拆成两个 |
+| `GCC_COLL` | `def` | 一个设置或一个列表，例如 `"def t4"` |
+| `CTM_TIMEOUT_FACTOR` | 3 | 每次运行的时限 = 倍数 × 预期时间，最少 180 秒 |
+
+`GCC_COLL` 是列表时，GCC 一边在每个 (库, 布局) 下按每个设置各跑一次，然后才跑 Intel：
+
+- 日志标签写成 `<库>-<网格>_gcc-<设置>_n<节点数>_<布局>`，例如 `FFTW-1024_gcc-t4_n4_128x1`；
+- CSV 的 toolchain 列仍是 `gcc`，settings 列是 `GCC_COLL=<设置>`。
+
+toolchain_mn_parse.sh 的处理：
+
+- 每种工具链在每个 (库, 网格, 节点数) 下，从所有布局和设置中取最好的那个；
+- 第一张表照常逐个列出每个 (布局, 设置) 的结果；
+- 第二张表在某工具链跑过多个设置时，在最佳行下面每个设置列一行 `setting: <布局> <设置>`：
+  - GCC 的 setting 行，比值相对于 GCC 自己的最佳；
+  - Intel 的 setting 行，比值相对于 GCC 的最佳。
+
+4 节点 1024³、只跑 128×1、`GCC_COLL="def t4"`、时限 6 倍的提交命令：
+
+```bash
+sbatch -N 4 -J ctmn_1024_4 -t 06:00:00 \
+  --export=ALL,CTM_LAYOUTS=128x1,GCC_COLL="def t4",CTM_TIMEOUT_FACTOR=6 \
+  cmp_toolchain_mn.sbatch 4 1024
+```
+
+运行次数是 4 库 × (2 个 GCC 设置 + 1 个 Intel) × 1 种布局 × 3 次 = 36 次。每次预期 6 分钟，合计约 3.6 小时，另加作业开始时建容器的几分钟；6 倍时限下单次最多 36 分钟，所以 `-t 06:00:00` 还能容下约 4 次超时。

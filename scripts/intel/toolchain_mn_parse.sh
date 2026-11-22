@@ -4,7 +4,9 @@
 #   1. per (library, grid, nodes, toolchain, layout, settings): runs, median (min-max) step time, FFT, planning,
 #      energy ok / runs, retries, UCX versions
 #   2. per (library, grid, nodes): best configuration of each toolchain (lowest median among configurations whose
-#      runs ALL have the reference energy and exit 0), intel/gcc and "ranges overlap" (min-max ranges overlap)
+#      runs ALL have the reference energy and exit 0, over all layouts AND settings), intel/gcc and "ranges overlap"
+#      (min-max ranges overlap); when a toolchain ran several settings (GCC_COLL="def t4", IMN_*), the best layout of
+#      every setting is listed below it ("  setting:")
 #   3. per toolchain and grid: strong scaling, library x nodes 1/2/4, best s/step, speedup S and efficiency E
 #      relative to that toolchain's best 1-node configuration
 #   4. runs killed at the time limit (TIMEOUT), runs whose start failed also when repeated (FAILED-RUN), and the other
@@ -56,6 +58,9 @@ END {
         else { s = "-"; mf = mp = 0 }
         printf "%-7s %5s %2s %-5s %-6s %-56s %4d  %-26s %8.4f %8.3f %3d/%-3d %4d %3d%s\n", p[1], p[2], p[3], p[4], p[5], substr(p[6], 1, 56), runs[k], s, mf, mp, eok[k] + 0, runs[k], ret[k], nto[k], uv[k]
         if (m && eok[k] == runs[k] && !bad[k]) {
+            sk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4] SUBSEP p[6]
+            if (!(sk in sbest)) { nsets[p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]]++; sl[p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]] = sl[p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]] SUBSEP p[6] }
+            if (!(sk in sbest) || md[k] < sbest[sk]) { sbest[sk] = md[k]; smin[sk] = mn[k]; smax[sk] = mx[k]; slay[sk] = p[5] }
             bk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]
             if (!(bk in best) || md[k] < best[bk]) { best[bk] = md[k]; bmin[bk] = mn[k]; bmax[bk] = mx[k]; bcfg[bk] = p[5] " " p[6] } } }
     # ---- 2
@@ -67,7 +72,11 @@ END {
             for (t in tcs) { bk = l SUBSEP gg SUBSEP n SUBSEP t; if (!(bk in best)) continue; any = 1
                 r = "-"; ov = "-"
                 if (t != "gcc" && (gk in best)) { r = sprintf("%.3f", best[bk] / best[gk]); ov = (bmin[bk] <= bmax[gk] && bmin[gk] <= bmax[bk]) ? "yes" : "no" }
-                printf "%-7s %5s %2d  %-5s %-62s %9.4f %-19s %9s  %s\n", l, gg, n, t, substr(bcfg[bk], 1, 62), best[bk], sprintf("%.4f-%.4f", bmin[bk], bmax[bk]), r, ov }
+                printf "%-7s %5s %2d  %-5s %-62s %9.4f %-19s %9s  %s\n", l, gg, n, t, substr(bcfg[bk], 1, 62), best[bk], sprintf("%.4f-%.4f", bmin[bk], bmax[bk]), r, ov
+                if (nsets[bk] > 1) { ms = split(sl[bk], ss, SUBSEP)
+                    for (q = 2; q <= ms; q++) { sk = bk SUBSEP ss[q]
+                        r2 = (t != "gcc" && (gk in best)) ? sprintf("%.3f", sbest[sk] / best[gk]) : sprintf("%.3f", sbest[sk] / best[bk])
+                        printf "%-7s %5s %2s  %-5s   setting: %-51s %9.4f %-19s %9s\n", "", "", "", "", substr(slay[sk] " " ss[q], 1, 51), sbest[sk], sprintf("%.4f-%.4f", smin[sk], smax[sk]), r2 } } }
             if (any) print "" } }
     # ---- 3
     for (t in tcs) for (gg in grids) {
