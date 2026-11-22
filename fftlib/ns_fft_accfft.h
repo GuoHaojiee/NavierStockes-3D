@@ -8,6 +8,22 @@
 //   spectral      osize/ostart (x whole, y split by P0, z split by P1) for both decompositions
 //   NS_FFTW_PLAN  estimate | measure (default) | patient (stock AccFFT treats PATIENT as MEASURE;
 //                 -DNS_ACCFFT_PATCHED for the patched library)
+//   NS_ACCFFT_PLAN  same values, AccFFT only; overrides NS_FFTW_PLAN here (the other libraries keep NS_FFTW_PLAN)
+//   Transpose method (src/accfft.cpp, src/transpose.cpp of the library):
+//     flag ACCFFT_MEASURE: T_Plan::which_fast_method times every candidate ONCE (one warm-up call + one timed call,
+//       max over ranks) and keeps the fastest: method 1 = Isend/Irecv to all ranks, method 2 = MPI_Alltoall
+//       (MPI_Alltoallv if the data is not evenly distributed), method 3 = par::Mpi_Alltoallv_dense, k-way exchange of
+//       Isend/Irecv rounds, kway = p/2, p/4, ... > 4, async (kway_async=1) or not (only for p a power of two > 7).
+//       Slab: T_plan_2 (forward) is measured, T_plan_2i (backward) gets -method. Pencil: T_plan_1 on the ranks with
+//       coord[0] == 0, broadcast, copied to T_plan_1i / T_plan_2 / T_plan_2i.
+//     any other flag (ESTIMATE, PATIENT in the stock library): method 2, kway 2, no measurement.
+//     The chosen method is printed by rank 0 after the plan:
+//       FFTB_ACCFFT_TPLAN sel=measure|default|fixed method=.. kway=.. kway_async=.. call=.. comm_size=.. measured=...
+//     and is part of settings() (CSV lib_settings).
+//   NS_ACCFFT_TMETHOD  auto (default: the library's choice) | 1 | 2 | 3:<kway>:a | 3:<kway>:s   (also m1, m2, m3k16a ...)
+//     Fixes the method after planning by setting the public T_Plan fields method / kway / kway_async of the plan's
+//     transpose plans (forward +method, backward -method), the same thing accfft_plan_dft_3d_r2c does after its
+//     measurement; the library source is not changed. kway must split the communicator (p = c * kway^n, c < kway).
 //   accfft_execute_c2r destroys its input; unnormalised both ways: backward(forward(x)) = N x
 //   AccFFT keeps buffer sizes in int: more than 2 GB of FFT buffer per rank aborts.
 //
@@ -17,6 +33,9 @@
 #define NS_FFT_ACCFFT_H
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <iostream>
 #include <string>
 #include <mpi.h>
@@ -36,6 +55,7 @@ struct Accfft {
     int alloc_max = 0;
     long local_size_r = 0, local_size_c = 0;
     accfft_plan* p = nullptr;
+    std::string tplan_desc;               // chosen transpose method, for settings()
 
     void init(int nt) {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank); MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
@@ -106,11 +126,14 @@ struct Accfft {
 
     // one plan for all transforms of this size; planner flag NS_FFTW_PLAN. Returns the plan time (s).
     double plan(double* any_r, cplx* any_c) {
-        rigor_id = nsmode::plan_rigor_from_env();
+        const char* pvar = plan_var();
+        rigor_id = nsmode::plan_rigor_from_env(nsmode::PLAN_MEASURE, pvar);
         if (rigor_id == nsmode::PLAN_INVALID || rigor_id == nsmode::PLAN_EXHAUSTIVE) {
-            if (rank == 0) std::cerr << "Error: NS_FFTW_PLAN must be estimate|measure|patient for AccFFT\n";
+            if (rank == 0) std::cerr << "Error: " << pvar << " must be estimate|measure|patient for AccFFT\n";
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
+        int fm = 0, fk = 0, fa = 0;        // NS_ACCFFT_TMETHOD, checked before the (long) planning
+        const bool fixed = tmethod_from_env(fm, fk, fa);
         const unsigned acc_flags[] = { ACCFFT_ESTIMATE, ACCFFT_MEASURE, ACCFFT_PATIENT };
 #ifdef NS_ACCFFT_PATCHED
         const char* acc_lib = "patched AccFFT: PATIENT -> FFTW_PATIENT";
@@ -118,7 +141,7 @@ struct Accfft {
         const char* acc_lib = "stock AccFFT: PATIENT is treated as FFTW_MEASURE";
 #endif
         if (rank == 0) std::cout << "AccFFT planner flag: ACCFFT_" << nsmode::plan_rigor_name(rigor_id)
-                                 << " (NS_FFTW_PLAN; " << acc_lib << ")\n";
+                                 << " (" << pvar << "; " << acc_lib << ")\n";
         if (rank == 0) std::cout << "Creating AccFFT plan...\n";
         MPI_Barrier(c_comm);
         double t0 = MPI_Wtime();
@@ -126,7 +149,97 @@ struct Accfft {
         MPI_Barrier(c_comm);
         double tp = MPI_Wtime() - t0;
         if (rank == 0) std::cout << "AccFFT plan time: " << tp << " s\n";
+        const char* sel = fixed ? "fixed" : (acc_flags[rigor_id] == ACCFFT_MEASURE ? "measure" : "default");
+        if (fixed) set_tmethod(fm, fk, fa);
+        report_tplan(sel);
         return tp;
+    }
+
+    // ---- transpose method (see the header comment)
+    static const char* plan_var() {
+        const char* a = std::getenv("NS_ACCFFT_PLAN");
+        return (a && *a) ? "NS_ACCFFT_PLAN" : "NS_FFTW_PLAN";
+    }
+    // the transpose plans of this plan: slab T_plan_2 / T_plan_2i, pencil also T_plan_1 / T_plan_1i
+    std::vector<T_Plan<double>*> tplans() const {
+        std::vector<T_Plan<double>*> v;
+        if (!p) return v;
+        if (p->T_plan_1) v.push_back(p->T_plan_1);
+        if (p->T_plan_1i) v.push_back(p->T_plan_1i);
+        if (p->T_plan_2) v.push_back(p->T_plan_2);
+        if (p->T_plan_2i) v.push_back(p->T_plan_2i);
+        return v;
+    }
+    static bool kway_splits(int np, int k) {     // par::Mpi_Alltoallv_dense: assert((np_new / kway) * kway == np_new)
+        if (k < 2) return false;
+        for (int q = np; q > 1;) { int kk = std::min(k, q); if (q % kk) return false; q /= kk; }
+        return true;
+    }
+    static std::string method_label(int m, int k, int a) {
+        char b[48];
+        if (m == 3) snprintf(b, sizeof b, "m3k%d%s", k, a ? "a" : "s"); else snprintf(b, sizeof b, "m%d", m);
+        return b;
+    }
+    // NS_ACCFFT_TMETHOD: false = auto (library's choice); aborts on an invalid value
+    bool tmethod_from_env(int& m, int& k, int& a) const {
+        const char* s = std::getenv("NS_ACCFFT_TMETHOD");
+        if (!s || !*s || !std::strcmp(s, "auto")) return false;
+        m = 0; k = 0; a = 1;
+        char c = 0; int n1 = 0;
+        if (!std::strcmp(s, "1") || !std::strcmp(s, "m1")) m = 1;
+        else if (!std::strcmp(s, "2") || !std::strcmp(s, "m2")) m = 2;
+        else if ((std::sscanf(s, "3:%d:%c%n", &k, &c, &n1) == 2 && s[n1] == 0) ||
+                 (std::sscanf(s, "m3k%d%c%n", &k, &c, &n1) == 2 && s[n1] == 0)) {
+            if (c == 'a' || c == 's') { m = 3; a = (c == 'a'); }
+        }
+        if (!m) {
+            if (rank == 0) std::cerr << "Error: NS_ACCFFT_TMETHOD=" << s << " (auto | 1 | 2 | 3:<kway>:a | 3:<kway>:s, or m1 m2 m3k<kway>a m3k<kway>s)\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        if (m == 1) k = nprocs;          // as which_fast_method sets it (unused by method 1)
+        if (m == 2) k = 2;
+        return true;
+    }
+    void set_tmethod(int m, int k, int a) {
+        for (T_Plan<double>* t : tplans())
+            if (m == 3 && !kway_splits((int)t->nprocs, k)) {
+                if (rank == 0) std::cerr << "Error: NS_ACCFFT_TMETHOD: kway=" << k << " does not split a transpose communicator of "
+                                         << t->nprocs << " ranks (p = c * kway^n, c < kway)\n";
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+        // forward plans +m, backward plans -m (accfft.cpp: T_plan_2i->method = -T_plan_2->method)
+        for (T_Plan<double>* t : tplans()) {
+            const bool inv = (t == p->T_plan_1i || t == p->T_plan_2i);
+            t->method = inv ? -m : m; t->kway = k; t->kway_async = (a != 0);
+        }
+    }
+    void report_tplan(const char* sel) {
+        T_Plan<double>* t = p->oneD ? p->T_plan_2 : p->T_plan_1;   // the measured / primary plan
+        if (!t) { tplan_desc = "tplan=none"; return; }
+        const int m = std::abs(t->method);
+        const char* call = m == 1 ? "Isend/Irecv" : m == 2 ? (t->is_evenly_distributed ? "MPI_Alltoall" : "MPI_Alltoallv")
+                         : m == 3 ? (t->kway_async ? "kway-dense-async" : "kway-dense-sync") : "other";
+        const std::string lab = method_label(m, t->kway, t->kway_async ? 1 : 0);
+        // candidates timed by which_fast_method (rank 0's copy holds the max over ranks); empty unless measured here
+        std::string meas;
+        if (!std::strcmp(sel, "measure") && t->pwhich_f_time && (p->oneD || p->coord[0] == 0)) {
+            for (const auto& e : *t->pwhich_f_time) {
+                const int f = e.first;
+                std::string l = (f == t->nprocs) ? "m1" : (f == 2) ? "m2" : method_label(3, std::abs(f), f > 0 ? 1 : 0);
+                char b[64]; snprintf(b, sizeof b, "%s%s:%.3e", meas.empty() ? "" : ";", l.c_str(), e.second);
+                meas += b;
+            }
+        }
+        char d[256];
+        snprintf(d, sizeof d, "tsel=%s tmethod=%s call=%s comm=%d", sel, lab.c_str(), call, (int)t->nprocs);
+        tplan_desc = d;
+        if (rank == 0) {
+            std::printf("FFTB_ACCFFT_TPLAN sel=%s method=%d kway=%d kway_async=%d label=%s call=%s comm_size=%d evenly=%d%s measured=%s\n",
+                        sel, t->method, (int)t->kway, t->kway_async ? 1 : 0, lab.c_str(), call, (int)t->nprocs,
+                        t->is_evenly_distributed ? 1 : 0, p->oneD ? "" : " (pencil: row plan; column plans use the same method)",
+                        meas.empty() ? "-" : meas.c_str());
+            std::fflush(stdout);
+        }
     }
     void forward(double* r, cplx* c) const { accfft_execute_r2c(p, r, c); }
     void backward(cplx* c, double* r) const { accfft_execute_c2r(p, c, r); }
@@ -138,7 +251,8 @@ struct Accfft {
                     f((size_t)((long)i * isize[1] * nz + (long)j * nz + k), i + istart[0], j + istart[1], k);
     }
     std::string settings() const {
-        return std::string("decomp=") + nsmode::decomp_name(decomp_id) + " plan=" + nsmode::plan_rigor_name(rigor_id);
+        return std::string("decomp=") + nsmode::decomp_name(decomp_id) + " plan=" + nsmode::plan_rigor_name(rigor_id) +
+               (tplan_desc.empty() ? "" : " " + tplan_desc);
     }
     void destroy() {
         if (p) accfft_destroy_plan(p);

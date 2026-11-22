@@ -78,6 +78,23 @@ static long core_key(int cpu) {
     const int core = rd(b + "core_id"), pkg = rd(b + "physical_package_id");
     return core < 0 ? -1 - cpu : (long)pkg * 100000 + core;
 }
+// ---- MPI / transport variables as rank 0 sees them (one FFTB_MPIENV line; the launch scripts may set them in several
+//      places, this is what the program actually got)
+extern char** environ;
+static void mpienv_report() {
+    if (g_rank) return;
+    static const char* pre[] = { "I_MPI_ADJUST_", "I_MPI_FABRICS", "FI_PROVIDER=", "UCX_TLS=", "UCX_RNDV", "UCX_ZCOPY",
+                                 "OMPI_MCA_coll", "OMPI_MCA_pml", "NS_ACCFFT_", "NS_HEFFTE_" };
+    std::vector<std::string> v;
+    for (char** e = environ; e && *e; ++e)
+        for (const char* q : pre) if (!std::strncmp(*e, q, std::strlen(q))) { v.push_back(*e); break; }
+    std::sort(v.begin(), v.end());
+    std::string out;
+    for (auto& x : v) { for (char& ch : x) if (ch == ' ' || ch == ',') ch = ';'; out += (out.empty() ? "" : " ") + x; }
+    printf("FFTB_MPIENV %s\n", out.empty() ? "-" : out.c_str());
+    fflush(stdout);
+}
+
 static void bind_report(int nthreads) {
     // the rank's CPUs = union of its threads' masks (with OMP_PROC_BIND the master thread's own mask is
     // only its place, not the whole domain the rank was given)
@@ -227,6 +244,7 @@ int main(int argc, char** argv) {
         fflush(stdout);
     }
     bind_report(nthreads);
+    mpienv_report();
     E.print_decomp();          // collective for heFFTe
     E.setup();                 // P3DFFT: Cp3dfft_setup (the planning)
     const size_t nr = E.nreal(), nc = E.ncplx();
@@ -320,7 +338,12 @@ int main(int argc, char** argv) {
     double t_local = -1.0;
     if (SPLIT) {
         unsigned rigor = FFTW_MEASURE;
+#if FFTB_LIB == 2
+        // the local model plans with AccFFT's planner variable: NS_ACCFFT_PLAN if set, otherwise NS_FFTW_PLAN
+        const int rid = nsmode::plan_rigor_from_env(nsmode::PLAN_MEASURE, Engine::plan_var());
+#else
         const int rid = nsmode::plan_rigor_from_env();
+#endif
         if (rid == nsmode::PLAN_ESTIMATE) rigor = FFTW_ESTIMATE; else if (rid == nsmode::PLAN_PATIENT) rigor = FFTW_PATIENT;
         std::pair<double, double> lt = local_model(nx, ny, nz, nthreads, rigor, std::max(1.0, WINDOW / 3.0));
         t_local = (lt.first + 2.0 * lt.second) / 3.0;

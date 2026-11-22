@@ -20,6 +20,15 @@
 #   default: for every layout in FFTB_LAYOUTS ("128x1"): GCC once per GCC_COLL setting ("def"; list e.g. "def t4"),
 #            then Intel once per FFTB_INTEL_SETS entry ("name:VAR=val VAR=val;name2:..."; default one entry: E6d for
 #            2/4 nodes, single-node for 1 node, i.e. the solvers' default Intel settings). Toolchains: FFTB_TC ("gcc intel").
+#   FFTB_INTEL_SETS format: entries separated by ";", each "name:VAR=val VAR=val ..." (name = configuration name, the
+#            first word of the CSV settings column; "name:" alone = the default E6d / single-node settings).
+#            IMN_* variables go to intel_mn_env.sh (IMN_ALLTOALL, IMN_ALLTOALLV, IMN_UCX_TLS, IMN_EXTRA, ...;
+#            IMN_ALLTOALL= empty = Intel MPI's default alltoall); every other variable (NS_ACCFFT_TMETHOD, NS_ACCFFT_PLAN,
+#            I_MPI_..., UCX_...) is exported in the run's environment after intel_mn_env.sh, so it wins.
+#            Example: FFTB_INTEL_SETS="E6d:;a2a_def:IMN_ALLTOALL=;a2av1:IMN_ALLTOALLV=1;est:NS_ACCFFT_PLAN=estimate"
+#   per library, Intel only: FFTB_INTEL_ENV_FFTW / _ACCFFT / _P3DFFT / _HEFFTE = "VAR=val ..." added to every Intel run
+#            of that library (after the configuration's variables), e.g. FFTB_INTEL_ENV_ACCFFT="I_MPI_ADJUST_ALLTOALLV=1".
+#            Shown in the ">>>" line and in the CSV settings column; the mpi_env column has what the program saw.
 #   explicit: FFTB_CONFIGS = lines "name|gcc|layout|GCC_COLL=<x> [VAR=val ...]" or "name|intel|layout|IMN_...=... "
 #            (as p256_diag.sbatch; see fftb_p256.sbatch).
 #   The CSV settings column is "<name>[ <variables>] NS_DECOMP=<d>"; its first word is the configuration name, the
@@ -33,7 +42,9 @@
 #   2 nodes 6 min, 4 nodes 4 min), at least 3 min.
 # CSV ~/guohaojie/results/fftb.csv (FFTB_CSV), one line per repetition:
 #   commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,
-#   check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind
+#   check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind,mpi_env
+#   lib_settings: the library's settings() (AccFFT: tsel=measure|default|fixed tmethod=m1|m2|m3k<k>a|s call=...)
+#   mpi_env: FFTB_MPIENV of rank 0 (I_MPI_ADJUST_*, I_MPI_FABRICS, UCX_TLS, OMPI_MCA_coll*, NS_ACCFFT_*, ...; "," -> ";")
 #   bind: OK | WARN from the FFTB_BIND line (ranks of a node share no CPU, every thread on its own physical core)
 #   t_fft_s = (t_fwd + 2 t_bwd)/3: the solver mix (12 forward + 24 backward per RK4 step), 36 t_fft_s = FFT s/step.
 #   status: OK | TIMEOUT | FAILED-RUN | ERROR (mn_lib.sh) | NO-RESULT (exit 0 but no FFTB_REP line) | CHECK-FAIL |
@@ -93,14 +104,16 @@ done
 TMP=$SCR/logs/fftb_$SLURM_JOB_ID.d; mkdir -p $TMP "$(dirname "$CSV")"
 COMMIT=$(git -C $SCR/src/NavierStockes-3D log -1 --format=%h 2>/dev/null || echo unknown)
 NODELIST=$(echo "${SLURM_JOB_NODELIST:-?}" | tr ',' ';')
-HDR="commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind"
+HDR="commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind,mpi_env"
 [ -f "$CSV" ] || echo "$HDR" > "$CSV"
 # a CSV from before the bind column: extend the header only (old rows: bind empty)
 head -1 "$CSV" | grep -q ',bind' || sed -i '1s/$/,bind/' "$CSV"
+head -1 "$CSV" | grep -q ',mpi_env' || sed -i '1s/$/,mpi_env/' "$CSV"
 KEEP="^decomposition:|process grid|planner flag|P3DFFT library|Threads \(runtime\)|planning time|plan time|\(planning\) time|^FFTB|rror|abort|intel_mn_env:|GCCENV:|UCXPROBE|MPI startup\(\): +(Intel|libfabric provider)"
 echo "fftb: nodes=$NODES ($SLURM_JOB_NODELIST) grids=$GRIDS libs=$LIBS reps=$REP window=${WINDOW}s fields=$NF split=$SPLIT"
 echo "commit $COMMIT   csv $CSV   common: $COMMON   time limit: $CTM_TIMEOUT_FACTOR x expected (>= 180 s)"
 for c in "${CONFIGS[@]}"; do echo "  config $c"; done
+for lib in $LIBS; do v=FFTB_INTEL_ENV_$(echo $lib | tr a-z A-Z); [ -n "${!v:-}" ] && echo "  $v=${!v} (Intel runs of $lib)"; done
 bin_of() {   # <toolchain> <lib>
     case $1:$2 in
     gcc:heffte) echo /work/build/bin_fftb/gcc/fftb_heffte;; intel:heffte) echo /work/build/bin_fftb/intel/fftb_heffte_mkl;;
@@ -143,17 +156,25 @@ X() {
     local lib=$2 N=$3
     bin=$(bin_of $tc $lib); envs=$COMMON
     [ $tc = intel ] && [ $lib = heffte ] && envs="$envs NS_HEFFTE_REORDER=1"
+    # Intel: IMN_* of the configuration go to intel_cfg (intel_mn_env.sh), everything else into the run environment,
+    # then the per-library variables FFTB_INTEL_ENV_<LIB>
+    local imn="" oth="" w lv libenv=""
+    if [ $tc = intel ]; then
+        for w in $set; do case $w in IMN_*) imn="$imn $w";; *=*) oth="$oth $w";; esac; done
+        lv=FFTB_INTEL_ENV_$(echo $lib | tr a-z A-Z); libenv=${!lv:-}
+        envs="$envs$oth${libenv:+ $libenv}"
+    fi
     label="$(name_of $lib)-${N}_${tc}-${cn}_n${NODES}_$L"; raw=$TMP/$label.raw
     e=$(fftb_expected $N $NODES)
     tmo=$(awk -v e=$e -v f=$CTM_TIMEOUT_FACTOR 'BEGIN { t = f * e; print (t < 180 ? 180 : int(t)) }'); tl=$(( tmo / 60 + 2 ))
-    setcol="$cn"; [ -n "$set" ] && [ "$set" != "$cn" ] && setcol="$cn $set"; setcol="$setcol NS_DECOMP=$DECOMP"
+    setcol="$cn"; [ -n "$set" ] && [ "$set" != "$cn" ] && setcol="$cn $set"; setcol="$setcol${libenv:+ $libenv} NS_DECOMP=$DECOMP"
     echo ">>> [$(date +%H:%M:%S)] $label ranks=$((NODES * ppn)) threads=$nt | limit=${tmo}s $setcol | $bin $N $N $N $nt"
     if [ $tc = gcc ]; then
         t=$(echo "$set" | grep -oE "GCC_COLL=[a-z0-9]+" | cut -d= -f2)
         envs="$envs $(mn_gcc_coll ${t:-def}) $(echo "$set" | sed -E 's/GCC_COLL=[a-z0-9]+//')"
         mn_run $label $raw $tmo mn_gcc $NODES $ppn $nt $tl "$envs" $bin $N $N $N $nt
     else
-        mn_run $label $raw $tmo intel_cfg "$set" $NODES $ppn $nt $tl "$envs" $bin $N $N $N $nt
+        mn_run $label $raw $tmo intel_cfg "${imn# }" $NODES $ppn $nt $tl "$envs" $bin $N $N $N $nt
     fi
     grep -E "$KEEP" $raw | awk '!/UCXPROBE/ || !u++'
     mn_extract $raw 0
@@ -165,17 +186,18 @@ X() {
     chk=$(kv check "$line"); err=$(kv max_err "$line")
     local tplan tloc bind; tplan=$(kv t_plan_s "$line"); tloc=$(kv t_local_s "$line")
     bind=$(grep -m1 "^FFTB_BIND ranks/node" $raw | awk '{print $NF}')
+    local menv; menv=$(grep -m1 "^FFTB_MPIENV " $raw | sed 's/^FFTB_MPIENV //' | tr ',' ';')
     echo "<<< exit=$MN_RC"
     [ "$MN_RC" = 127 ] && echo "WARNING: exit 127 = command not found (missing binary $bin?)"
     while read -r r; do
         [ -z "$r" ] && continue; n=$((n + 1))
         st=$MN_STATUS; [ "$st" = OK ] && [ "$chk" = FAIL ] && st=CHECK-FAIL
-        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$(kv rep "$r"),$(kv t_fft_s "$r"),$tplan,$tloc,$chk,$MN_UCXV,$st,$(kv t_fwd_s "$r"),$(kv t_bwd_s "$r"),$(kv pairs "$r"),$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind" \
+        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$(kv rep "$r"),$(kv t_fft_s "$r"),$tplan,$tloc,$chk,$MN_UCXV,$st,$(kv t_fwd_s "$r"),$(kv t_bwd_s "$r"),$(kv pairs "$r"),$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind,$menv" \
             | tee -a "$CSV" | sed 's/^/CSV /'
     done <<< "$(grep "^FFTB_REP " $raw)"
     if [ $n = 0 ]; then
         st=$MN_STATUS; [ "$st" = OK ] && st=NO-RESULT; [ "$MN_RC" = 127 ] && st=MISSING-BINARY
-        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,0,,$tplan,,${chk:-none},$MN_UCXV,$st,,,,$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind" \
+        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,0,,$tplan,,${chk:-none},$MN_UCXV,$st,,,,$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind,$menv" \
             | tee -a "$CSV" | sed 's/^/CSV /'
     fi
     echo

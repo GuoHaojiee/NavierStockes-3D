@@ -17,6 +17,12 @@
 #      first word of settings): 36 x t_fft (the FFT time of one RK4 step in bench mode: 12 forward + 24 backward)
 #      next to the solver's "FFT (incl. transpose/comm)" s/step and the ratio
 #   5. launches / repetitions that are not OK (status, check), and multi-node Intel runs without UCX 1.17.0
+#   6. variants (fftb_accfft_tune.sbatch): every Intel configuration of library FFTB_VAR_LIB (AccFFT) against the
+#      reference FFTB_VAR_REF (GCC configuration name, GCC_COLL=t4) with the same grid, nodes and layout: launches,
+#      transpose method, t_fft median (min-max), t_local, t_comm = t_fft - t_local, comm%, t_fft/ref, comm/ref comm,
+#      ranges overlap, the median of each job (A / B rounds) separately
+# AccFFT rows in 1 and 6 show the transpose method AccFFT used (tmethod from lib_settings, FFTB_ACCFFT_TPLAN):
+#   m1 Isend/Irecv, m2 MPI_Alltoall(v), m3k<k>a|s k-way exchange async|sync; "m2x3" = 3 launches with m2.
 # Exit code 127 (command not found) is shown as "missing binary" in 5.
 # Only rows with status OK and check OK count in 1-4. Filters: FFTB_COMMIT=<hash>, FFTB_JOBS="<jobid> ...",
 # FFTB_TC=gcc|intel. A scaling study (fftb_scale.sbatch, one job per node count): FFTB_JOBS="<j1> <j2> <j4>".
@@ -26,12 +32,17 @@ CSV=${1:-$HOME/guohaojie/results/fftb.csv}
 [ -f "$CSV" ] || { echo "no $CSV"; exit 1; }
 SOLVER=${FFTB_SOLVER_CSV:-$HOME/guohaojie/results/toolchain_mn.csv}
 SF=(); for f in $SOLVER; do [ -f "$f" ] && SF+=("$f"); done
-awk -F, -v commit="${FFTB_COMMIT:-}" -v jobs=" ${FFTB_JOBS:-} " -v tcf="${FFTB_TC:-}" -v fixl="${FFTB_FIXED_LAYOUT:-128x1}" -v nsolver=${#SF[@]} '
+awk -F, -v commit="${FFTB_COMMIT:-}" -v jobs=" ${FFTB_JOBS:-} " -v tcf="${FFTB_TC:-}" -v fixl="${FFTB_FIXED_LAYOUT:-128x1}" -v nsolver=${#SF[@]} -v vlib="${FFTB_VAR_LIB:-AccFFT}" -v vref="${FFTB_VAR_REF:-GCC_COLL=t4}" '
 function sortv(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j >= 1 && a[j] > t; j--) a[j + 1] = a[j]; a[j + 1] = t } }
 function median(a, n) { sortv(a, n); return (n % 2) ? a[(n + 1) / 2] : (a[n / 2] + a[n / 2 + 1]) / 2 }
 function libord(l) { return (l == "FFTW") ? 1 : (l == "AccFFT") ? 2 : (l == "P3DFFT") ? 3 : (l == "heFFTe") ? 4 : 5 }
 function first(s,   a) { split(s, a, " "); return a[1] }
 function rpn(l,   a) { split(l, a, "x"); return a[1] + 0 }
+function tmfmt(k,   a, m, i, r) { if (tml[k] == "") return ""; m = split(tml[k], a, "/"); r = ""
+    for (i = 1; i <= m; i++) r = r (i > 1 ? "/" : "") a[i] "x" tmc[k, a[i]]; return r }
+function jobmeds(k,   js, m, i, j, c, r) { m = split(jbl[k], js, " "); r = ""
+    for (i = 1; i <= m; i++) { c = njb[k, js[i]]; for (j = 1; j <= c; j++) za[j] = tjb[k, js[i], j]; r = r (i > 1 ? " / " : "") sprintf("%.4e", median(za, c)) }
+    return r }
 FNR == 1 { fileno++; if (fileno > 1 && $0 ~ /^commit,/) { for (i = 1; i <= NF; i++) sc[fileno, $i] = i }; next }
 # ---------------- solver CSV files (toolchain_mn.csv layout, header-driven)
 fileno > 1 {
@@ -62,6 +73,10 @@ tcf != "" && $4 != tcf { next }
     if (!(lay in layseen)) { layseen[lay] = 1; lays[++nlay] = lay }
     if (!(k in n)) keys[++nk] = k
     n[k]++; t[k, n[k]] = $12 + 0; pl[k, n[k]] = $13 + 0
+    if ($11 == "1") { nla[k]++
+        if (lib == "AccFFT" && match($23, /tmethod=[^ ;]+/)) { tmv = substr($23, RSTART + 8, RLENGTH - 8)
+            if (!((k, tmv) in tmc)) tml[k] = tml[k] (tml[k] == "" ? "" : "/") tmv; tmc[k, tmv]++ } }
+    jb = $2; if (!((k, jb) in njb)) jbl[k] = jbl[k] " " jb; njb[k, jb]++; tjb[k, jb, njb[k, jb]] = $12 + 0
     if ($14 != "") { nl[k]++; tl[k, nl[k]] = $14 + 0 }
     if (index(" " uv[k] " ", " " $16 " ") == 0) uv[k] = uv[k] " " $16
     libs[lib] = 1; grids[g] = 1; nodes[nn] = 1
@@ -78,7 +93,7 @@ END {
         loc = "-"; cm = "-"
         if (nl[k]) { for (j = 1; j <= nl[k]; j++) c[j] = tl[k, j]; ml = median(c, nl[k]); loc = sprintf("%.4e", ml); cm = sprintf("%.0f", 100 * (med[k] - ml) / med[k])
                      tloc[k] = ml; cfr[k] = (med[k] - ml) / med[k] }
-        printf "%-7s %5s %5s %-5s %-6s %4d  %.4e (%.4e-%.4e) %9.3f %11s %6s %-8s %s%s\n", p[1], p[2], p[3], p[4], p[6], m, med[k], lo[k], hi[k], mp, loc, cm, uv[k], p[5], (k in bw) ? "  bindWARN" : ""
+        printf "%-7s %5s %5s %-5s %-6s %4d  %.4e (%.4e-%.4e) %9.3f %11s %6s %-8s %s%s\n", p[1], p[2], p[3], p[4], p[6], m, med[k], lo[k], hi[k], mp, loc, cm, uv[k], p[5], ((k in bw) ? "  bindWARN" : "") (tml[k] != "" ? "  tm=" tmfmt(k) : "")
         gk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4] SUBSEP first(p[5])
         if (!(gk in gseen)) { gseen[gk] = 1; gord[++ng] = gk }
         if (!((gk, p[6]) in gmed) || med[k] < gmed[gk, p[6]]) { gmed[gk, p[6]] = med[k]; gkey[gk, p[6]] = k }
@@ -183,4 +198,32 @@ END {
     # ---- 5. problems
     print ""; print "--- 5. not OK (" np + 0 (nmb ? "; " nmb " with exit 127 = missing binary: rebuild, build_fftb.sh must end with BUILD OK" : "") ")"
     for (i = 1; i <= np; i++) print prob[i]
+    # ---- 6. variants against the reference configuration
+    print ""; print "--- 6. " vlib " variants against " vref " (same grid, nodes, layout); comm = t_fft - t_local; per FFT"
+    nvg = 0
+    for (gg in grids) for (nn = 1; nn <= 4; nn *= 2) for (li = 1; li <= nlay; li++) {
+        lay = lays[li]; rk = ""; nc = 0
+        for (i = 1; i <= nk; i++) { split(keys[i], p, SUBSEP)
+            if (p[1] != vlib || p[2] != gg || p[3] != nn || p[6] != lay) continue
+            if (p[4] == "gcc" && first(p[5]) == vref && (rk == "" || med[keys[i]] < med[rk])) rk = keys[i] }
+        for (i = 1; i <= nk; i++) { split(keys[i], p, SUBSEP)
+            if (p[1] == vlib && p[2] == gg && p[3] == nn && p[6] == lay && p[4] == "intel") cand[++nc] = keys[i] }
+        if (!nc) continue
+        for (i = 2; i <= nc; i++) { tt = cand[i]; for (j = i - 1; j >= 1 && med[cand[j]] > med[tt]; j--) cand[j + 1] = cand[j]; cand[j + 1] = tt }
+        nvg++
+        printf "\n  %s %s, %s node%s, layout %s  (reference %s: %s)\n", vlib, gg, nn, (nn > 1 ? "s" : ""), lay, vref, (rk == "" ? "none" : sprintf("%.4e s", med[rk]))
+        printf "  %-5s %-12s %-16s %3s  %-34s %10s %10s %5s %7s %8s %4s  %s\n", "tc", "config", "tmethod", "la", "t_fft s: median (min-max)", "t_local s", "t_comm s", "comm%", "t/ref", "comm/ref", "ovl", "per job"
+        for (i = 0; i <= nc; i++) {
+            k = (i == 0) ? rk : cand[i]; if (k == "") continue
+            split(k, p, SUBSEP)
+            lc = (k in tloc) ? sprintf("%10.4e", tloc[k]) : sprintf("%10s", "-"); cc = (k in tloc) ? sprintf("%10.4e", med[k] - tloc[k]) : sprintf("%10s", "-")
+            cp = (k in cfr) ? sprintf("%4.0f%%", 100 * cfr[k]) : "    -"
+            r1 = (rk != "" && i > 0) ? sprintf("%7.3f", med[k] / med[rk]) : sprintf("%7s", i == 0 ? "1" : "-")
+            r2 = (rk != "" && i > 0 && (k in tloc) && (rk in tloc) && med[rk] > tloc[rk]) ? sprintf("%8.3f", (med[k] - tloc[k]) / (med[rk] - tloc[rk])) : sprintf("%8s", i == 0 ? "1" : "-")
+            ov = (rk != "" && i > 0) ? ((lo[k] <= hi[rk] && lo[rk] <= hi[k]) ? "yes" : "no") : "-"
+            printf "  %-5s %-12s %-16s %3d  %.4e (%.4e-%.4e) %s %s %5s %s %s %4s  %s\n", p[4], substr(first(p[5]), 1, 12), (tmfmt(k) == "" ? "-" : substr(tmfmt(k), 1, 16)), nla[k], med[k], lo[k], hi[k], lc, cc, cp, r1, r2, ov, jobmeds(k)
+        }
+    }
+    if (!nvg) print "  (no " vlib " Intel runs)"
+    else print "  (la = launches; t/ref and comm/ref against the reference row; ovl = min-max ranges overlap; per job = median of each job, in job order)"
 }' "$CSV" "${SF[@]}"

@@ -154,13 +154,14 @@ inline void print_phase_summary(const double acc[PH_COUNT], double total_wall, l
 // -----------------------------------------------------------------------------
 // FFTW planner rigor from the environment (CPU solvers whose library takes it at run time)
 //   NS_FFTW_PLAN = estimate | measure | patient | exhaustive      (default: measure)
+//   (var: another variable with the same values, e.g. NS_ACCFFT_PLAN for AccFFT only)
 // The environment is the same on every rank (srun exports it), so no broadcast is needed.
 // Returns PLAN_INVALID for an unknown value; the caller aborts.
 // -----------------------------------------------------------------------------
 enum PlanRigor { PLAN_INVALID = -1, PLAN_ESTIMATE = 0, PLAN_MEASURE = 1, PLAN_PATIENT = 2, PLAN_EXHAUSTIVE = 3 };
 
-inline int plan_rigor_from_env(int def = PLAN_MEASURE) {
-    const char* s = std::getenv("NS_FFTW_PLAN");
+inline int plan_rigor_from_env(int def = PLAN_MEASURE, const char* var = "NS_FFTW_PLAN") {
+    const char* s = std::getenv(var);
     if (!s || !*s)                     return def;
     if (!std::strcmp(s, "estimate"))   return PLAN_ESTIMATE;
     if (!std::strcmp(s, "measure"))    return PLAN_MEASURE;
