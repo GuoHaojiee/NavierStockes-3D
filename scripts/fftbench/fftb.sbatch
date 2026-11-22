@@ -33,7 +33,8 @@
 #   2 nodes 6 min, 4 nodes 4 min), at least 3 min.
 # CSV ~/guohaojie/results/fftb.csv (FFTB_CSV), one line per repetition:
 #   commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,
-#   check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason
+#   check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind
+#   bind: OK | WARN from the FFTB_BIND line (ranks of a node share no CPU, every thread on its own physical core)
 #   t_fft_s = (t_fwd + 2 t_bwd)/3: the solver mix (12 forward + 24 backward per RK4 step), 36 t_fft_s = FFT s/step.
 #   status: OK | TIMEOUT | FAILED-RUN | ERROR (mn_lib.sh) | NO-RESULT (exit 0 but no FFTB_REP line) | CHECK-FAIL.
 #   A launch without results writes one line with rep=0.
@@ -89,8 +90,10 @@ done
 TMP=$SCR/logs/fftb_$SLURM_JOB_ID.d; mkdir -p $TMP "$(dirname "$CSV")"
 COMMIT=$(git -C $SCR/src/NavierStockes-3D log -1 --format=%h 2>/dev/null || echo unknown)
 NODELIST=$(echo "${SLURM_JOB_NODELIST:-?}" | tr ',' ';')
-HDR="commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason"
+HDR="commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,t_fft_s,t_plan_s,t_local_s,check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind"
 [ -f "$CSV" ] || echo "$HDR" > "$CSV"
+# a CSV from before the bind column: extend the header only (old rows: bind empty)
+head -1 "$CSV" | grep -q ',bind' || sed -i '1s/$/,bind/' "$CSV"
 KEEP="^decomposition:|process grid|planner flag|P3DFFT library|Threads \(runtime\)|planning time|plan time|\(planning\) time|^FFTB|rror|abort|intel_mn_env:|GCCENV:|UCXPROBE|MPI startup\(\): +(Intel|libfabric provider)"
 echo "fftb: nodes=$NODES ($SLURM_JOB_NODELIST) grids=$GRIDS libs=$LIBS reps=$REP window=${WINDOW}s fields=$NF split=$SPLIT"
 echo "commit $COMMIT   csv $CSV   common: $COMMON   time limit: $CTM_TIMEOUT_FACTOR x expected (>= 180 s)"
@@ -148,17 +151,18 @@ X() {
     line=$(grep -m1 "^FFTB_SUMMARY" $raw)
     libset=$(echo "$line" | grep -oE 'settings="[^"]*"' | sed 's/settings="//;s/"$//' | tr ',' ';')
     chk=$(kv check "$line"); err=$(kv max_err "$line")
-    local tplan tloc; tplan=$(kv t_plan_s "$line"); tloc=$(kv t_local_s "$line")
+    local tplan tloc bind; tplan=$(kv t_plan_s "$line"); tloc=$(kv t_local_s "$line")
+    bind=$(grep -m1 "^FFTB_BIND ranks/node" $raw | awk '{print $NF}')
     echo "<<< exit=$MN_RC"
     while read -r r; do
         [ -z "$r" ] && continue; n=$((n + 1))
         st=$MN_STATUS; [ "$st" = OK ] && [ "$chk" = FAIL ] && st=CHECK-FAIL
-        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$(kv rep "$r"),$(kv t_fft_s "$r"),$tplan,$tloc,$chk,$MN_UCXV,$st,$(kv t_fwd_s "$r"),$(kv t_bwd_s "$r"),$(kv pairs "$r"),$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY" \
+        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$(kv rep "$r"),$(kv t_fft_s "$r"),$tplan,$tloc,$chk,$MN_UCXV,$st,$(kv t_fwd_s "$r"),$(kv t_bwd_s "$r"),$(kv pairs "$r"),$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind" \
             | tee -a "$CSV" | sed 's/^/CSV /'
     done <<< "$(grep "^FFTB_REP " $raw)"
     if [ $n = 0 ]; then
         st=$MN_STATUS; [ "$st" = OK ] && st=NO-RESULT
-        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,0,,$tplan,,${chk:-none},$MN_UCXV,$st,,,,$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY" \
+        echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,0,,$tplan,,${chk:-none},$MN_UCXV,$st,,,,$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind" \
             | tee -a "$CSV" | sed 's/^/CSV /'
     fi
     echo

@@ -5,23 +5,30 @@
 #   2. Intel vs GCC per (library, grid, nodes): the best GCC configuration (lowest median over settings and layouts),
 #      every Intel configuration against it (ratio, "ranges overlap" = the min-max ranges overlap, i.e. the
 #      difference is within the scatter), and best Intel vs best GCC
-#   3. strong scaling per (library, grid, toolchain): best configuration per node count, speedup and efficiency
-#      relative to the smallest node count present
+#   1b. layouts per (library, grid, nodes, toolchain, configuration name): t_fft of every layout, the best one marked
+#   1c. communication share per configuration (FFTB_SPLIT=1 runs): t_comm = t_fft - t_local, (t_fft - t_local)/t_fft
+#   3. strong scaling per (library, grid, toolchain): best configuration (layout, settings) per node count,
+#      speedup and efficiency relative to the smallest node count present; communication share of that configuration
+#   3b. the same with one fixed layout for every node count (FFTB_FIXED_LAYOUT, default 128x1), for comparison
 #   4. against the solver: rows of FFTB_SOLVER_CSV (default ~/guohaojie/results/toolchain_mn.csv; several files
 #      allowed, space separated) with the same (library, grid, nodes, toolchain, layout, configuration name =
 #      first word of settings): 36 x t_fft (the FFT time of one RK4 step in bench mode: 12 forward + 24 backward)
 #      next to the solver's "FFT (incl. transpose/comm)" s/step and the ratio
 #   5. launches / repetitions that are not OK (status, check), and multi-node Intel runs without UCX 1.17.0
-# Only rows with status OK and check OK count in 1-4. Filters: FFTB_COMMIT=<hash>, FFTB_JOBS="<jobid> ...".
+# Only rows with status OK and check OK count in 1-4. Filters: FFTB_COMMIT=<hash>, FFTB_JOBS="<jobid> ...",
+# FFTB_TC=gcc|intel. A scaling study (fftb_scale.sbatch, one job per node count): FFTB_JOBS="<j1> <j2> <j4>".
+# Runs whose FFTB_BIND check said WARN (ranks sharing CPUs, threads sharing a core) are counted but marked "bindWARN"
+# in 1 and listed in 5.
 CSV=${1:-$HOME/guohaojie/results/fftb.csv}
 [ -f "$CSV" ] || { echo "no $CSV"; exit 1; }
 SOLVER=${FFTB_SOLVER_CSV:-$HOME/guohaojie/results/toolchain_mn.csv}
 SF=(); for f in $SOLVER; do [ -f "$f" ] && SF+=("$f"); done
-awk -F, -v commit="${FFTB_COMMIT:-}" -v jobs=" ${FFTB_JOBS:-} " -v nsolver=${#SF[@]} '
+awk -F, -v commit="${FFTB_COMMIT:-}" -v jobs=" ${FFTB_JOBS:-} " -v tcf="${FFTB_TC:-}" -v fixl="${FFTB_FIXED_LAYOUT:-128x1}" -v nsolver=${#SF[@]} '
 function sortv(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j >= 1 && a[j] > t; j--) a[j + 1] = a[j]; a[j + 1] = t } }
 function median(a, n) { sortv(a, n); return (n % 2) ? a[(n + 1) / 2] : (a[n / 2] + a[n / 2 + 1]) / 2 }
 function libord(l) { return (l == "FFTW") ? 1 : (l == "AccFFT") ? 2 : (l == "P3DFFT") ? 3 : (l == "heFFTe") ? 4 : 5 }
 function first(s,   a) { split(s, a, " "); return a[1] }
+function rpn(l,   a) { split(l, a, "x"); return a[1] + 0 }
 FNR == 1 { fileno++; if (fileno > 1 && $0 ~ /^commit,/) { for (i = 1; i <= NF; i++) sc[fileno, $i] = i }; next }
 # ---------------- solver CSV files (toolchain_mn.csv layout, header-driven)
 fileno > 1 {
@@ -35,14 +42,19 @@ fileno > 1 {
 # ---------------- fftb.csv
 commit != "" && $1 != commit { next }
 jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
+tcf != "" && $4 != tcf { next }
 {
     tc = $4; set = $5; lib = $6; g = $7; nn = $8; lay = $9 "x" $10; st = $17; chk = $15
     if (st != "OK" || chk != "OK" || $11 == "0" || $12 == "")
         prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%-2s job=%s status=%s check=%s exit=%s retries=%s  %s", lib, g, nn, tc, lay, $11, $2, st, chk, $25, $24, set)
     else if (tc == "intel" && nn + 0 > 1 && $16 != "1.17.0")
         prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%-2s job=%s UCX %s (%s)  %s", lib, g, nn, tc, lay, $11, $2, $16, $26, set)
+    if ($27 == "WARN" && st == "OK" && $11 == "1")
+        prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s job=%s FFTB_BIND WARN (ranks share CPUs or threads share a core)  %s", lib, g, nn, tc, lay, $2, set)
     if (st != "OK" || chk != "OK" || $12 == "") next
     k = lib SUBSEP g SUBSEP nn SUBSEP tc SUBSEP set SUBSEP lay
+    if ($27 == "WARN") bw[k] = 1
+    if (!(lay in layseen)) { layseen[lay] = 1; lays[++nlay] = lay }
     if (!(k in n)) keys[++nk] = k
     n[k]++; t[k, n[k]] = $12 + 0; pl[k, n[k]] = $13 + 0
     if ($14 != "") { nl[k]++; tl[k, nl[k]] = $14 + 0 }
@@ -59,15 +71,49 @@ END {
         for (j = 1; j <= m; j++) { a[j] = t[k, j]; b[j] = pl[k, j] }
         sortv(a, m); lo[k] = a[1]; hi[k] = a[m]; med[k] = median(a, m); mp = median(b, m)
         loc = "-"; cm = "-"
-        if (nl[k]) { for (j = 1; j <= nl[k]; j++) c[j] = tl[k, j]; ml = median(c, nl[k]); loc = sprintf("%.4e", ml); cm = sprintf("%.0f", 100 * (med[k] - ml) / med[k]) }
-        printf "%-7s %5s %5s %-5s %-6s %4d  %.4e (%.4e-%.4e) %9.3f %11s %6s %-8s %s\n", p[1], p[2], p[3], p[4], p[6], m, med[k], lo[k], hi[k], mp, loc, cm, uv[k], p[5]
+        if (nl[k]) { for (j = 1; j <= nl[k]; j++) c[j] = tl[k, j]; ml = median(c, nl[k]); loc = sprintf("%.4e", ml); cm = sprintf("%.0f", 100 * (med[k] - ml) / med[k])
+                     tloc[k] = ml; cfr[k] = (med[k] - ml) / med[k] }
+        printf "%-7s %5s %5s %-5s %-6s %4d  %.4e (%.4e-%.4e) %9.3f %11s %6s %-8s %s%s\n", p[1], p[2], p[3], p[4], p[6], m, med[k], lo[k], hi[k], mp, loc, cm, uv[k], p[5], (k in bw) ? "  bindWARN" : ""
+        gk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4] SUBSEP first(p[5])
+        if (!(gk in gseen)) { gseen[gk] = 1; gord[++ng] = gk }
+        if (!((gk, p[6]) in gmed) || med[k] < gmed[gk, p[6]]) { gmed[gk, p[6]] = med[k]; gkey[gk, p[6]] = k }
+        if (!(gk in gbest) || med[k] < gbest[gk]) { gbest[gk] = med[k]; gblay[gk] = p[6] }
+        fk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]
+        if (p[6] == fixl && (!(fk in fbest) || med[k] < fbest[fk])) { fbest[fk] = med[k]; fbkey[fk] = k }
         bk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]
         if (!(bk in best) || med[k] < best[bk]) { best[bk] = med[k]; bkey[bk] = k }
     }
+    # layouts in order of ranks per node, most ranks first
+    for (i = 2; i <= nlay; i++) { tt = lays[i]; for (j = i - 1; j >= 1 && rpn(lays[j]) < rpn(tt); j--) lays[j + 1] = lays[j]; lays[j + 1] = tt }
+    # ---- 1b. layouts
+    print ""; print "--- 1b. layouts per (library, grid, nodes, toolchain, configuration): t_fft s per layout (comm% if measured), * = best"
+    printf "%-7s %5s %5s %-5s %-12s", "lib", "grid", "nodes", "tc", "config"; for (i = 1; i <= nlay; i++) printf " %17s", lays[i]; printf "   best\n"
+    for (o = 1; o <= 5; o++) for (gi = 1; gi <= ng; gi++) {
+        split(gord[gi], p, SUBSEP); if (libord(p[1]) != o) continue
+        gk = gord[gi]; printf "%-7s %5s %5s %-5s %-12s", p[1], p[2], p[3], p[4], substr(p[5], 1, 12)
+        for (i = 1; i <= nlay; i++) {
+            if (!((gk, lays[i]) in gmed)) { printf " %17s", "-"; continue }
+            k = gkey[gk, lays[i]]; cs = (k in cfr) ? sprintf("(%2.0f%%)", 100 * cfr[k]) : "     "
+            printf " %10.4e%s%s", gmed[gk, lays[i]], cs, (lays[i] == gblay[gk]) ? "*" : " "
+        }
+        printf "   %s\n", gblay[gk]
+    }
+    # ---- 1c. communication share
+    print ""; print "--- 1c. communication share per configuration (FFTB_SPLIT=1): t_comm = t_fft - t_local (upper estimate: includes packing)"
+    printf "%-7s %5s %5s %-5s %-6s %-12s %11s %11s %11s %6s\n", "lib", "grid", "nodes", "tc", "layout", "config", "t_fft s", "t_local s", "t_comm s", "comm%"
+    nc1 = 0
+    for (o = 1; o <= 5; o++) for (nn = 1; nn <= 4; nn *= 2) for (i = 1; i <= nk; i++) {
+        split(keys[i], p, SUBSEP); k = keys[i]; if (libord(p[1]) != o || p[3] != nn || !(k in cfr)) continue
+        nc1++
+        printf "%-7s %5s %5s %-5s %-6s %-12s %11.4e %11.4e %11.4e %5.0f%%\n", p[1], p[2], p[3], p[4], p[6], substr(first(p[5]), 1, 12), med[k], tloc[k], med[k] - tloc[k], 100 * cfr[k]
+    }
+    if (!nc1) print "  (no runs with FFTB_SPLIT=1)"
     # ---- 2. Intel vs GCC
     print ""; print "--- 2. Intel vs GCC per (library, grid, nodes): every Intel configuration against the best GCC one"
-    printf "%-7s %5s %5s  %-44s %-6s %11s %11s %8s  %s\n", "lib", "grid", "nodes", "intel settings", "layout", "intel s", "best gcc s", "int/gcc", "ranges overlap"
-    for (o = 1; o <= 5; o++) for (gi = 1; gi <= nk; gi++) {
+    hasg = 0; for (bk in best) { split(bk, p, SUBSEP); if (p[4] == "gcc") hasg = 1 }
+    if (!hasg) print "  (no GCC runs selected)"
+    else printf "%-7s %5s %5s  %-44s %-6s %11s %11s %8s  %s\n", "lib", "grid", "nodes", "intel settings", "layout", "intel s", "best gcc s", "int/gcc", "ranges overlap"
+    if (hasg) for (o = 1; o <= 5; o++) for (gi = 1; gi <= nk; gi++) {
         split(keys[gi], p, SUBSEP); if (libord(p[1]) != o || p[4] != "intel") continue
         gk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP "gcc"
         if (!(gk in best)) { printf "%-7s %5s %5s  %-44s %-6s %11.4e %11s %8s  %s\n", p[1], p[2], p[3], substr(p[5], 1, 44), p[6], med[keys[gi]], "-", "-", "-"; continue }
@@ -77,20 +123,27 @@ END {
         printf "%-7s %5s %5s  %-44s %-6s %11.4e %11.4e %8.3f  %s%s\n", p[1], p[2], p[3], substr(p[5], 1, 44), p[6], med[k], best[gk], med[k] / best[gk], ov, mark
     }
     for (bk in best) { split(bk, p, SUBSEP); if (p[4] == "gcc") { split(bkey[bk], qq, SUBSEP); printf "  best gcc %-7s %5s n=%s: %s %s  %.4e\n", p[1], p[2], p[3], qq[6], qq[5], best[bk] } }
-    # ---- 3. strong scaling
-    print ""; print "--- 3. strong scaling: best configuration per node count (t_fft s, speedup S and efficiency E vs the smallest node count)"
-    printf "%-7s %5s %-5s", "lib", "grid", "tc"; for (nn = 1; nn <= 4; nn *= 2) printf " | %24s", nn " node" (nn > 1 ? "s" : ""); printf "\n"
-    for (o = 1; o <= 5; o++) for (l in libs) { if (libord(l) != o) continue
-        for (g in grids) for (ti = 1; ti <= 2; ti++) { tc = (ti == 1) ? "gcc" : "intel"
-            n0 = 0; for (nn = 1; nn <= 4; nn *= 2) if ((l SUBSEP g SUBSEP nn SUBSEP tc) in best) { n0 = nn; break }
-            if (!n0) continue
-            t0 = best[l SUBSEP g SUBSEP n0 SUBSEP tc]
-            printf "%-7s %5s %-5s", l, g, tc
-            for (nn = 1; nn <= 4; nn *= 2) { bk = l SUBSEP g SUBSEP nn SUBSEP tc
-                if (bk in best) printf " | %.4e %5.2f %5.0f%%", best[bk], t0 / best[bk], 100 * t0 / best[bk] / (nn / n0)
-                else printf " | %24s", "-" }
-            printf "\n" } }
-    print "  (S = T(n0) / T(n), E = S / (n / n0), n0 = smallest node count with data)"
+    # ---- 3. strong scaling (best configuration per node count) and 3b (fixed layout)
+    for (pass = 1; pass <= 2; pass++) {
+        print ""
+        if (pass == 1) print "--- 3. strong scaling, best configuration per node count: t_fft s, layout, speedup S, efficiency E, comm%"
+        else print "--- 3b. strong scaling with the fixed layout " fixl " (for comparison with 3)"
+        printf "%-7s %5s %-5s", "lib", "grid", "tc"; for (nn = 1; nn <= 4; nn *= 2) printf " | %34s", nn " node" (nn > 1 ? "s" : ""); printf "\n"
+        nrow = 0
+        for (o = 1; o <= 5; o++) for (l in libs) { if (libord(l) != o) continue
+            for (g in grids) for (ti = 1; ti <= 2; ti++) { tc = (ti == 1) ? "gcc" : "intel"
+                n0 = 0; for (nn = 1; nn <= 4; nn *= 2) { bk = l SUBSEP g SUBSEP nn SUBSEP tc; if ((pass == 1 && (bk in best)) || (pass == 2 && (bk in fbest))) { n0 = nn; break } }
+                if (!n0) continue
+                bk = l SUBSEP g SUBSEP n0 SUBSEP tc; t0 = (pass == 1) ? best[bk] : fbest[bk]
+                printf "%-7s %5s %-5s", l, g, tc; nrow++
+                for (nn = 1; nn <= 4; nn *= 2) { bk = l SUBSEP g SUBSEP nn SUBSEP tc
+                    if (pass == 1 && (bk in best)) { tv = best[bk]; kk = bkey[bk] } else if (pass == 2 && (bk in fbest)) { tv = fbest[bk]; kk = fbkey[bk] } else { printf " | %34s", "-"; continue }
+                    split(kk, qs, SUBSEP); cs = (kk in cfr) ? sprintf("%3.0f%%", 100 * cfr[kk]) : "   -"
+                    printf " | %.4e %-6s %5.2f %4.0f%% %s", tv, qs[6], t0 / tv, 100 * t0 / tv / (nn / n0), cs }
+                printf "\n" } }
+        if (!nrow) print "  (no data" (pass == 2 ? " with layout " fixl : "") ")"
+    }
+    print "  (S = T(n0) / T(n), E = S / (n / n0), n0 = smallest node count with data; the last column is the comm% of that configuration)"
     # ---- 4. against the solver
     print ""; print "--- 4. against the solver: 36 x t_fft vs the solver FFT s/step, same (lib, grid, nodes, toolchain, layout, configuration name)"
     if (!nsolver) print "  (no solver CSV found)"

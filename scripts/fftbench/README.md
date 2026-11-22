@@ -31,7 +31,10 @@ output, timing lines masked, is identical to the previous binaries, and so are t
    - Each repetition prints `FFTB_REP ... t_fft_s=...`.
    - **t_fft_s = (t_fwd + 2·t_bwd)/3**: the solver's mix (12 forward + 24 backward per RK4 step in bench mode), so
      **36 × t_fft_s = FFT time per solver step**.
-5. **`FFTB_SPLIT=1`** additionally times the local FFT work with plain FFTW: batched 1-D transforms over N³/P points,
+5. **Binding.** At start-up `FFTB_BIND ... OK|WARN` reports whether the ranks of a node share a CPU and whether
+   every OpenMP thread sits on its own physical core (sysfs `core_id`). It becomes the CSV `bind` column.
+   `FFTB_SHOWBIND=1` also prints the CPU lists of ranks 0 and 1.
+6. **`FFTB_SPLIT=1`** additionally times the local FFT work with plain FFTW: batched 1-D transforms over N³/P points,
    same thread count, no communication. `t_fft − t_local` is an upper estimate of the communication + packing time.
 
 ## Cluster
@@ -77,16 +80,37 @@ FFTB_SOLVER_CSV=~/guohaojie/results/p256_diag.csv bash fftb_parse.sh
 - `settings` = configuration name (first word) + its variables + `NS_DECOMP`.
 - `status` is one of: OK, TIMEOUT, FAILED-RUN, ERROR, NO-RESULT, CHECK-FAIL.
 
+## fftb_scale.sbatch `<nodes> <grid>` (Intel only, scaling scan)
+
+- Four libraries: FFTW, AccFFT, P3DFFT, heFFTe (MKL backend, `NS_HEFFTE_REORDER=1`); slab, MEASURE, `FFTB_SPLIT=1`,
+  3 repetitions per launch.
+- Layouts `FFTB_LAYOUTS` (`"128x1 64x2 32x4 16x8"`), with threads = 128 / ranks per node.
+- Thread settings: `OMP_PLACES=cores`, `OMP_PROC_BIND=close`, `KMP_BLOCKTIME=0`, `MKL_NUM_THREADS` = threads.
+- Binding:
+  - 1 node: Intel `mpirun` pins with `I_MPI_PIN_DOMAIN=<threads>:compact`.
+  - 2 and 4 nodes: `srun --cpu-bind=cores -c <threads>`.
+  - Either way the `FFTB_BIND` line checks the result.
+
+```bash
+sbatch -N 1 -J fftb_scale_1024_1 -t 04:00:00 fftb_scale.sbatch 1 1024
+sbatch -N 2 -J fftb_scale_1024_2 -t 03:00:00 fftb_scale.sbatch 2 1024
+sbatch -N 4 -J fftb_scale_1024_4 -t 02:00:00 fftb_scale.sbatch 4 1024
+FFTB_JOBS="<job1> <job2> <job4>" bash fftb_parse.sh
+```
+
 ## fftb_parse.sh `[csv]`
 
 The parser prints five sections:
 1. Per (library, grid, nodes, toolchain, settings, layout): the median and range.
+   - **1b**: every layout of a configuration side by side, with the best one marked.
+   - **1c**: the communication share (t_fft − t_local)/t_fft per configuration.
 2. Intel against the best GCC configuration: ratio and whether the ranges overlap.
-3. Strong scaling.
+3. Strong scaling with the best layout per node count (speedup, efficiency, comm%).
+   **3b**: the same with the fixed layout `FFTB_FIXED_LAYOUT` (128x1).
 4. Against the solver: 36 × t_fft next to the solver's `FFT (incl. transpose/comm)` s/step. It uses the rows of
    `FFTB_SOLVER_CSV` (default `toolchain_mn.csv`) with the same library, grid, nodes, toolchain, layout and
    configuration name. The configuration name is the first word of settings: `GCC_COLL=def`, `E6d`, `single-node`,
    or the `p256_diag` names `i_a_base` … `g_def`.
 5. Everything that is not OK.
 
-Filters: `FFTB_JOBS`, `FFTB_COMMIT`.
+Filters: `FFTB_JOBS`, `FFTB_COMMIT`, `FFTB_TC`. Runs with a binding WARN are marked and listed in section 5.

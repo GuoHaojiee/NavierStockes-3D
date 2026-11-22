@@ -37,6 +37,8 @@
 #include <vector>
 #include <mpi.h>
 #include <omp.h>
+#include <sched.h>
+#include <unistd.h>
 
 #ifndef FFTB_LIB
 #error "compile with -DFFTB_LIB=1 (FFTW) | 2 (AccFFT) | 3 (P3DFFT) | 4 (heFFTe)"
@@ -62,6 +64,70 @@ static int g_rank = 0, g_np = 1;
 static double max_all(double v) { double m; MPI_Allreduce(&v, &m, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD); return m; }
 static double env_dbl(const char* n, double d) { const char* v = getenv(n); return (v && *v) ? atof(v) : d; }
 static int env_int(const char* n, int d) { const char* v = getenv(n); return (v && *v) ? atoi(v) : d; }
+// ---- binding report (always, rank 0 prints one FFTB_BIND line; FFTB_SHOWBIND=1 also the CPU lists of ranks 0 and 1)
+// Per rank: CPUs in the union of its threads' affinity masks; CPU of every OpenMP thread (sched_getcpu inside a parallel region, after a
+// short spin so the threads have settled); distinct CPUs and distinct physical cores (sysfs core_id +
+// physical_package_id) among the threads. Per node: CPUs that are in the masks of two or more ranks.
+// OK = no overlap between ranks and every thread on its own physical core.
+static std::string cpu_list(const std::vector<int>& v) {
+    std::string s; for (size_t i = 0; i < v.size(); ++i) { if (i) s += ","; s += std::to_string(v[i]); } return s;
+}
+static long core_key(int cpu) {
+    auto rd = [](const std::string& p) { FILE* f = fopen(p.c_str(), "r"); int x = -1; if (f) { if (fscanf(f, "%d", &x) != 1) x = -1; fclose(f); } return x; };
+    const std::string b = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+    const int core = rd(b + "core_id"), pkg = rd(b + "physical_package_id");
+    return core < 0 ? -1 - cpu : (long)pkg * 100000 + core;
+}
+static void bind_report(int nthreads) {
+    // the rank's CPUs = union of its threads' masks (with OMP_PROC_BIND the master thread's own mask is
+    // only its place, not the whole domain the rank was given)
+    cpu_set_t m; CPU_ZERO(&m);
+    std::vector<int> tcpu(nthreads, -1);
+    #pragma omp parallel num_threads(nthreads)
+    {
+        volatile double x = 0.0; for (int i = 0; i < 2000000; ++i) x += 1e-9 * i;
+        cpu_set_t t; CPU_ZERO(&t); sched_getaffinity(0, sizeof t, &t);
+        tcpu[omp_get_thread_num()] = sched_getcpu();
+        #pragma omp critical
+        CPU_OR(&m, &m, &t);
+    }
+    const int nmask = CPU_COUNT(&m);
+    std::vector<int> d = tcpu; std::sort(d.begin(), d.end()); d.erase(std::unique(d.begin(), d.end()), d.end());
+    std::vector<long> ck; for (int c : tcpu) ck.push_back(core_key(c));
+    std::sort(ck.begin(), ck.end()); ck.erase(std::unique(ck.begin(), ck.end()), ck.end());
+    // overlap of the masks of the ranks of one node
+    MPI_Comm node; MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, g_rank, MPI_INFO_NULL, &node);
+    int nr; MPI_Comm_size(node, &nr);
+    std::vector<unsigned char> all((size_t)nr * sizeof m);
+    MPI_Allgather(&m, sizeof m, MPI_BYTE, all.data(), sizeof m, MPI_BYTE, node);
+    int overlap = 0;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        int k = 0; for (int r = 0; r < nr; ++r) if (CPU_ISSET(c, (cpu_set_t*)(all.data() + (size_t)r * sizeof m))) ++k;
+        if (k > 1) ++overlap;
+    }
+    MPI_Comm_free(&node);
+    int v[5] = {nmask, -nmask, (int)d.size(), (int)ck.size(), overlap}, g[5];
+    MPI_Allreduce(v, g, 5, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    int ov; MPI_Allreduce(&overlap, &ov, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    const bool ok = ov == 0 && g[2] == nthreads && g[3] == nthreads;
+    if (!g_rank) {
+        printf("FFTB_BIND ranks/node=%d threads=%d mask_cpus=%d-%d thread_cpus_distinct_min=%d thread_cores_distinct_min=%d "
+               "overlapping_cpus_per_node=%d %s\n", nr, nthreads, g[0], -g[1], g[2], g[3], ov, ok ? "OK" : "WARN");
+        fflush(stdout);
+    }
+    const char* sb = getenv("FFTB_SHOWBIND");
+    if (sb && !strcmp(sb, "1"))
+        for (int r = 0; r < std::min(2, g_np); ++r) {
+            if (g_rank == r) {
+                std::vector<int> mk; for (int c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &m)) mk.push_back(c);
+                char h[64]; gethostname(h, sizeof h);
+                printf("FFTB_BIND rank=%d host=%s mask=%s threads_on=%s\n", r, h, cpu_list(mk).c_str(), cpu_list(tcpu).c_str());
+                fflush(stdout);
+            }
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+}
+
 static double median(std::vector<double> v) {
     std::sort(v.begin(), v.end()); size_t n = v.size();
     return n == 0 ? 0.0 : (n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]));
@@ -160,6 +226,7 @@ int main(int argc, char** argv) {
         printf("============================================================\n");
         fflush(stdout);
     }
+    bind_report(nthreads);
     E.print_decomp();          // collective for heFFTe
     E.setup();                 // P3DFFT: Cp3dfft_setup (the planning)
     const size_t nr = E.nreal(), nc = E.ncplx();
