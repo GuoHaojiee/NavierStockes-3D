@@ -491,3 +491,94 @@ bash ct4_parse.sh $(ls -t ~/guohaojie/logs/ct4_ct4fd_*.out | head -1)
 - cmp_toolchain_4n 用假 srun 跑通（FFTW、两种 Intel ALLTOALL 设置、打印 plan、OMPI_MCA 透传），ct4_parse 各节都正常。
 
 没测：真实的 2 节点和 4 节点运行、hcoll 和 ucc 的实际状态、带宽和耗时。
+
+## 启动可靠性（mn_lib.sh）、p=256 诊断、cmp_toolchain_mn
+
+### A. 启动可靠性
+
+cmp_toolchain_mn、p256_diag、cmp_toolchain_4n 和 cpu_final 都改用 `mn_lib.sh` 启动求解器。
+
+- **带作业号的容器名**：intel_common.sh 在作业里把 pyxis 容器名改成 `ns3d_gcc_j<作业号>`、`ns3d_intel_v2_j<作业号>`，这样一个作业不会用到别的作业建了一半或者正在用的容器。之前 ct4_fftw_diag 里 GCC 全部失败（"enroot-switchroot: failed to execute: /bin/sh"），就是这类问题。
+  - 作业开始时调用 `job_containers_init`：在每个节点上删掉本作业的旧容器，以及已经不在运行的作业留下的 `ns3d_*_j<id>`；再把两个容器各建一次，这样第一次计时运行不用承担解包镜像的时间；
+  - 作业结束时 `cleanup_all` 删除这两个容器；
+  - `MN_SHARED_CONTAINERS=1` 恢复原来共用的容器名。
+- **每次运行的时限**：预期时间的 3 倍，最少 3 分钟。预期时间表在 `mn_expected` 里，按 网格 × 节点数 × 布局 给出；`MN_TMO_SCALE` 可以整体放大。
+- **启动失败立即结束并重试一次**：运行期间每 5 秒检查一次输出，出现 `container start failed`、`enroot-switchroot`、`inconsistent client PMI version` 或 `internal_Init_thread` 就立即结束本次运行（不再等到超时），然后重试一次。
+  - 日志里记 `RETRY <标签> rep=<r> attempt=2 reason=…`；最后仍然失败的记 `FAILED-RUN …`；
+  - CSV 的 `retries` 列记重试次数；
+  - 各个解析脚本统计重试次数。
+- **UCX 版本探测**：ucx_probe.c 现在包装 MPI_Finalize。这时 UCX 一定还在内存里，rank 也是用 MPI_Comm_rank 取得的准确值；进程没走到 MPI_Finalize 时，再在进程退出时报告。探测不到时给出原因：
+  - `reason=no-libucp-mapped`：没有加载 libucp（例如单节点只用 shm）；
+  - `reason=dlopen-NOLOAD:…` 或 `reason=dlsym-…`：读不到版本；
+  - `run-did-not-finish`：运行没有完成；
+  - `no-probe-line-rank0-output-missing`：运行完成了，但 rank 0 的探测行不在输出里。
+
+  探测库在每个容器里用 mpicc 编译（需要 mpi.h）。
+- **intel_mn_env.sh 新增两个开关**：`IMN_UCX_TLS`（替换 UCX_TLS）和 `IMN_EXTRA="VAR=val …"`（原样 export，最后执行），rank 0 的 `intel_mn_env:` 那一行会打印出来。`IMN_PIN=intel` 时 irun_mn 不再让 srun 绑核，否则 Intel MPI 自己的绑核不会生效。
+- **GCC 一边新增 `GCC_COLL=def|t4`**：`t4` 设 `OMPI_MCA_coll_tuned_use_dynamic_rules=1`、`coll_tuned_alltoall_algorithm=4`，并关掉 `coll_ucc` 和 `coll_hcoll`；alltoallv 保持默认。
+
+### B. p256_diag.sbatch
+
+2 节点，512³，10 步，FFTW 和 P3DFFT。每个配置 3 次，重复放在外层，配置交替进行：
+
+| 配置 | 工具链 | 布局 | 设置 |
+|---|---|---|---|
+| i_a_base | Intel | 128×1（p=256） | E6d，不设 ALLTOALL |
+| i_b_rc | Intel | 128×1 | `IMN_UCX_TLS=rc_mlx5,sm,self` |
+| i_c_dc | Intel | 128×1 | `IMN_UCX_TLS=dc_mlx5,sm,self` |
+| i_d_rndvinf | Intel | 128×1 | `IMN_EXTRA="UCX_RNDV_THRESH=inf"` |
+| i_e_rndv4k | Intel | 128×1 | `IMN_EXTRA="UCX_RNDV_THRESH=4096"` |
+| i_f_pinintel | Intel | 128×1 | `IMN_PIN=intel` |
+| i_a_base | Intel | 64×2（p=128） | 基线 |
+| g_def | GCC | 128×1 | `GCC_COLL=def` |
+| g_t4 | GCC | 128×1 | `GCC_COLL=t4` |
+
+共 54 次运行，约 1.5–2.3 小时。结果写到 `~/guohaojie/results/p256_diag.csv`，用 toolchain_mn_parse.sh 解析：第一张表是每个 (库, 配置) 的中位数和范围，第二张表给出 Intel 和 GCC 各自最好的配置。
+
+### C. cmp_toolchain_mn.sbatch <节点数 1|2|4> <网格 512|1024|dry>
+
+- **两种工具链**：
+  - GCC 的设置用 `GCC_COLL` 和 `CTM_GCC_ENV` 传入；
+  - Intel 的设置用 `IMN_*` 传入；
+  - 两边的设置都打印在日志里，也写进 CSV 的 `settings` 列。
+- **启动方式**：
+  - 1 个节点：Intel 在容器里用 mpirun（fork + shm）；GCC 用 `srun --mpi=pmix`；
+  - 多个节点：Intel 用 irun_mn。
+- **库和参数**：四个库，slab，MEASURE；Intel 加 `KMP_BLOCKTIME=0`，heFFTe 用 MKL 后端加 `NS_HEFFTE_REORDER=1`，P3DFFT 用 `bin_p3d/<gcc|intel>`。
+- **测试规模**：
+  - 每节点布局 128×1 和 64×2；
+  - 每个配置 3 次，重复放外层，两种工具链交替；
+  - 10 步：512³ 的动能参考为 1.7950250065e+08，1024³ 为 1.4360200052e+09。
+- **CSV**：每次运行一行，追加到 `~/guohaojie/results/toolchain_mn.csv`；dry-run 写到 `toolchain_mn_dry.csv`。
+- **时长估算**：每个 (节点数, 网格) 48 次运行。
+
+  | 网格 | 节点 | 合计 | `-t` |
+  |---|---|---|---|
+  | 512 | 1 | 2.0 h | 02:40:00 |
+  | 512 | 2 | 1.6 h | 02:10:00 |
+  | 512 | 4 | 1.2 h | 01:40:00 |
+  | 1024 | 1 | 12 h | 16:00:00 |
+  | 1024 | 2 | 8 h | 10:30:00 |
+  | 1024 | 4 | 4.8 h | 06:30:00 |
+
+  都不超过 20 小时，所以每个 (节点数, 网格) 一个作业。如果集群的作业时长上限更短，用 `CTM_LIBS="fftw accfft"` 和 `CTM_LIBS="p3dfft heffte"` 拆成两个作业。
+- **toolchain_mn_parse.sh [csv]**：
+  - 每个 (库, 网格, 节点数, 工具链, 布局, 设置) 的中位数和范围；
+  - 每个 (库, 网格, 节点数) 两种工具链各自的最佳配置、intel/gcc 比值和 ranges overlap；
+  - 每种工具链、每个网格一张强扩展表，以该工具链 1 节点最佳配置为基准；
+  - 列出动能错误、退出码非零、重试过，以及 Intel 多节点 UCX 不是 1.17.0 的运行。
+- **plot_toolchain_mn.py**：每个网格一张强扩展图，`fig_toolchain_mn_<网格>`。每个库一种颜色和标记，Intel 实线、GCC 虚线（空心标记），每个点用该节点数下的最佳配置。
+
+### 本机测过的部分
+
+全部用假 srun：
+
+- 注入了一次 "container start failed" 并让它挂住：约 20 秒内被检测到并结束，重试后成功；
+- 本机没有 InfiniBand，FI_PROVIDER=mlx 时会报 internal_Init_thread，脚本把它识别为启动失败，重试后记为 FAILED-RUN；
+- IMN_EXTRA="FI_PROVIDER=tcp" 时 2 节点 Intel 能跑通。本机加载的是 UCX 1.16.0，正确地打出了 WARNING；
+- 新的探测库在 Open MPI 和 Intel MPI 下都在 MPI_Finalize 时报告，原因字段正确；
+- p256_diag 每个配置的 IMN_* 都只对本次运行生效；
+- cmp_toolchain_4n 和 cpu_final 换到 mn_lib 之后流程正常；
+- 解析脚本和图用虚构数据测过。
+
+没测：pyxis 和 enroot 的真实行为（容器名、`enroot list` 的输出格式、预建容器）、多节点的真实性能。

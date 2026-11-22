@@ -5,7 +5,8 @@
 #      energy and exit code 0
 #   3. strong scaling: library x nodes (1, 2, 4), each cell the best layout's median step time, speedup and parallel
 #      efficiency relative to the best 1-node configuration of the same library
-#   4. runs with a wrong energy, a non-zero exit code or a UCX version other than 1.17.0 on more than one node
+#   4. runs with a wrong energy, a non-zero exit code, a retry (start failure) or a UCX version other than 1.17.0
+#      on more than one node
 # Filters (environment): CPF_COMMIT=<hash> (only rows of that commit), CPF_JOBS="<jobid> <jobid> ..."
 CSV=${1:-$HOME/guohaojie/results/cpu_final.csv}
 [ -f "$CSV" ] || { echo "no $CSV"; exit 1; }
@@ -25,8 +26,10 @@ jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
     if ($16 != "0") bad[k]++
     if (index(" " uv[k] " ", " " $14 " ") == 0) uv[k] = uv[k] " " $14
     libs[lib] = 1; nodes[nn] = 1
-    if ($13 != "yes" || $16 != "0" || $15 == "WARN")
-        prob[++np] = sprintf("  %-7s nodes=%s %-6s rep=%s job=%s  energy=%s(%s) exit=%s ucx=%s%s", lib, nn, lay, $8, $2, $12, $13, $16, $14, ($15 == "WARN" ? " UCX-WARN" : ""))
+    if ($13 != "yes" || $16 != "0" || $15 == "WARN" || $19 + 0 > 0)
+        prob[++np] = sprintf("  %-7s nodes=%s %-6s rep=%s job=%s  energy=%s(%s) exit=%s ucx=%s%s%s%s", lib, nn, lay, $8, $2, $12, $13, $16, $14,
+                             ($20 != "" ? "(" $20 ")" : ""), ($15 == "WARN" ? " UCX-WARN" : ""), ($19 + 0 > 0 ? " retries=" $19 : ""))
+    nret += $19
 }
 END {
     # ---- 1. per configuration
@@ -65,6 +68,6 @@ END {
         printf "\n" }
     print "  (S = T(1 node) / T(n nodes), E = S / n; layouts in the table above)"
     # ---- 4. problems
-    print ""; print "--- runs with a wrong energy, a non-zero exit code or an unexpected UCX version (" np + 0 ")"
+    print ""; print "--- runs with a wrong energy, a non-zero exit code, a retry or an unexpected UCX version (" np + 0 "; retries in total: " nret + 0 ")"
     for (i = 1; i <= np; i++) print prob[i]
 }' "$CSV"

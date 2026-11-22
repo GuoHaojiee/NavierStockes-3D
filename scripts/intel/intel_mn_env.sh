@@ -15,12 +15,14 @@
 #                           intel: Intel MPI pins, I_MPI_PIN_DOMAIN=<threads>:compact (needs OMP_NUM_THREADS)
 #   IMN_DEBUG      (unset)  I_MPI_DEBUG level (4: pin map and libfabric provider)
 #   IMN_PMI2_LIB   (/usr/lib/x86_64-linux-gnu/libpmi2.so.0)
+#   IMN_UCX_TLS    (unset)  replaces UCX_TLS (default rc_mlx5,ud_mlx5,sm,self), e.g. rc_mlx5,sm,self or dc_mlx5,sm,self
+#   IMN_EXTRA      (unset)  "VAR=val VAR2=val2": exported as given, last (e.g. "UCX_RNDV_THRESH=inf")
 source /work/src/NavierStockes-3D/scripts/intel/intel_env.sh >/dev/null 2>&1
 
 export I_MPI_PMI=pmi2 I_MPI_PMI_LIBRARY=${IMN_PMI2_LIB:-/usr/lib/x86_64-linux-gnu/libpmi2.so.0}
 unset I_MPI_HYDRA_BOOTSTRAP
 export I_MPI_FABRICS=shm:ofi FI_PROVIDER=mlx FI_PROVIDER_PATH=$I_MPI_ROOT/opt/mpi/libfabric/lib/prov
-export UCX_TLS=rc_mlx5,ud_mlx5,sm,self
+export UCX_TLS=${IMN_UCX_TLS:-rc_mlx5,ud_mlx5,sm,self}
 export UCX_NET_DEVICES=${IMN_NET_DEVICES:-mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1}
 
 IMN_UCX_DIR=${IMN_UCX_DIR:-/work/opt_ucx/hpcx}
@@ -46,8 +48,9 @@ else
     export I_MPI_PIN=0
 fi
 [ -n "$IMN_DEBUG" ] && export I_MPI_DEBUG=$IMN_DEBUG
+[ -n "$IMN_EXTRA" ] && export $IMN_EXTRA
 
 # one line on rank 0, so every log shows what was used
 if [ "${SLURM_PROCID:-0}" = 0 ]; then
-    echo "intel_mn_env: PMI=$I_MPI_PMI ($I_MPI_PMI_LIBRARY) FABRICS=$I_MPI_FABRICS FI_PROVIDER=$FI_PROVIDER UCX=${UCX_MODULE_DIR:-image 1.12.1} UCX_TLS=$UCX_TLS ALLTOALL=${I_MPI_ADJUST_ALLTOALL:-default} ALLTOALLV=${I_MPI_ADJUST_ALLTOALLV:-default} PIN=${IMN_PIN:-slurm}"
+    echo "intel_mn_env: PMI=$I_MPI_PMI ($I_MPI_PMI_LIBRARY) FABRICS=$I_MPI_FABRICS FI_PROVIDER=$FI_PROVIDER UCX=${UCX_MODULE_DIR:-image 1.12.1} UCX_TLS=$UCX_TLS ALLTOALL=${I_MPI_ADJUST_ALLTOALL:-default} ALLTOALLV=${I_MPI_ADJUST_ALLTOALLV:-default} PIN=${IMN_PIN:-slurm} EXTRA=${IMN_EXTRA:-none}"
 fi
