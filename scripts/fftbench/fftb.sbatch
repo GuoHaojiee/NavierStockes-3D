@@ -36,8 +36,11 @@
 #   check,ucx_version,status,t_fwd_s,t_bwd_s,pairs,max_err,nf,lib_settings,retries,exit_code,ucx_reason,bind
 #   bind: OK | WARN from the FFTB_BIND line (ranks of a node share no CPU, every thread on its own physical core)
 #   t_fft_s = (t_fwd + 2 t_bwd)/3: the solver mix (12 forward + 24 backward per RK4 step), 36 t_fft_s = FFT s/step.
-#   status: OK | TIMEOUT | FAILED-RUN | ERROR (mn_lib.sh) | NO-RESULT (exit 0 but no FFTB_REP line) | CHECK-FAIL.
+#   status: OK | TIMEOUT | FAILED-RUN | ERROR (mn_lib.sh) | NO-RESULT (exit 0 but no FFTB_REP line) | CHECK-FAIL |
+#           MISSING-BINARY (exit 127). Before anything runs, the job checks that every binary it needs exists (exit 2 if not).
 #   A launch without results writes one line with rep=0.
+# Exit code: 0 = every run OK (status OK, check OK); 2 = a needed binary is missing (nothing run); 3 = some run not OK.
+#   So --dependency=afterok:<dry-run job> starts the long jobs only after a clean dry run.
 # Submit:
 #   cd ~/guohaojie/src/NavierStockes-3D/scripts/fftbench
 #   sbatch -N 1 -J fftb_dry1 -t 00:40:00 fftb.sbatch 1 dry
@@ -98,20 +101,29 @@ KEEP="^decomposition:|process grid|planner flag|P3DFFT library|Threads \(runtime
 echo "fftb: nodes=$NODES ($SLURM_JOB_NODELIST) grids=$GRIDS libs=$LIBS reps=$REP window=${WINDOW}s fields=$NF split=$SPLIT"
 echo "commit $COMMIT   csv $CSV   common: $COMMON   time limit: $CTM_TIMEOUT_FACTOR x expected (>= 180 s)"
 for c in "${CONFIGS[@]}"; do echo "  config $c"; done
-B=$SCR/build/bin_fftb
-for f in gcc/fftb_fftw gcc/fftb_accfft gcc/fftb_p3dfft gcc/fftb_heffte intel/fftb_fftw intel/fftb_accfft intel/fftb_p3dfft intel/fftb_heffte_mkl; do
-    [ -x $B/$f ] && echo "  $(ls -l --time-style=+%F_%R $B/$f | awk '{print $6, $7}')" || echo "  MISSING $B/$f"
-done
-[ $NODES -gt 1 ] && { [ -f $SCR/opt_ucx/hpcx/lib/libucp.so.0 ] || echo "WARNING: HPC-X UCX not staged (stage_hpcx_ucx.sh)"; }
-job_containers_init
-mn_init $TMP /work/logs/fftb_$SLURM_JOB_ID.d
-
 bin_of() {   # <toolchain> <lib>
     case $1:$2 in
     gcc:heffte) echo /work/build/bin_fftb/gcc/fftb_heffte;; intel:heffte) echo /work/build/bin_fftb/intel/fftb_heffte_mkl;;
     *) echo /work/build/bin_fftb/$1/fftb_$2;;
     esac
 }
+# every binary this job will run (toolchains of CONFIGS x FFTB_LIBS) must exist and be executable; otherwise stop
+# here with exit code 2, before any container is started (instead of one exit-127 run per configuration)
+TCS=$(for c in "${CONFIGS[@]}"; do IFS='|' read -r cn tc L set <<< "$c"; echo $tc; done | sort -u)
+miss=0
+for tc in $TCS; do for lib in $LIBS; do
+    w=$(bin_of $tc $lib); h=$SCR${w#/work}
+    if [ -f $h ] && [ -x $h ]; then echo "  binary $(ls -l --time-style=+%F_%R $h | awk '{print $6, $7}')"
+    else echo "ERROR: missing binary $h (toolchain $tc, library $lib)"; miss=$((miss + 1)); fi
+done; done
+if [ $miss -gt 0 ]; then
+    echo "ERROR: $miss binary/binaries missing -> nothing run. Build: scripts/fftbench/build_fftb.sh gcc|intel (it must end with BUILD OK)"
+    exit 2
+fi
+[ $NODES -gt 1 ] && { [ -f $SCR/opt_ucx/hpcx/lib/libucp.so.0 ] || echo "WARNING: HPC-X UCX not staged (stage_hpcx_ucx.sh)"; }
+job_containers_init
+mn_init $TMP /work/logs/fftb_$SLURM_JOB_ID.d
+
 name_of() { case $1 in fftw) echo FFTW;; accfft) echo AccFFT;; p3dfft) echo P3DFFT;; heffte) echo heFFTe;; esac; }
 fftb_expected() {   # <grid> <nodes> -> seconds per launch (container start, planning, check, warm-up, repetitions)
     local g=$1 n=$2
@@ -154,6 +166,7 @@ X() {
     local tplan tloc bind; tplan=$(kv t_plan_s "$line"); tloc=$(kv t_local_s "$line")
     bind=$(grep -m1 "^FFTB_BIND ranks/node" $raw | awk '{print $NF}')
     echo "<<< exit=$MN_RC"
+    [ "$MN_RC" = 127 ] && echo "WARNING: exit 127 = command not found (missing binary $bin?)"
     while read -r r; do
         [ -z "$r" ] && continue; n=$((n + 1))
         st=$MN_STATUS; [ "$st" = OK ] && [ "$chk" = FAIL ] && st=CHECK-FAIL
@@ -161,7 +174,7 @@ X() {
             | tee -a "$CSV" | sed 's/^/CSV /'
     done <<< "$(grep "^FFTB_REP " $raw)"
     if [ $n = 0 ]; then
-        st=$MN_STATUS; [ "$st" = OK ] && st=NO-RESULT
+        st=$MN_STATUS; [ "$st" = OK ] && st=NO-RESULT; [ "$MN_RC" = 127 ] && st=MISSING-BINARY
         echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$setcol" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,0,,$tplan,,${chk:-none},$MN_UCXV,$st,,,,$err,$NF,$libset,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$bind" \
             | tee -a "$CSV" | sed 's/^/CSV /'
     fi
@@ -175,4 +188,9 @@ for N in $GRIDS; do
     done
 done
 echo "=============== this job's CSV lines: $(grep -c ",$SLURM_JOB_ID," "$CSV")   retries: $(grep -c '^RETRY' $SCR/logs/fftb_${SLURM_JOB_NAME}_$SLURM_JOB_ID.out 2>/dev/null)"
+# exit code for --dependency=afterok chains: 0 only if every line of this job has status OK and check OK
+NBAD=$(awk -F, -v j=$SLURM_JOB_ID '$2 == j && ($17 != "OK" || $15 != "OK")' "$CSV" | wc -l)
 cleanup_all
+if [ "$NBAD" -gt 0 ]; then echo "fftb: $NBAD CSV line(s) of this job not OK (status/check) -> exit 3"; exit 3; fi
+echo "fftb: all runs OK"
+exit 0

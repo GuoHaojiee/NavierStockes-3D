@@ -39,19 +39,24 @@ output, timing lines masked, is identical to the previous binaries, and so are t
 
 ## Cluster
 
+Everything goes through `sbatch` with dependencies:
+- **`build_fftb.sbatch gcc|intel`** runs `build_fftb.sh` in the container. It exits 0 only when the build ends with
+  `BUILD OK`, meaning every expected binary is present and built from this source.
+- **`fftb.sbatch`** (and the wrappers, which `exec` it) checks every binary it needs before starting anything (exit 2),
+  and exits 3 if any run was not OK. So `afterok` on a dry run gates the long jobs.
+
 ```bash
-cd ~/guohaojie/src/NavierStockes-3D && git pull --ff-only
-source scripts/intel/intel_common.sh                       # $M, $MI, $EXCL
-# build into build/bin_fftb/{gcc,intel} (never bin_gcc / bin_intel / bin_p3d)
-srun -p batch --exclude=$EXCL -N1 -n1 -c16 --time=00:30:00 $M  bash /work/src/NavierStockes-3D/scripts/fftbench/build_fftb.sh gcc
-srun -p batch --exclude=$EXCL -N1 -n1 -c16 --time=00:30:00 $MI bash /work/src/NavierStockes-3D/scripts/fftbench/build_fftb.sh intel
-cd scripts/fftbench
-sbatch -N 1 -J fftb_dry1 -t 00:40:00 fftb.sbatch 1 dry     # 64^3, every binary: check OK?
-sbatch -N 2 -J fftb_dry2 -t 00:40:00 fftb.sbatch 2 dry
+cd ~/guohaojie/src/NavierStockes-3D && git pull --ff-only && cd scripts/fftbench
+B=$(sbatch --parsable -J fftb_build_intel build_fftb.sbatch intel)
+D1=$(sbatch --parsable -d afterok:$B -N 1 -J fftb_dry1 -t 00:40:00 fftb.sbatch 1 dry)
+D2=$(sbatch --parsable -d afterok:$B -N 2 -J fftb_dry2 -t 00:40:00 fftb.sbatch 2 dry)
+sbatch -d afterok:$D2 fftb_p256.sbatch
 bash fftb_parse.sh ~/guohaojie/results/fftb_dry.csv
-sbatch fftb_p256.sbatch                                     # p=256 question, 2 nodes, 512^3 + 1024^3
-FFTB_SOLVER_CSV=~/guohaojie/results/p256_diag.csv bash fftb_parse.sh
 ```
+
+`build_fftb.sh` (before 2026-11-22): in intel mode its build helper `c()` was replaced by the `c()` of
+`scripts/intel/intel_env.sh`. Every step printed OK, but the binaries went to `./a.out` and nothing reached
+`bin_fftb/intel` ("0 of 0 built", exit 0). The helper is now `fb_build`, and the script checks the expected binaries at the end.
 
 ## fftb.sbatch `<nodes> <grid | "512 1024" | dry>`
 
@@ -71,6 +76,8 @@ FFTB_SOLVER_CSV=~/guohaojie/results/p256_diag.csv bash fftb_parse.sh
 | `FFTB_ENV` | — | extra VAR=val for every run |
 | `FFTB_TIMEOUT_FACTOR` | 3 | time limit = factor x expected (1 / 2 / 4-10 min), at least 3 min |
 | `FFTB_CSV` | `~/guohaojie/results/fftb.csv` (dry: `fftb_dry.csv`) | |
+
+Exit code: 0 all OK; 2 a binary missing (nothing run); 3 some run not OK (status or check). Exit 127 of a run: status MISSING-BINARY, shown as "missing binary" by the parser.
 
 - Launches go through `scripts/intel/mn_lib.sh`: job-specific containers, time limit, one retry on a broken start, UCX probe.
 - The Intel heFFTe binary is `fftb_heffte_mkl` with `NS_HEFFTE_REORDER=1`, as in `cmp_toolchain_mn`.

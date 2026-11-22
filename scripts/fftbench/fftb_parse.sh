@@ -15,6 +15,7 @@
 #      first word of settings): 36 x t_fft (the FFT time of one RK4 step in bench mode: 12 forward + 24 backward)
 #      next to the solver's "FFT (incl. transpose/comm)" s/step and the ratio
 #   5. launches / repetitions that are not OK (status, check), and multi-node Intel runs without UCX 1.17.0
+# Exit code 127 (command not found) is shown as "missing binary" in 5.
 # Only rows with status OK and check OK count in 1-4. Filters: FFTB_COMMIT=<hash>, FFTB_JOBS="<jobid> ...",
 # FFTB_TC=gcc|intel. A scaling study (fftb_scale.sbatch, one job per node count): FFTB_JOBS="<j1> <j2> <j4>".
 # Runs whose FFTB_BIND check said WARN (ranks sharing CPUs, threads sharing a core) are counted but marked "bindWARN"
@@ -45,8 +46,10 @@ jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
 tcf != "" && $4 != tcf { next }
 {
     tc = $4; set = $5; lib = $6; g = $7; nn = $8; lay = $9 "x" $10; st = $17; chk = $15
+    if ($25 == "127") nmb++
     if (st != "OK" || chk != "OK" || $11 == "0" || $12 == "")
-        prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%-2s job=%s status=%s check=%s exit=%s retries=%s  %s", lib, g, nn, tc, lay, $11, $2, st, chk, $25, $24, set)
+        prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%-2s job=%s status=%s check=%s exit=%s%s retries=%s  %s", lib, g, nn, tc, lay, $11, $2, st, chk, $25,
+                             ($25 == "127" ? " (missing binary)" : ""), $24, set)
     else if (tc == "intel" && nn + 0 > 1 && $16 != "1.17.0")
         prob[++np] = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%-2s job=%s UCX %s (%s)  %s", lib, g, nn, tc, lay, $11, $2, $16, $26, set)
     if ($27 == "WARN" && st == "OK" && $11 == "1")
@@ -160,6 +163,6 @@ END {
         if (!nm) print "  (no matching solver rows)"
     }
     # ---- 5. problems
-    print ""; print "--- 5. not OK (" np + 0 ")"
+    print ""; print "--- 5. not OK (" np + 0 (nmb ? "; " nmb " with exit 127 = missing binary: rebuild, build_fftb.sh must end with BUILD OK" : "") ")"
     for (i = 1; i <= np; i++) print prob[i]
 }' "$CSV" "${SF[@]}"
