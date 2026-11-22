@@ -4,7 +4,9 @@
 #      median plan time, median local FFT time and the communication share (FFTB_SPLIT=1), check, UCX
 #   2. Intel vs GCC per (library, grid, nodes): the best GCC configuration (lowest median over settings and layouts),
 #      every Intel configuration against it (ratio, "ranges overlap" = the min-max ranges overlap, i.e. the
-#      difference is within the scatter), and best Intel vs best GCC
+#      difference is within the scatter), with 36 x t_fft (FFT s per RK4 step) of both
+#   2b. table: best Intel vs best GCC per (library, grid, nodes): layout, configuration, 36 x t_fft median (min-max),
+#      intel/gcc ratio, ranges overlap
 #   1b. layouts per (library, grid, nodes, toolchain, configuration name): t_fft of every layout, the best one marked
 #   1c. communication share per configuration (FFTB_SPLIT=1 runs): t_comm = t_fft - t_local, (t_fft - t_local)/t_fft
 #   3. strong scaling per (library, grid, toolchain): best configuration (layout, settings) per node count,
@@ -113,19 +115,35 @@ END {
     if (!nc1) print "  (no runs with FFTB_SPLIT=1)"
     # ---- 2. Intel vs GCC
     print ""; print "--- 2. Intel vs GCC per (library, grid, nodes): every Intel configuration against the best GCC one"
+    print "    (t_fft per FFT; 36*t = 36 x t_fft = FFT seconds per RK4 step, bench mode)"
     hasg = 0; for (bk in best) { split(bk, p, SUBSEP); if (p[4] == "gcc") hasg = 1 }
     if (!hasg) print "  (no GCC runs selected)"
-    else printf "%-7s %5s %5s  %-44s %-6s %11s %11s %8s  %s\n", "lib", "grid", "nodes", "intel settings", "layout", "intel s", "best gcc s", "int/gcc", "ranges overlap"
+    else printf "%-7s %5s %5s  %-40s %-6s %11s %9s %11s %9s %8s  %s\n", "lib", "grid", "nodes", "intel settings", "layout", "intel s", "36*t s", "best gcc s", "36*t s", "int/gcc", "ranges overlap"
     if (hasg) for (o = 1; o <= 5; o++) for (gi = 1; gi <= nk; gi++) {
         split(keys[gi], p, SUBSEP); if (libord(p[1]) != o || p[4] != "intel") continue
         gk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP "gcc"
-        if (!(gk in best)) { printf "%-7s %5s %5s  %-44s %-6s %11.4e %11s %8s  %s\n", p[1], p[2], p[3], substr(p[5], 1, 44), p[6], med[keys[gi]], "-", "-", "-"; continue }
+        if (!(gk in best)) { printf "%-7s %5s %5s  %-40s %-6s %11.4e %9.4f %11s %9s %8s  %s\n", p[1], p[2], p[3], substr(p[5], 1, 40), p[6], med[keys[gi]], 36 * med[keys[gi]], "-", "-", "-", "-"; continue }
         k = keys[gi]; q = bkey[gk]
         ov = (lo[k] <= hi[q] && lo[q] <= hi[k]) ? "yes" : "no"
         mark = (bkey[p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP "intel"] == k) ? "  <- best intel" : ""
-        printf "%-7s %5s %5s  %-44s %-6s %11.4e %11.4e %8.3f  %s%s\n", p[1], p[2], p[3], substr(p[5], 1, 44), p[6], med[k], best[gk], med[k] / best[gk], ov, mark
+        printf "%-7s %5s %5s  %-40s %-6s %11.4e %9.4f %11.4e %9.4f %8.3f  %s%s\n", p[1], p[2], p[3], substr(p[5], 1, 40), p[6], med[k], 36 * med[k], best[gk], 36 * best[gk], med[k] / best[gk], ov, mark
     }
-    for (bk in best) { split(bk, p, SUBSEP); if (p[4] == "gcc") { split(bkey[bk], qq, SUBSEP); printf "  best gcc %-7s %5s n=%s: %s %s  %.4e\n", p[1], p[2], p[3], qq[6], qq[5], best[bk] } }
+    # ---- 2b. table: best Intel vs best GCC per (library, grid, nodes)
+    if (hasg) {
+        print ""; print "--- 2b. table: best Intel vs best GCC per (library, grid, nodes); 36*t = FFT s per RK4 step (median, min-max)"
+        printf "%-7s %5s %5s | %-6s %-14s %-24s | %-6s %-14s %-24s | %8s  %s\n", "lib", "grid", "nodes", "layout", "gcc config", "gcc 36*t s (min-max)", "layout", "intel config", "intel 36*t s (min-max)", "int/gcc", "ranges overlap"
+        for (o = 1; o <= 5; o++) for (gg in grids) for (nn = 1; nn <= 4; nn *= 2) for (l in libs) {
+            if (libord(l) != o) continue
+            gk = l SUBSEP gg SUBSEP nn SUBSEP "gcc"; ik = l SUBSEP gg SUBSEP nn SUBSEP "intel"
+            if (!(gk in best) && !(ik in best)) continue
+            gs = "-"; is = "-"; gl = gc = il = ic = "-"; r = "-"; ov = "-"
+            if (gk in best) { q = bkey[gk]; split(q, qa, SUBSEP); gl = qa[6]; gc = first(qa[5]); gs = sprintf("%.4f (%.4f-%.4f)", 36 * med[q], 36 * lo[q], 36 * hi[q]) }
+            if (ik in best) { k = bkey[ik]; split(k, ka, SUBSEP); il = ka[6]; ic = first(ka[5]); is = sprintf("%.4f (%.4f-%.4f)", 36 * med[k], 36 * lo[k], 36 * hi[k]) }
+            if ((gk in best) && (ik in best)) { r = sprintf("%.3f", med[k] / med[q]); ov = (lo[k] <= hi[q] && lo[q] <= hi[k]) ? "yes" : "no" }
+            printf "%-7s %5s %5s | %-6s %-14s %-24s | %-6s %-14s %-24s | %8s  %s\n", l, gg, nn, gl, substr(gc, 1, 14), gs, il, substr(ic, 1, 14), is, r, ov
+        }
+        print "  (int/gcc = ratio of the medians; ranges overlap = the min-max ranges of the two configurations overlap)"
+    }
     # ---- 3. strong scaling (best configuration per node count) and 3b (fixed layout)
     for (pass = 1; pass <= 2; pass++) {
         print ""

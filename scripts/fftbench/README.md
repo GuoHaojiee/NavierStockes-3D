@@ -105,13 +105,29 @@ sbatch -N 4 -J fftb_scale_1024_4 -t 02:00:00 fftb_scale.sbatch 4 1024
 FFTB_JOBS="<job1> <job2> <job4>" bash fftb_parse.sh
 ```
 
+## fftb_tc.sbatch `<nodes> <grid>` (toolchain comparison)
+
+GCC (`bin_fftb/gcc`; `GCC_COLL` list; heFFTe with the FFTW backend) against Intel (`bin_fftb/intel`; `FFTB_INTEL_SETS`,
+default E6d / single-node; heFFTe with MKL and `NS_HEFFTE_REORDER=1`).
+- Four libraries, slab, MEASURE, layouts `FFTB_LAYOUTS` (`128x1`), `FFTB_SPLIT=1`, 3 repetitions per launch.
+- Within each library the toolchains alternate.
+- Result tables: sections 2 and 2b of the parser.
+
+```bash
+sbatch -N 1 -J fftb_tc_1024_1 -t 02:00:00 fftb_tc.sbatch 1 1024
+sbatch -N 4 -J fftb_tc_1024_4 -t 01:30:00 fftb_tc.sbatch 4 1024
+FFTB_JOBS="<job1> <job4>" bash fftb_parse.sh
+```
+
 ## fftb_parse.sh `[csv]`
 
 The parser prints five sections:
 1. Per (library, grid, nodes, toolchain, settings, layout): the median and range.
    - **1b**: every layout of a configuration side by side, with the best one marked.
    - **1c**: the communication share (t_fft − t_local)/t_fft per configuration.
-2. Intel against the best GCC configuration: ratio and whether the ranges overlap.
+2. Intel against the best GCC configuration: t_fft and 36 × t_fft (FFT s per RK4 step), ratio, and whether the
+   ranges overlap. **2b**: one row per (library, grid, nodes) with the best GCC and the best Intel configuration,
+   36 × t_fft median (min–max), intel/gcc and overlap, ready for a table.
 3. Strong scaling with the best layout per node count (speedup, efficiency, comm%).
    **3b**: the same with the fixed layout `FFTB_FIXED_LAYOUT` (128x1).
 4. Against the solver: 36 × t_fft next to the solver's `FFT (incl. transpose/comm)` s/step. It uses the rows of
