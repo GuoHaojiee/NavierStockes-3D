@@ -27,7 +27,7 @@ jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
     if (index(" " uv[k] " ", " " $14 " ") == 0) uv[k] = uv[k] " " $14
     libs[lib] = 1; nodes[nn] = 1
     if ($13 != "yes" || $16 != "0" || $15 == "WARN" || $19 + 0 > 0)
-        prob[++np] = sprintf("  %-7s nodes=%s %-6s rep=%s job=%s  energy=%s(%s) exit=%s ucx=%s%s%s%s", lib, nn, lay, $8, $2, $12, $13, $16, $14,
+        prob[++np] = sprintf("  %-7s nodes=%s %-6s rep=%s job=%s  energy=%s(%s) exit=%s%s ucx=%s%s%s%s", lib, nn, lay, $8, $2, $12, $13, $16, ($16 == "124" ? " TIMEOUT" : ""), $14,
                              ($20 != "" ? "(" $20 ")" : ""), ($15 == "WARN" ? " UCX-WARN" : ""), ($19 + 0 > 0 ? " retries=" $19 : ""))
     nret += $19
 }

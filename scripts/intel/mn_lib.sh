@@ -4,13 +4,18 @@
 #
 #   mn_init <tmpdir on /scratch> <the same path under /work>
 #       builds the UCX probe in both containers (scripts/cpu_final/ucx_probe.c, mpicc, wraps MPI_Finalize)
-#   mn_timeout <grid> <nodes> <layout>          -> seconds: 3 x expected (table below), at least 180 (MN_TMO_SCALE)
+#   mn_timeout <grid> <nodes> <layout>          -> seconds: CTM_TIMEOUT_FACTOR (default 3) x expected (table below)
+#                                                  x MN_TMO_SCALE (1), at least 180
 #   mn_gcc_coll <def|t4>                        -> Open MPI environment for GCC_COLL
 #   mn_run <label> <raw file> <timeout s> <command...>
 #       runs the command (a shell function or program) in the background, output to <raw>; every 5 s looks for
 #       $MN_FAILPAT (broken container start or MPI start); then, or at the time limit, kills it. A run killed for a
 #       start failure is repeated once ("RETRY <label> rep=<r> attempt=2 reason=<...>" in the log).
-#       Sets MN_RC (exit code; 124 = time limit), MN_REASON, MN_RETRIES.
+#       Sets MN_RC (exit code; 124 = time limit), MN_REASON, MN_RETRIES and MN_STATUS:
+#         OK          exit 0
+#         TIMEOUT     killed at the time limit ("TIMEOUT <label> rep=<r> limit=<s>s factor=<f>" in the log)
+#         FAILED-RUN  start failure also in the repeated run ("FAILED-RUN <label> ..." in the log)
+#         ERROR       any other non-zero exit
 #   mn_gcc   <nodes> <ppn> <threads> <time limit min> "<env>" <binary> <args...>   GCC container, Open MPI, srun pmix
 #   mn_intel <nodes> <ppn> <threads> <time limit min> "<env>" <binary> <args...>   v2 image: 1 node mpirun fork+shm,
 #                                                                                   more nodes irun_mn (E6d, IMN_*)
@@ -29,7 +34,8 @@ mn_expected() {
     esac
 }
 mn_timeout() {
-    local e t; e=$(mn_expected "$@"); t=$(awk -v e=$e -v s=${MN_TMO_SCALE:-1} 'BEGIN { t = 3 * e * s; print (t < 180 ? 180 : int(t)) }')
+    local e t; e=$(mn_expected "$@")
+    t=$(awk -v e=$e -v f=${CTM_TIMEOUT_FACTOR:-3} -v s=${MN_TMO_SCALE:-1} 'BEGIN { t = f * e * s; print (t < 180 ? 180 : int(t)) }')
     echo $t
 }
 mn_gcc_coll() {
@@ -86,7 +92,13 @@ mn_run() {
         MN_RETRIES=1
         mn_run_once $raw $tmo "$@"
     fi
-    [ -n "$MN_REASON" ] && echo "FAILED-RUN $label rep=${rep:-?} reason=$MN_REASON exit=$MN_RC"
+    case "$MN_REASON" in
+    "time limit"*)    MN_STATUS=TIMEOUT
+                      echo "TIMEOUT $label rep=${rep:-?} limit=${tmo}s factor=${CTM_TIMEOUT_FACTOR:-3} exit=$MN_RC" ;;
+    "start failure"*) MN_STATUS=FAILED-RUN
+                      echo "FAILED-RUN $label rep=${rep:-?} reason=${MN_REASON#start failure: } exit=$MN_RC" ;;
+    *)                if [ "$MN_RC" = 0 ]; then MN_STATUS=OK; else MN_STATUS=ERROR; fi ;;
+    esac
     return 0
 }
 

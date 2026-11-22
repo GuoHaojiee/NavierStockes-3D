@@ -25,7 +25,8 @@
 # Every run appends one CSV line to ~/guohaojie/results/cpu_final.csv (dry: cpu_final_dry.csv; CPF_CSV=...):
 #   commit,jobid,nodelist,lib,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,energy_ok,ucx_version,
 #   ucx_warn,exit_code,omp_threads,mkl_threads,retries,ucx_reason
-#   Reliability (scripts/intel/mn_lib.sh): job-specific container names, time limit per run (3 x expected, >= 3 min),
+#   Reliability (scripts/intel/mn_lib.sh): job-specific container names, time limit per run (CTM_TIMEOUT_FACTOR,
+#   default 3, x expected, >= 3 min; exit_code 124 = TIMEOUT),
 #   a broken container / MPI start is stopped and repeated once (RETRY line, retries column).
 #   ucx_version: the libucp really mapped by MPI rank 0 (LD_PRELOAD scripts/cpu_final/ucx_probe.so), "none" when
 #   no UCX was loaded (single node, shm). Multi-node runs expect 1.17.0, otherwise ucx_warn=WARN and the log says

@@ -7,7 +7,9 @@
 #      runs ALL have the reference energy and exit 0), intel/gcc and "ranges overlap" (min-max ranges overlap)
 #   3. per toolchain and grid: strong scaling, library x nodes 1/2/4, best s/step, speedup S and efficiency E
 #      relative to that toolchain's best 1-node configuration
-#   4. runs with a wrong energy, a non-zero exit code, a retry, or (Intel, >1 node) a UCX version other than 1.17.0
+#   4. runs killed at the time limit (TIMEOUT), runs whose start failed also when repeated (FAILED-RUN), and the other
+#      runs with a wrong energy, a non-zero exit code, a retry, or (Intel, >1 node) a UCX version other than 1.17.0
+#   (status column; rows from before it: exit 124 = TIMEOUT)
 # Filters: CTM_COMMIT=<hash>, CTM_JOBS="<jobid> ...".
 CSV=${1:-$HOME/guohaojie/results/toolchain_mn.csv}
 [ -f "$CSV" ] || { echo "no $CSV"; exit 1; }
@@ -29,7 +31,13 @@ jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
     ret[k] += $18
     if (index(" " uv[k] " ", " " $17 " ") == 0) uv[k] = uv[k] " " $17
     libs[lib] = 1; grids[g] = 1; tcs[tc] = 1
+    stt = $21; if (stt == "") stt = ($19 == "0") ? "OK" : ($19 == "124") ? "TIMEOUT" : "ERROR"
+    if (stt == "TIMEOUT") nto[k]++
+    tag = sprintf("  %-7s %5s n=%s %-5s %-6s rep=%s job=%s [%s]", lib, g, nn, tc, lay, $11, $2, set)
+    if (stt == "TIMEOUT")    { tol[++nt] = tag " exit=" $19 (($18 + 0 > 0) ? " retries=" $18 : "") }
+    if (stt == "FAILED-RUN") { frl[++nf] = tag " exit=" $19 " retries=" $18 }
     w = ""
+    if (stt == "TIMEOUT" || stt == "FAILED-RUN") { libs[lib] = 1; grids[g] = 1; tcs[tc] = 1; next }
     if ($16 != "yes") w = w " energy=" ($15 == "" ? "missing" : $15)
     if ($19 != "0") w = w " exit=" $19
     if ($18 + 0 > 0) w = w " retries=" $18
@@ -38,7 +46,7 @@ jobs != "  " && index(jobs, " " $2 " ") == 0 { next }
 }
 END {
     # ---- 1
-    printf "%-7s %5s %2s %-5s %-6s %-56s %4s  %-26s %8s %8s %7s %4s %s\n", "lib", "grid", "n", "tc", "layout", "settings", "runs", "step s: median (min-max)", "FFT s", "plan s", "energy", "retr", "ucx"
+    printf "%-7s %5s %2s %-5s %-6s %-56s %4s  %-26s %8s %8s %7s %4s %3s %s\n", "lib", "grid", "n", "tc", "layout", "settings", "runs", "step s: median (min-max)", "FFT s", "plan s", "energy", "retr", "TO", "ucx"
     for (o = 1; o <= 5; o++) for (gg in grids) for (n = 1; n <= 4; n *= 2) for (i = 1; i <= nk; i++) {
         split(keys[i], p, SUBSEP); if (lo(p[1]) != o || p[2] != gg || p[3] != n) continue
         k = keys[i]; m = ns[k]
@@ -46,7 +54,7 @@ END {
                  sortv(a, m); mn[k] = a[1]; mx[k] = a[m]; md[k] = median(a, m); mf = median(b, m); mp = median(c, m)
                  s = sprintf("%.4f (%.4f-%.4f)", md[k], mn[k], mx[k]) }
         else { s = "-"; mf = mp = 0 }
-        printf "%-7s %5s %2s %-5s %-6s %-56s %4d  %-26s %8.4f %8.3f %3d/%-3d %4d%s\n", p[1], p[2], p[3], p[4], p[5], substr(p[6], 1, 56), runs[k], s, mf, mp, eok[k] + 0, runs[k], ret[k], uv[k]
+        printf "%-7s %5s %2s %-5s %-6s %-56s %4d  %-26s %8.4f %8.3f %3d/%-3d %4d %3d%s\n", p[1], p[2], p[3], p[4], p[5], substr(p[6], 1, 56), runs[k], s, mf, mp, eok[k] + 0, runs[k], ret[k], nto[k], uv[k]
         if (m && eok[k] == runs[k] && !bad[k]) {
             bk = p[1] SUBSEP p[2] SUBSEP p[3] SUBSEP p[4]
             if (!(bk in best) || md[k] < best[bk]) { best[bk] = md[k]; bmin[bk] = mn[k]; bmax[bk] = mx[k]; bcfg[bk] = p[5] " " p[6] } } }
@@ -75,6 +83,12 @@ END {
             printf "\n" }
         print "" }
     # ---- 4
-    print "--- runs with a wrong energy, a non-zero exit, a retry or an unexpected UCX version (" np + 0 ")"
+    print "--- TIMEOUT: killed at the time limit (" nt + 0 ")"
+    for (i = 1; i <= nt; i++) print tol[i]
+    print ""
+    print "--- FAILED-RUN: start failure also in the repeated run (" nf + 0 ")"
+    for (i = 1; i <= nf; i++) print frl[i]
+    print ""
+    print "--- other runs with a wrong energy, a non-zero exit, a retry or an unexpected UCX version (" np + 0 ")"
     for (i = 1; i <= np; i++) print prob[i]
 }' "$CSV"

@@ -61,8 +61,8 @@ if grep -q "^FFTW PLAN:" "$L"; then
       /^<<< exit=/ { printf "  %-26s rep=%-2s step=%-8s fwd:%s | bwd:%s\n", lab, rep, step, (fw == "" ? " -" : fw), (bw == "" ? " -" : bw) }' "$L"
 fi
 echo
-echo "--- retries (start failures, mn_lib.sh): $(grep -c '^RETRY' "$L") ; runs stopped: $(grep -c '^FAILED-RUN' "$L")"
-grep -E "^(RETRY|FAILED-RUN)" "$L" | sed 's/^/  /'
+echo "--- retries (start failures, mn_lib.sh): $(grep -c '^RETRY' "$L") ; FAILED-RUN (start failed twice): $(grep -c '^FAILED-RUN' "$L") ; TIMEOUT: $(grep -c '^TIMEOUT' "$L")"
+grep -E "^(RETRY|FAILED-RUN|TIMEOUT)" "$L" | sed 's/^/  /'
 echo
 echo "--- runs with a non-zero exit code"
 awk '/^>>>/ { l = $3 } /^<<< exit=/ { split($0, a, "="); if (a[2] != "0") print "  " l " exit=" a[2] }' "$L" | sort | uniq -c

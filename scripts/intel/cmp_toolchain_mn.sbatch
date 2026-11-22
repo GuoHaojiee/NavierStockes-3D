@@ -24,12 +24,13 @@
 #          dry   64^3,   dt=5e-5, 10 steps, energy 3.3526466678e+05, 1 run per library and toolchain,
 #                1 node 64x2, 2 nodes 32x4 per node, 4 nodes 16x8 (slab: ranks <= 64); CSV toolchain_mn_dry.csv
 # Reliability (mn_lib.sh): job-specific container names (created once per node at the start, removed at the end);
-#   every run has a time limit of 3 x its expected time (at least 3 min) and is stopped at once on "container start
+#   every run has a time limit of CTM_TIMEOUT_FACTOR (default 3; 6 for the 1024^3 runs) x its expected time (at least
+#   3 min; killed -> status TIMEOUT) and is stopped at once on "container start
 #   failed", "enroot-switchroot", "inconsistent client PMI version" or "internal_Init_thread", then repeated once
 #   (RETRY line, retries column).
 # Every run appends one line to ~/guohaojie/results/toolchain_mn.csv:
 #   commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,
-#   energy_ok,ucx_version,retries,exit_code,ucx_reason
+#   energy_ok,ucx_version,retries,exit_code,ucx_reason,status   (status: OK | TIMEOUT | FAILED-RUN | ERROR)
 #   (ucx_version: libucp really loaded by MPI rank 0, ucx_probe.c; "none" for single-node shm; the reason when unknown)
 # Time estimate: 4 libraries x 2 toolchains x 2 layouts x 3 repetitions = 48 runs per (nodes, grid); expected time per
 #   run (mn_lib.sh table; container start + MEASURE planning + 10 steps):
@@ -46,7 +47,8 @@
 #   sbatch -N 1 -J ctmn_dry1 -t 00:30:00 cmp_toolchain_mn.sbatch 1 dry
 #   sbatch -N 4 -J ctmn_1024_4 -t 06:30:00 cmp_toolchain_mn.sbatch 4 1024
 #   bash toolchain_mn_parse.sh ; python3 plot_toolchain_mn.py
-# Options: CTM_LIBS, CTM_LAYOUTS, CTM_REP (3), CTM_CSV, CTM_IMAGE (v2), MN_TMO_SCALE (1), GCC_COLL (def), CTM_GCC_ENV.
+# Options: CTM_LIBS, CTM_LAYOUTS, CTM_REP (3), CTM_CSV, CTM_IMAGE (v2), CTM_TIMEOUT_FACTOR (3), GCC_COLL (def), CTM_GCC_ENV.
+#   e.g. sbatch -N 4 -J ctmn_1024_4 -t 08:00:00 --export=ALL,CTM_TIMEOUT_FACTOR=6 cmp_toolchain_mn.sbatch 4 1024
 NODES=${1:?usage: sbatch -N <n> cmp_toolchain_mn.sbatch <1|2|4> <512|1024|dry>}
 GRID=${2:?usage: sbatch -N <n> cmp_toolchain_mn.sbatch <1|2|4> <512|1024|dry>}
 export INTEL_IMAGE=${CTM_IMAGE:-v2}
@@ -75,10 +77,12 @@ TMP=$SCR/logs/ctmn_$SLURM_JOB_ID.d; mkdir -p $TMP "$(dirname "$CSV")"
 COMMIT=$(git -C $SCR/src/NavierStockes-3D log -1 --format=%h 2>/dev/null || echo unknown)
 NODELIST=$(echo "${SLURM_JOB_NODELIST:-?}" | tr ',' ';')
 KEEP="^decomposition:|process grid|heFFTe backend|planner flag|P3DFFT library|Running on|Threads \(runtime\)|planning time|plan time|\(planning\) time|Kinetic energy|Avg per step:|FFT \(incl|rror|abort|intel_mn_env:|GCCENV:|UCXPROBE|MPI startup\(\): +(Intel|libfabric provider)"
-[ -f "$CSV" ] || echo "commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,energy_ok,ucx_version,retries,exit_code,ucx_reason" > "$CSV"
+[ -f "$CSV" ] || echo "commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,energy_ok,ucx_version,retries,exit_code,ucx_reason,status" > "$CSV"
+# a CSV from before the status column: extend the header only (old rows: status from exit_code in the parser)
+head -1 "$CSV" | grep -q ',status' || sed -i '1s/$/,status/' "$CSV"
 
 echo "cmp_toolchain_mn: nodes=$NODES ($SLURM_JOB_NODELIST) grid=$GRID N=$N dt=$DT steps=$NS energy_ref=$EREF reps=$REP layouts(per node)=$LAYOUTS libs=$LIBS"
-echo "commit $COMMIT   csv $CSV"
+echo "commit $COMMIT   csv $CSV   time limit per run: ${CTM_TIMEOUT_FACTOR:-3} x expected (>= 180 s)"
 echo "gcc settings:   $GSET   -> env: ${GENV:-<run_env.sh only>}"
 echo "intel settings: $ISET"
 for b in bin_gcc/ns_fftw bin_gcc/ns_accfft bin_gcc/ns_heffte_v2 bin_p3d/gcc/ns_p3dfft bin_intel/ns_fftw bin_intel/ns_accfft bin_intel/ns_heffte_v2_mkl bin_p3d/intel/ns_p3dfft; do
@@ -114,7 +118,7 @@ X() {
     if [ $tc = intel ] && [ $NODES -gt 1 ] && [ "$MN_UCXV" != 1.17.0 ]; then echo "WARNING: UCX $MN_UCXV loaded, expected 1.17.0 ($label rep=$rep${MN_UCXWHY:+, $MN_UCXWHY})"; fi
     [ "$MN_EOK" = no ] && echo "WARNING: kinetic energy ${MN_EN:-missing}, reference $EREF"
     echo "<<< exit=$MN_RC"
-    echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$set" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$rep,$MN_STEP,$MN_FFT,$MN_PLAN,$MN_EN,$MN_EOK,$MN_UCXV,$MN_RETRIES,$MN_RC,$MN_UCXWHY" \
+    echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$set" | tr ',' ';'),$(name_of $lib),$N,$NODES,$ppn,$nt,$rep,$MN_STEP,$MN_FFT,$MN_PLAN,$MN_EN,$MN_EOK,$MN_UCXV,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$MN_STATUS" \
         | tee -a "$CSV" | sed 's/^/CSV /'
     echo
 }

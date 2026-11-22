@@ -38,7 +38,9 @@ TMP=$SCR/logs/p256_$SLURM_JOB_ID.d; mkdir -p $TMP "$(dirname "$CSV")"
 COMMIT=$(git -C $SCR/src/NavierStockes-3D log -1 --format=%h 2>/dev/null || echo unknown)
 NODELIST=$(echo "${SLURM_JOB_NODELIST:-?}" | tr ',' ';')
 KEEP="^decomposition:|planner flag|P3DFFT library|Running on|Threads \(runtime\)|planning time|\(planning\) time|Kinetic energy|Avg per step:|FFT \(incl|rror|abort|intel_mn_env:|GCCENV:|UCXPROBE|MPI startup\(\): +(Intel|libfabric provider)"
-[ -f "$CSV" ] || echo "commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,energy_ok,ucx_version,retries,exit_code,ucx_reason" > "$CSV"
+[ -f "$CSV" ] || echo "commit,jobid,nodelist,toolchain,settings,lib,grid,nodes,ranks_per_node,threads,rep,step_s,fft_s,plan_s,energy,energy_ok,ucx_version,retries,exit_code,ucx_reason,status" > "$CSV"
+# a CSV from before the status column: extend the header only (old rows: status from exit_code in the parser)
+head -1 "$CSV" | grep -q ',status' || sed -i '1s/$/,status/' "$CSV"
 # configuration: name | toolchain | layout | IMN_* or GCC_COLL settings
 CONFIGS=(
   "i_a_base|intel|128x1|IMN_ALLTOALL="
@@ -85,7 +87,7 @@ C() {
     [ $tc = intel ] && [ "$MN_UCXV" != 1.17.0 ] && echo "WARNING: UCX $MN_UCXV loaded, expected 1.17.0 ($label rep=$rep${MN_UCXWHY:+, $MN_UCXWHY})"
     [ "$MN_EOK" = no ] && echo "WARNING: kinetic energy ${MN_EN:-missing}, reference $EREF"
     echo "<<< exit=$MN_RC"
-    echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$cname $set" | tr ',' ';'),$(name_of $2),$N,$NODES,$ppn,$nt,$rep,$MN_STEP,$MN_FFT,$MN_PLAN,$MN_EN,$MN_EOK,$MN_UCXV,$MN_RETRIES,$MN_RC,$MN_UCXWHY" \
+    echo "$COMMIT,$SLURM_JOB_ID,$NODELIST,$tc,$(echo "$cname $set" | tr ',' ';'),$(name_of $2),$N,$NODES,$ppn,$nt,$rep,$MN_STEP,$MN_FFT,$MN_PLAN,$MN_EN,$MN_EOK,$MN_UCXV,$MN_RETRIES,$MN_RC,$MN_UCXWHY,$MN_STATUS" \
         | tee -a "$CSV" | sed 's/^/CSV /'
     echo
 }
