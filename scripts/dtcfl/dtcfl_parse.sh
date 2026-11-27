@@ -12,6 +12,8 @@
 #                   at the time t* of the run's smallest dt (cut last step excluded),
 #                   dt_min / (C * dt_{C=1}(t*)) < 0.8, dt_{C=1} = dt of probe C=1.0 interpolated at t*
 #                   (= max sum|u_i|/dx_i of the C=1 run over that of this run). The steps around t* are listed.
+#        inaccurate ran to T, but |E(12)/E_ref(12) - 1| > ${DTC_EDEV:-1e-3}, even when the dt ratio is normal
+#                   (throttled and inaccurate can both apply: "throttled,inaccurate")
 #        stable     otherwise
 #      (the same ratio is shown for the main cfl runs where t* lies inside the C=1 run)
 #   5. CSV of the cfl and probe series: run,C,step,t,dt,umax,E,eps,Ceff,lim -> ${DTC_CSV:-<results>/dtcfl_series_<cfl jobid>.csv}
@@ -144,15 +146,21 @@ if [ -n "$PS" ]; then
         if   [ "$(get "$p" blowup)" = 1 ]; then status="BLOWUP t=$(get "$p" bt)"
         elif [ "$(get "$p" cap)" = 1 ];    then status="STEP CAP t=$(get "$p" tlast)"
         elif [ "$(get "$p" steps)" = NA ]; then status="did not finish"
-        elif awk -v r=$th 'BEGIN { exit !(r != "NA" && r < 0.8) }'; then status=throttled
-        else status=stable; fi
+        else
+            dE=$(rel $(get "$p" E20) $(get "$S_ref" E12))
+            status=""
+            awk -v r=$th 'BEGIN { exit !(r != "NA" && r < 0.8) }' && status=throttled
+            awk -v d=$dE -v m=${DTC_EDEV:-1e-3} 'BEGIN { if (d == "NA") exit 1; if (d < 0) d = -d; exit !(d > m) }' && status=${status:+$status,}inaccurate
+            status=${status:-stable}
+        fi
         dE=$(rel $(get "$p" E20) $(get "$S_ref" E12)); dW=$(rel $(get "$p" W20) $(get "$S_ref" W12))
-        case "$status" in stable|throttled) ;; *) dE=-; dW=- ;; esac     # FINAL is not at t=12
+        case "$status" in BLOWUP*|STEP*|did*) dE=-; dW=- ;; esac     # FINAL is not at t=12
         printf "  %5s %7s %12s %9s %12s %9s %10s %10s  %s\n" $C $(get "$p" steps) $(get "$p" dmin) $(get "$p" tdmin) $c1 $th \
                $dE $dW "$status"
         eval "ST_$k=\"\$status\""
     done
-    echo "  (dev = run/ref - 1 at t=12: FINAL line of the probe vs the reference interpolated at t=12)"
+    echo "  (dev = run/ref - 1 at t=12: FINAL line of the probe vs the reference interpolated at t=12;"
+    echo "   inaccurate: |E dev| > ${DTC_EDEV:-1e-3}; throttled: ratio < 0.8)"
     for C in $PS; do
         k=$(echo $C | tr . _); eval "p=\$S_probe_C$k st=\$ST_$k"
         case "$st" in
@@ -160,7 +168,7 @@ if [ -n "$PS" ]; then
             note=""; awk -v c=$C 'BEGIN { exit !(c < 0.9) }' && note="  [C < 0.9: possibly aliasing (no dealiasing), not the CFL limit]"
             echo "  C=$C: $st$note; last scanned steps (step t dt umax E eps Ceff):"
             grep "^BLOWUP_HIST [0-9]" "$(f_of $PJ probe_C$C)" | sed 's/^BLOWUP_HIST/    /' ;;
-        throttled|stable)
+        *throttled*|*inaccurate*|stable)
             echo "  C=$C ($st): steps around the smallest dt (t=$(get "$p" tdmin))"
             around "$(f_of $PJ probe_C$C)" $(get "$p" tdmin) ;;
         esac
