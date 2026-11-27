@@ -109,6 +109,7 @@ mpirun -np 8 ./navier_stokes_cufftmp_multinode 256 256 256 1e-4 100 bench
 | `NS_CFL_VISC=<Cv>` | 1.0 | cfl：粘性界 dt_v = Cv / (ν·k²max)，k²max = (NX/2)² + (NY/2)² + (NZ/2)² |
 | `NS_DT_MAX=<dt>` | 无 | cfl：dt 的上限 |
 | `NS_T_END=<T>` | cfl 下必须设置 | cfl：按物理时间结束，最后一步截短，正好落在 T 上 |
+| `NS_NYQ0=0\|1` | 0 | 1 时去掉三个方向的 Nyquist 平面（kx = NX/2、ky = NY/2、kz = NZ/2，只对偶数 N 有效）。投影后的初值以及每个 RK 级的更新，都把这些模态（V 和 acc）置 0，所以求导和投影里 Nyquist 的 k 取什么值不再起作用，两者自然一致。默认 0 保持原约定（Nyquist 处 k = +N/2），结果逐位不变。原约定会破坏 Nyquist 平面的共轭对称性：在 64³ 的 TG（Re=1600）中，从 t≈3 开始出现虚假耗散，E(10) 为 0.0026，而用 NS_NYQ0=1 时为 0.052（文献参考值 0.074）。verify 解在 Nyquist 附近几乎没有能量，L2 基本不变 |
 | `NS_DT_PRINT=<K>` | cfl 100；fixed 不打印 | 每 K 步打印一行 `DT step t dt umax E eps Ceff lim`。数值取自该步开始时刻：E = 0.5⟨\|u\|²⟩，eps = ν⟨\|ω\|²⟩，Ceff = dt·max Σ\|u_i\|/dx_i，lim 表示哪一项限制了 dt（conv、visc、dtmax、tend，fixed 模式为 fixed） |
 
 cfl 模式下，dt = min(dt_c, dt_v, NS_DT_MAX, T_END − t)。

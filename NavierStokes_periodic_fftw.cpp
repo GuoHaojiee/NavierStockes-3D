@@ -43,11 +43,21 @@ static nsfft::Fftw g_fft;
 //   NS_T_END=<T>            cfl：必须设置；按物理时间结束，最后一步截短正好落在 T
 //                           （cfl 模式下 argv 的 dt 不使用，NSTEPS 是步数上限，达到上限仍未到 T 时报错）
 //   NS_DT_PRINT=<K>         每 K 步打印一行 "DT ..."（cfl 默认 100；fixed 只有显式设置时才打印）
+//   NS_NYQ0=0|1             1：去掉三个方向的 Nyquist 平面（kx=NX/2、ky=NY/2、kz=NZ/2，仅偶数 N）。
+//                           投影后的初值与每个 RK 级更新都把这些模态（V 与 acc）整体置 0，
+//                           因此求导（旋度、-k²V）与投影里 Nyquist 的 k 取什么值都不再起作用，两者自然一致。
+//                           默认 0：保持原约定（Nyquist 处 k = +N/2），结果逐位不变。
 // 设置了以上任何一个变量时才输出新增的行（"DT"、"DTCFL_*"、"FINAL"），默认输出逐字不变。
 // ==============================================================================
 static double g_nu = 1.0;
 enum { IC_POLY = 0, IC_TG = 1 };
 static int g_ic = IC_POLY;
+static bool g_nyq0 = false;
+
+// 谱空间（转置布局 [y_local][x][z]）的点是否在某个 Nyquist 平面上（奇数 N 没有 Nyquist）
+inline bool on_nyquist(ptrdiff_t i, ptrdiff_t jg, ptrdiff_t k, ptrdiff_t nx, ptrdiff_t ny, ptrdiff_t nz) {
+    return 2*i == nx || 2*jg == ny || 2*k == nz;
+}
 
 // ==============================================================================
 // 解析解与强迫项（与 heFFTe/p3dfft 版本完全一致）
@@ -208,6 +218,21 @@ void make_div_free(fftw_complex* V1_c, fftw_complex* V2_c, fftw_complex* V3_c, c
             }
         }
     }
+}
+
+/**
+ * NS_NYQ0=1：把三个 Nyquist 平面上的模态置 0（in-place，谱空间转置布局）
+ */
+void zero_nyquist(fftw_complex* const* V, int ncomp, const Grid& g) {
+    const ptrdiff_t nx = g.nx, ny = g.ny, nz = g.nz, nz_c = nz/2 + 1;
+    #pragma omp parallel for collapse(3)
+    for(ptrdiff_t j = 0; j < g.local_n1; ++j)
+        for(ptrdiff_t i = 0; i < nx; ++i)
+            for(ptrdiff_t k = 0; k < nz_c; ++k)
+                if (on_nyquist(i, g.local_1_start + j, k, nx, ny, nz)) {
+                    ptrdiff_t idx = (j * nx + i) * nz_c + k;
+                    for (int c = 0; c < ncomp; ++c) { V[c][idx][0] = 0.0; V[c][idx][1] = 0.0; }
+                }
 }
 
 /**
@@ -422,12 +447,22 @@ void rk4_stage(Fields& F, const Grid& g, double& tau, double t, int stage, StepC
         default: acc_mode = ACC_KEEP;                  a_v = tau/6.0; base = F.acc; break;
     }
     const bool force = g_with_force;
+    const bool nyq0 = g_nyq0;
     #pragma omp parallel for collapse(3)
     for(ptrdiff_t j = 0; j < g.local_n1; ++j) {          // 转置布局 [y_local][x][z]
         for(ptrdiff_t i = 0; i < nx; ++i) {
             for(ptrdiff_t k = 0; k < nz_c; ++k) {
                 ptrdiff_t idx = (j * nx + i) * nz_c + k;
                 ptrdiff_t jg = g.local_1_start + j;
+                // NS_NYQ0=1：Nyquist 模态恒为 0（V^n 已为 0；这里 V 与 acc 都写 0）
+                if (nyq0 && on_nyquist(i, jg, k, nx, ny, nz)) {
+                    for (int c = 0; c < 3; ++c)
+                        for (int r = 0; r < 2; ++r) {
+                            if (acc_mode != ACC_KEEP) F.acc[c][idx][r] = 0.0;
+                            F.V[c][idx][r] = 0.0;
+                        }
+                    continue;
+                }
                 double kx = (i  <= nx/2) ? (double)i  : (double)(i  - nx);
                 double ky = (jg <= ny/2) ? (double)jg : (double)(jg - ny);
                 double kz = (double)k;
@@ -546,12 +581,18 @@ int main(int argc, char **argv) {
 
     // ---- 粘性系数、初值、时间步长控制（见文件开头说明） ----
     const bool ext_out = env_set("NS_NU") || env_set("NS_IC") || env_set("NS_DT_MODE") || env_set("NS_CFL") ||
-                         env_set("NS_CFL_VISC") || env_set("NS_DT_MAX") || env_set("NS_T_END") || env_set("NS_DT_PRINT");
+                         env_set("NS_CFL_VISC") || env_set("NS_DT_MAX") || env_set("NS_T_END") || env_set("NS_DT_PRINT") ||
+                         env_set("NS_NYQ0");
     StepCtl ctl;
     if (const char* s = getenv("NS_IC")) {
         if      (!strcmp(s, "poly") || !*s) g_ic = IC_POLY;
         else if (!strcmp(s, "tg"))          g_ic = IC_TG;
         else { if (rank == 0) fprintf(stderr, "Error: NS_IC=%s (expected poly|tg)\n", s); g_env_err = true; }
+    }
+    if (const char* s = getenv("NS_NYQ0")) {
+        if      (!strcmp(s, "0") || !*s) g_nyq0 = false;
+        else if (!strcmp(s, "1"))        g_nyq0 = true;
+        else { if (rank == 0) fprintf(stderr, "Error: NS_NYQ0=%s (expected 0|1)\n", s); g_env_err = true; }
     }
     const bool nu_given = env_set("NS_NU");
     g_nu = env_double("NS_NU", (g_ic == IC_TG) ? 1.0 / 1600.0 : 1.0, /*positive=*/false);
@@ -620,9 +661,9 @@ int main(int argc, char **argv) {
         // FFTW MPI 只有 slab（x 切分）；NS_DECOMP 不起作用，只打印出来便于核对
         g_fft.print_decomp();
         if (ext_out) {
-            printf("DTCFL_CONFIG dt_mode=%s ic=%s nu=%.10e%s cfl=%.4f cfl_visc=%.4f dt_max=%.6e t_end=%.6f "
+            printf("DTCFL_CONFIG dt_mode=%s ic=%s nyq0=%d nu=%.10e%s cfl=%.4f cfl_visc=%.4f dt_max=%.6e t_end=%.6f "
                    "dt_print=%ld k2max=%.0f dt_visc=%.6e\n",
-                   ctl.cfl ? "cfl" : "fixed", g_ic == IC_TG ? "tg" : "poly", g_nu,
+                   ctl.cfl ? "cfl" : "fixed", g_ic == IC_TG ? "tg" : "poly", g_nyq0 ? 1 : 0, g_nu,
                    nu_given ? "" : "(default)", ctl.C, ctl.Cv, ctl.dt_max, ctl.t_end, dt_print, ctl.k2max,
                    g_nu > 0 ? ctl.Cv / (g_nu * ctl.k2max) : HUGE_VAL);
             if (ctl.cfl)
@@ -717,6 +758,7 @@ int main(int argc, char **argv) {
     // 投影初始条件到无散空间
     if (rank == 0) cout << "Projecting initial condition to divergence-free space..." << endl;
     make_div_free(V1_c, V2_c, V3_c, grid);
+    if (g_nyq0) zero_nyquist(F.V, 3, grid);
 
     // ------------------------------------------------------------------
     // 时间推进（RK4）
